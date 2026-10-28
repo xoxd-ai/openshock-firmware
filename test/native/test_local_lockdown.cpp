@@ -71,25 +71,18 @@ static void sp46RefusesNamedCommands()
   }
 }
 
-static void localSocketAllowsOnlyRfTxPin()
+static void localSocketAllowsNothing()
 {
-  int allowed = 0;
+  // SPR-75: the port 81 socket serves no command, the RF TX pin included, since that pin could be moved
+  // onto the E-Stop GPIO.
   for (const char* name : kUpstreamPayloads) {
     if (LocalSocketAllows(name)) {
-      ++allowed;
-      CHECK(std::strcmp(name, "SetRfTxPinCommand") == 0);
+      std::printf("FAIL %s:%d: local socket allows %s\n", __FILE__, __LINE__, name);
+      ++s_failures;
     }
   }
-  CHECK(allowed == 1);
-
-  // Every allow-list entry is a real payload name, so a typo cannot pass silently.
-  for (std::string_view entry : kLocalSocketAllowed) {
-    bool known = false;
-    for (const char* name : kUpstreamPayloads) {
-      known = known || entry == name;
-    }
-    CHECK(known);
-  }
+  CHECK(kLocalSocketAllowed.empty());
+  CHECK(!LocalSocketAllows("SetRfTxPinCommand"));
 }
 
 static void localSocketFailsClosed()
@@ -111,6 +104,7 @@ static void gatewayLockouts()
   static_assert(!kAllowOtaInstall, "the fork never installs firmware over the air");
   static_assert(!kAllowGatewayRestart, "the fork ignores the gateway restart trigger");
   static_assert(!LocalSocketAllows("SetEstopEnabledCommand"), "the allow list is usable at compile time");
+  static_assert(!LocalSocketAllows("SetRfTxPinCommand"), "SPR-75: the RF TX pin is serial only");
 }
 
 static void reportStartsEmpty()
@@ -194,7 +188,7 @@ static void logLine()
 int main()
 {
   sp46RefusesNamedCommands();
-  localSocketAllowsOnlyRfTxPin();
+  localSocketAllowsNothing();
   localSocketFailsClosed();
   gatewayLockouts();
   reportStartsEmpty();

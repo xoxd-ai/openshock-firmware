@@ -41,7 +41,7 @@ Upstream lets the gateway replace the firmware and reboot the hub. Either would 
 
 The captive portal opens an access point with no password whenever the gateway is unreachable, and its WebSocket on port 81 has no authentication. Upstream lets anyone on that access point turn the E-Stop off, move its pin, change the Wi-Fi networks and link the hub to another account. Softproxy SP-46 (TIN-7125 `fd8d8374`) refuses those commands there. The serial port stays the local path.
 
-`kLocalSocketAllowed` in `include/softproxy/Lockout.h` is an allow list, checked in `src/message_handlers/websocket/Local.cpp` before dispatch. A refused command is logged (`Refusing local socket command <name>`) and the client gets the error message `refused_local_command`.
+`kLocalSocketAllowed` in `include/softproxy/Lockout.h` is an allow list, now empty, checked in `src/message_handlers/websocket/Local.cpp` before dispatch. A refused command is logged (`Refusing local socket command <name>`) and the client gets the error message `refused_local_command`.
 
 | Local command | Upstream 1.5.2 | This fork | Serial path |
 | --- | --- | --- | --- |
@@ -50,7 +50,7 @@ The captive portal opens an access point with no password whenever the gateway i
 | `WifiScanCommand`, `WifiNetworkSaveCommand`, `WifiNetworkForgetCommand`, `WifiNetworkConnectCommand`, `WifiNetworkDisconnectCommand` | allowed | refused | `networks` |
 | `AccountLinkCommand`, `AccountUnlinkCommand` | allowed | refused | `authtoken` |
 | The nine `OtaUpdate*` commands | empty handlers | refused, so a later upstream body cannot open an install path | none needed |
-| `SetRfTxPinCommand` | allowed | allowed, SP-46 does not name it | `rftxpin` |
+| `SetRfTxPinCommand` | allowed | refused (SPR-75): the pin could be moved onto the E-Stop GPIO | `rftxpin` |
 | a payload a later release adds | handled | refused until it is added to the list | |
 
 The portal itself still serves the static frontend, and the access point still opens while the gateway is down.

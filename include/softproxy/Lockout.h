@@ -4,6 +4,7 @@
 // caps (include/softproxy/CapLimiter.h) or the hub E-Stop. No Arduino or ESP-IDF dependency, so the host test
 // can check them.
 
+#include <array>
 #include <string_view>
 
 namespace OpenShock::Softproxy {
@@ -27,13 +28,13 @@ namespace OpenShock::Softproxy {
   /// password, so SP-46 refuses the E-Stop, E-Stop pin, Wi-Fi and account-link commands there. The serial
   /// port stays the local path for each of them: `estop`, `networks` and `authtoken`.
   ///
-  /// This is an allow list. A payload not named here, including one a later upstream release adds, is
-  /// refused. The RF TX pin stays because SP-46 does not name it. The nine OTA commands are empty handlers
-  /// at 1.5.2, so refusing them changes nothing today and keeps a later upstream body from opening an
-  /// install path.
-  inline constexpr std::string_view kLocalSocketAllowed[] = {
-    "SetRfTxPinCommand",
-  };
+  /// This is an allow list, and it is empty: the socket serves no command. A payload not named here,
+  /// including one a later upstream release adds, is refused. The RF TX pin is refused as well (TIN-7125
+  /// SPR-75), because it could move the transmitter onto the E-Stop GPIO and so disable the E-Stop from the
+  /// open access point. Serial `rftxpin` stays its local path. The nine OTA commands are empty handlers at
+  /// 1.5.2, so refusing them changes nothing today and keeps a later upstream body from opening an install
+  /// path.
+  inline constexpr std::array<std::string_view, 0> kLocalSocketAllowed{};
 
   /// Whether the local socket may run the command with this payload name. A null or empty name refuses.
   constexpr bool LocalSocketAllows(const char* payloadName)
