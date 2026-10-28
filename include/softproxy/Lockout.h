@@ -34,7 +34,7 @@ namespace OpenShock::Softproxy {
   /// open access point. Serial `rftxpin` stays its local path. The nine OTA commands are empty handlers at
   /// 1.5.2, so refusing them changes nothing today and keeps a later upstream body from opening an install
   /// path.
-  inline constexpr std::array<std::string_view, 0> kLocalSocketAllowed{};
+  inline constexpr std::array<std::string_view, 0> kLocalSocketAllowed {};
 
   /// Whether the local socket may run the command with this payload name. A null or empty name refuses.
   constexpr bool LocalSocketAllows(const char* payloadName)

@@ -33,15 +33,15 @@ namespace OpenShock::Softproxy {
 
   /// One consistent reading of the report.
   struct RefusalSnapshot {
-    uint32_t count;     // Refusals since boot, saturating at `RefusalReport::kMaxCount`.
-    uint8_t lastCode;   // Wire code of the latest refusal's verdict. 0 before the first refusal.
+    uint32_t count;    // Refusals since boot, saturating at `RefusalReport::kMaxCount`.
+    uint8_t lastCode;  // Wire code of the latest refusal's verdict. 0 before the first refusal.
   };
 
   /// Counts refusals without a lock. The count and the last code share one atomic word, so a reader never
   /// pairs a count with the code of another refusal.
   class RefusalReport {
   public:
-    static constexpr uint32_t kMaxCount = 0x00FF'FFFFu;
+    static constexpr uint32_t kMaxCount = 0x00FFFFFFu;
 
     /// Records one refusal and returns its sequence number, starting at 1. An admitted verdict is not a
     /// refusal: nothing is recorded and the result is 0. At `kMaxCount` the count stops and the code still updates.
