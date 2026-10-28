@@ -1,14 +1,16 @@
 // Host test for include/softproxy/CapLimiter.h. It needs no board and no PlatformIO:
 //
-//   g++ -std=c++20 -Wall -Wextra -Iinclude test/native/test_cap_limiter.cpp -o cap_limiter_test && ./cap_limiter_test
+//   g++ -std=c++20 -Wall -Wextra -Werror -Iinclude test/native/test_cap_limiter.cpp -o cap_limiter_test && ./cap_limiter_test
 //
 // Every cap below is a synthetic test value chosen for the arithmetic. None is a body-safety value.
 
 #include "softproxy/CapLimiter.h"
+#include "softproxy/Lockout.h"
 
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <vector>
 
 using namespace OpenShock::Softproxy;
@@ -35,6 +37,10 @@ static int s_failures = 0;
 static const int64_t kSec  = 1000;
 static const int64_t kMin  = 60 * kSec;
 static const int64_t kHour = 60 * kMin;
+static const int64_t kDay  = 24 * kHour;
+
+// A hub clock past every cold boot hold the fixtures produce. A multiple of both bucket sizes.
+static const int64_t kWarm = 2 * kDay;
 
 // Synthetic caps: 10 percent, 100 ms, 1 pulse, 1 s gap, 3 per hour, 5 per day.
 static ChannelCaps fixture()
@@ -103,9 +109,29 @@ static void requestCaps()
 {
   ChannelCaps c = fixture();
   ChannelLimiter l;
-  CHECK_VERDICT(l.Admit(c, 11, 100, kHour), Verdict::OverIntensity);
-  CHECK_VERDICT(l.Admit(c, 10, 101, kHour), Verdict::OverPulseMs);
-  CHECK_VERDICT(l.Admit(c, 10, 100, kHour), Verdict::Allow);
+  CHECK_VERDICT(l.Admit(c, 11, 100, kWarm), Verdict::OverIntensity);
+  CHECK_VERDICT(l.Admit(c, 10, 101, kWarm), Verdict::OverPulseMs);
+  CHECK_VERDICT(l.Admit(c, 10, 100, kWarm), Verdict::Allow);
+}
+
+static void coldBootHoldSpacing()
+{
+  // 5 per day spaces stages 17280 s apart, longer than the 1200 s hourly spacing and the 1 s gap.
+  CHECK(ColdBootHoldMs(fixture()) == kDay / 5);
+
+  // The hourly spacing rounds up: 3600000 / 7 is 514285.7.
+  ChannelCaps hourly = fixture();
+  hourly.maxPerHour  = 7;
+  hourly.maxPerDay   = 1000;
+  CHECK(ColdBootHoldMs(hourly) == 514'286);
+
+  // Coherent caps never let the gap exceed the hourly spacing.
+  ChannelCaps wide = fixture();
+  wide.minGapSec   = 1200;
+  wide.maxPerHour  = 3;
+  wide.maxPerDay   = 1000;
+  CHECK(CapsCoherent(wide));
+  CHECK(ColdBootHoldMs(wide) == 1200 * kSec);
 }
 
 static void bootHold()
@@ -113,10 +139,12 @@ static void bootHold()
   ChannelCaps c = fixture();
   c.minGapSec   = 30;
   c.maxPerHour  = 3;
+  c.maxPerDay   = 72;  // 1200 s daily spacing, equal to the hourly spacing
   ChannelLimiter l;
   CHECK_VERDICT(l.Admit(c, 1, 1, 0), Verdict::BootHold);
-  CHECK_VERDICT(l.Admit(c, 1, 1, 30 * kSec - 1), Verdict::BootHold);
-  CHECK_VERDICT(l.Admit(c, 1, 1, 30 * kSec), Verdict::Allow);
+  CHECK_VERDICT(l.Admit(c, 1, 1, 30 * kSec), Verdict::BootHold);  // past the gap, inside the hourly spacing
+  CHECK_VERDICT(l.Admit(c, 1, 1, 1200 * kSec - 1), Verdict::BootHold);
+  CHECK_VERDICT(l.Admit(c, 1, 1, 1200 * kSec), Verdict::Allow);
 }
 
 static void gapBetweenStages()
@@ -124,7 +152,7 @@ static void gapBetweenStages()
   ChannelCaps c = fixture();
   c.minGapSec   = 10;
   ChannelLimiter l;
-  const int64_t t0 = kHour;
+  const int64_t t0 = kWarm;
   CHECK_VERDICT(l.Admit(c, 1, 1, t0), Verdict::Allow);
   CHECK_VERDICT(l.Admit(c, 1, 1, t0 + 10 * kSec - 1), Verdict::Gap);
   CHECK_VERDICT(l.Admit(c, 1, 1, t0 + 10 * kSec), Verdict::Allow);
@@ -134,7 +162,7 @@ static void hourlyAndDaily()
 {
   ChannelCaps c = fixture();  // 3 per hour, 5 per day
   ChannelLimiter l;
-  const int64_t t0 = kHour;
+  const int64_t t0 = kWarm;
   CHECK_VERDICT(l.Admit(c, 1, 1, t0), Verdict::Allow);
   CHECK_VERDICT(l.Admit(c, 1, 1, t0 + kSec), Verdict::Allow);
   CHECK_VERDICT(l.Admit(c, 1, 1, t0 + 2 * kSec), Verdict::Allow);
@@ -159,7 +187,7 @@ static void stageJoin()
   c.maxPulsesPerStage = 2;
   c.stageJoinMs       = 500;
   ChannelLimiter l;
-  const int64_t t0 = kHour;
+  const int64_t t0 = kWarm;
   CHECK_VERDICT(l.Admit(c, 1, 100, t0), Verdict::Allow);              // stage 1, pulse 1, ends t0+100
   CHECK_VERDICT(l.Admit(c, 1, 100, t0 + 300), Verdict::Allow);        // joins, pulse 2, ends t0+400
   CHECK_VERDICT(l.Admit(c, 1, 100, t0 + 600), Verdict::OverPulses);   // inside the join window, stage full
@@ -179,7 +207,7 @@ static void refusalsRecordNothing()
 {
   ChannelCaps c = fixture();
   ChannelLimiter l;
-  const int64_t t0 = kHour;
+  const int64_t t0 = kWarm;
   for (int i = 0; i < 10; ++i) {
     CHECK_VERDICT(l.Admit(c, 11, 1, t0 + i * kSec), Verdict::OverIntensity);
   }
@@ -216,6 +244,83 @@ static void windowNeverUnderstates()
   }
 }
 
+// A warm restart restores the counters and the clock, so a restart loop gains nothing.
+static void retainedSurvivesRestart()
+{
+  ChannelCaps c = fixture();  // 3 per hour, 5 per day
+  ChannelLimiter shock;
+  ChannelLimiter vibrate;
+  const int64_t t0 = kWarm;
+  CHECK_VERDICT(shock.Admit(c, 1, 1, t0), Verdict::Allow);
+  CHECK_VERDICT(shock.Admit(c, 1, 1, t0 + kSec), Verdict::Allow);
+  CHECK_VERDICT(shock.Admit(c, 1, 1, t0 + 2 * kSec), Verdict::Allow);
+  CHECK_VERDICT(vibrate.Admit(c, 1, 1, t0 + 3 * kSec), Verdict::Allow);
+
+  RetainedLimiters retained;
+  std::memset(&retained, 0xA5, sizeof(retained));  // Stand-in for no-init memory.
+  SealRetained(retained, t0 + 3 * kSec, shock, vibrate);
+
+  // After the restart the clock resumes at the sealed value plus the time since boot.
+  int64_t clockMs = -1;
+  ChannelLimiter shockAfter;
+  ChannelLimiter vibrateAfter;
+  CHECK(RestoreRetained(retained, clockMs, shockAfter, vibrateAfter));
+  CHECK(clockMs == t0 + 3 * kSec);
+  const int64_t sinceBoot = 5 * kSec;
+  const int64_t now       = clockMs + sinceBoot;
+  CHECK(shockAfter.StagesLastHour(now) == 3);
+  CHECK(vibrateAfter.StagesLastHour(now) == 1);
+  CHECK_VERDICT(shockAfter.Admit(c, 1, 1, now), Verdict::Hourly);
+  CHECK_VERDICT(vibrateAfter.Admit(c, 1, 1, now), Verdict::Allow);
+}
+
+// Garbage, a flipped byte or another layout reads as a cold boot and changes nothing.
+static void retainedRejectsCorruption()
+{
+  ChannelCaps c = fixture();
+  ChannelLimiter shock;
+  ChannelLimiter vibrate;
+  CHECK_VERDICT(shock.Admit(c, 1, 1, kWarm), Verdict::Allow);
+
+  RetainedLimiters garbage;
+  std::memset(&garbage, 0xA5, sizeof(garbage));
+  int64_t clockMs = 7;
+  ChannelLimiter s;
+  ChannelLimiter v;
+  CHECK(!RestoreRetained(garbage, clockMs, s, v));
+  CHECK(clockMs == 7);
+  CHECK(s.StagesLastDay(kWarm) == 0);
+
+  RetainedLimiters sealed;
+  SealRetained(sealed, kWarm, shock, vibrate);
+  const std::size_t offsets[] = {offsetof(RetainedLimiters, clockMs), offsetof(RetainedLimiters, shock) + 17, offsetof(RetainedLimiters, vibrate) + 3, offsetof(RetainedLimiters, checksum)};
+  for (std::size_t offset : offsets) {
+    RetainedLimiters flipped = sealed;
+    reinterpret_cast<unsigned char*>(&flipped)[offset] ^= 0x01;
+    CHECK(!RestoreRetained(flipped, clockMs, s, v));
+  }
+
+  RetainedLimiters otherVersion = sealed;
+  otherVersion.version          = static_cast<uint16_t>(kRetainedVersion + 1);
+  otherVersion.checksum         = RetainedChecksum(otherVersion);
+  CHECK(!RestoreRetained(otherVersion, clockMs, s, v));
+
+  RetainedLimiters negativeClock;
+  SealRetained(negativeClock, -1, shock, vibrate);
+  CHECK(!RestoreRetained(negativeClock, clockMs, s, v));
+
+  CHECK(clockMs == 7);
+  CHECK(s.StagesLastDay(kWarm) == 0);
+  CHECK(RestoreRetained(sealed, clockMs, s, v));
+  CHECK(s.StagesLastDay(kWarm) == 1);
+}
+
+static void lockouts()
+{
+  static_assert(!kAllowOtaInstall, "the fork never installs firmware over the air");
+  static_assert(!kAllowGatewayRestart, "the fork ignores the gateway restart trigger");
+}
+
 static void verdictHelpers()
 {
   CHECK(Admitted(Verdict::Allow));
@@ -230,12 +335,16 @@ int main()
   zeroCapsRefuse();
   incoherentCapsRefuse();
   requestCaps();
+  coldBootHoldSpacing();
   bootHold();
   gapBetweenStages();
   hourlyAndDaily();
   stageJoin();
   refusalsRecordNothing();
   windowNeverUnderstates();
+  retainedSurvivesRestart();
+  retainedRejectsCorruption();
+  lockouts();
   verdictHelpers();
 
   if (s_failures != 0) {

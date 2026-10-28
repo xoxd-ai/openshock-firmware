@@ -5,6 +5,7 @@ const char* const TAG = "ServerMessageHandlers";
 #include "captiveportal/Manager.h"
 #include "estop/EStopManager.h"
 #include "Logging.h"
+#include "softproxy/Lockout.h"
 
 #include <cstdint>
 
@@ -31,6 +32,11 @@ void _Private::HandleTrigger(const OpenShock::Serialization::Gateway::GatewayToH
 
   switch (triggerType) {
     case TriggerType::Restart:
+      // Softproxy fork: the gateway may not reboot the hub (softproxy/Lockout.h). Serial `restart` still works.
+      if (!OpenShock::Softproxy::kAllowGatewayRestart) {
+        OS_LOGW(TAG, "Ignoring gateway restart trigger, disabled in this fork");
+        break;
+      }
       esp_restart();
       break;
     case TriggerType::EmergencyStop:

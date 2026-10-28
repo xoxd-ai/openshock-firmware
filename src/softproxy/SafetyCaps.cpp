@@ -6,6 +6,7 @@ const char* const TAG = "SafetyCaps";
 #include "Logging.h"
 #include "SimpleMutex.h"
 
+#include <esp_attr.h>
 #include <nvs.h>
 
 #include <cstring>
@@ -47,6 +48,39 @@ static ChannelCaps s_shock     = {};
 static ChannelCaps s_vibrate   = {};
 static ChannelLimiter s_shockLimiter;
 static ChannelLimiter s_vibrateLimiter;
+
+// Survives a warm restart. Its content is garbage after a cold boot, which the checksum rejects.
+static RTC_NOINIT_ATTR RetainedLimiters s_retained;
+static bool s_restored       = false;
+static int64_t s_clockBaseMs = 0;  // Hub clock at boot. 0 after a cold boot.
+
+// Hub clock: the restored clock plus the time since boot. It never runs ahead of real time.
+static int64_t hubNowMs()
+{
+  return s_clockBaseMs + OpenShock::millis();
+}
+
+static void ensureRestored()
+{
+  if (s_restored) {
+    return;
+  }
+  s_restored = true;
+
+  int64_t clockMs = 0;
+  if (RestoreRetained(s_retained, clockMs, s_shockLimiter, s_vibrateLimiter)) {
+    s_clockBaseMs = clockMs;
+    OS_LOGI(TAG, "Restored the cap counters after a warm restart");
+  } else {
+    s_clockBaseMs = 0;
+    OS_LOGI(TAG, "Cold boot, cap counters start empty and each channel holds before its first stage");
+  }
+}
+
+static void sealRetained(int64_t now)
+{
+  SealRetained(s_retained, now, s_shockLimiter, s_vibrateLimiter);
+}
 
 static bool loadRecord()
 {
@@ -133,6 +167,8 @@ static bool ensureLoaded()
 bool SafetyCaps::Init()
 {
   ScopedLock lock__(&s_capsMutex);
+  ensureRestored();
+  sealRetained(hubNowMs());
   return ensureLoaded();
 }
 
@@ -147,7 +183,9 @@ void SafetyCaps::Get(ChannelCaps& shock, ChannelCaps& vibrate)
 bool SafetyCaps::GetCounts(ShockerCommandType type, uint32_t& lastHour, uint32_t& lastDay)
 {
   ScopedLock lock__(&s_capsMutex);
-  const int64_t now = OpenShock::millis();
+  ensureRestored();
+  const int64_t now = hubNowMs();
+  sealRetained(now);
   switch (type) {
     case ShockerCommandType::Shock:
       lastHour = s_shockLimiter.StagesLastHour(now);
@@ -250,9 +288,9 @@ Verdict SafetyCaps::Admit(ShockerCommandType type, uint8_t intensity, uint16_t d
     return Verdict::CapsNotSet;
   }
 
-  const int64_t now = OpenShock::millis();
-  if (type == ShockerCommandType::Shock) {
-    return s_shockLimiter.Admit(s_shock, intensity, durationMs, now);
-  }
-  return s_vibrateLimiter.Admit(s_vibrate, intensity, durationMs, now);
+  ensureRestored();
+  const int64_t now = hubNowMs();
+  Verdict verdict   = type == ShockerCommandType::Shock ? s_shockLimiter.Admit(s_shock, intensity, durationMs, now) : s_vibrateLimiter.Admit(s_vibrate, intensity, durationMs, now);
+  sealRetained(now);
+  return verdict;
 }

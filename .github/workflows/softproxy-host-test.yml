@@ -1,0 +1,29 @@
+# Softproxy fork: runs the host test of the cap decision logic (SOFTPROXY.md). Linear: TIN-7545.
+name: softproxy-host-test
+
+on:
+  pull_request:
+    branches:
+      - 'softproxy/**'
+    types: [opened, reopened, synchronize]
+  push:
+    branches:
+      - 'softproxy/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  cap-limiter:
+    name: cap limiter host test
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Build and run the host test
+        run: |
+          g++ -std=c++20 -Wall -Wextra -Werror -Iinclude test/native/test_cap_limiter.cpp -o cap_limiter_test
+          ./cap_limiter_test

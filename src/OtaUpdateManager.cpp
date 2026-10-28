@@ -13,6 +13,7 @@ const char* const TAG = "OtaUpdateManager";
 #include "SemVer.h"
 #include "serialization/WSGateway.h"
 #include "SimpleMutex.h"
+#include "softproxy/Lockout.h"
 #include "util/HexUtils.h"
 #include "util/PartitionUtils.h"
 #include "util/StringUtils.h"
@@ -327,6 +328,13 @@ static void otaum_updatetask(void* arg)
     }
 
     lastUpdateCheck = now;
+
+    // Softproxy fork: stop before any download, whatever the OTA config says (softproxy/Lockout.h).
+    if (!Softproxy::kAllowOtaInstall) {
+      updateRequested = false;
+      OS_LOGW(TAG, "OTA install is disabled in this fork, flash over serial instead");
+      continue;
+    }
 
     if (config.requireManualApproval) {
       OS_LOGD(TAG, "Manual approval required, skipping update check");
@@ -724,6 +732,12 @@ bool OtaUpdateManager::TryGetFirmwareRelease(const OpenShock::SemVer& version, F
 bool OtaUpdateManager::TryStartFirmwareUpdate(const OpenShock::SemVer& version)
 {
   OS_LOGD(TAG, "Requesting firmware version %s", version.toString().c_str());  // TODO: This is abusing the SemVer::toString() method causing alot of string copies, fix this
+
+  // Softproxy fork: refuse every remote install request (softproxy/Lockout.h).
+  if (!Softproxy::kAllowOtaInstall) {
+    OS_LOGW(TAG, "Refusing OTA update request, OTA install is disabled in this fork");
+    return false;
+  }
 
   return otaum_try_queue_update_request(version);
 }
