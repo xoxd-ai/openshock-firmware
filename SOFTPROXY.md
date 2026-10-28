@@ -1,6 +1,6 @@
 # Softproxy cap enforcement (xoxd-ai fork)
 
-This fork of `OpenShock/Firmware` starts from tag `1.5.2` (commit `5546c13eb745e4fb2b4ca7b0f4160de8b261872c`). It adds one change: the hub checks every shock and vibrate command against operator-set caps before the radio sends it. Softproxy's alarm service checks the same caps first (Softproxy ADR-0008 decision 6, `Device.dhall` server check 3). The hub check is the second line. A step over the intensity, pulse, per-stage or gap caps cannot reach the shocker even when the server sends it. The hourly and daily caps hold across a warm restart, and a power cycle costs a full cold boot hold (see Fail closed). To keep the gateway from removing the check, the fork also refuses over-the-air installs and ignores the gateway restart trigger (see Remote paths). Linear: TIN-7545.
+This fork of `OpenShock/Firmware` starts from tag `1.5.2` (commit `5546c13eb745e4fb2b4ca7b0f4160de8b261872c`). It adds one change: the hub checks every shock and vibrate command against operator-set caps before the radio sends it. Softproxy's alarm service checks the same caps first (Softproxy ADR-0008 decision 6, `Device.dhall` server check 3). The hub check is the second line. A step over the intensity, pulse, per-stage or gap caps cannot reach the shocker even when the server sends it. The hourly and daily caps hold across a warm restart, and a power cycle costs a full cold boot hold (see Fail closed). To keep the gateway from removing the check, the fork also refuses over-the-air installs and ignores the gateway restart trigger (see Remote paths). The captive portal's local socket refuses the E-Stop, Wi-Fi and account-link commands (SP-46, see Local socket). Each refusal reaches the hub log and the gateway heartbeat (see Refusal report). Linear: TIN-7545.
 
 ## What the hub enforces
 
@@ -34,9 +34,40 @@ Upstream lets the gateway replace the firmware and reboot the hub. Either would 
 | Gateway `OtaUpdateRequest` | queues an install of any version from the CDN | `TryStartFirmwareUpdate` refuses |
 | OTA check on startup or on a timer, a changed CDN domain | installs the found version | the OTA task stops before any download |
 | Gateway `Trigger` `Restart` | `esp_restart()` | ignored and logged |
+| Gateway `Trigger` `CaptivePortalEnable` | holds the portal open while the gateway is connected | ignored and logged (SP-46). `CaptivePortal::SetAlwaysEnabled(true)` also refuses, whatever the caller |
 | Serial flash, serial `restart` | allowed | allowed, both need the local serial port |
 
-The gateway can still enable the captive portal. Its local commands cannot read or change the caps or start an install.
+## Local socket
+
+The captive portal opens an access point with no password whenever the gateway is unreachable, and its WebSocket on port 81 has no authentication. Upstream lets anyone on that access point turn the E-Stop off, move its pin, change the Wi-Fi networks and link the hub to another account. Softproxy SP-46 (TIN-7125 `fd8d8374`) refuses those commands there. The serial port stays the local path.
+
+`kLocalSocketAllowed` in `include/softproxy/Lockout.h` is an allow list, now empty, checked in `src/message_handlers/websocket/Local.cpp` before dispatch. A refused command is logged (`Refusing local socket command <name>`) and the client gets the error message `refused_local_command`.
+
+| Local command | Upstream 1.5.2 | This fork | Serial path |
+| --- | --- | --- | --- |
+| `SetEstopEnabledCommand` | allowed | refused | `estop enabled` |
+| `SetEstopPinCommand` | allowed | refused | `estop pin` |
+| `WifiScanCommand`, `WifiNetworkSaveCommand`, `WifiNetworkForgetCommand`, `WifiNetworkConnectCommand`, `WifiNetworkDisconnectCommand` | allowed | refused | `networks` |
+| `AccountLinkCommand`, `AccountUnlinkCommand` | allowed | refused | `authtoken` |
+| The nine `OtaUpdate*` commands | empty handlers | refused, so a later upstream body cannot open an install path | none needed |
+| `SetRfTxPinCommand` | allowed | refused (SPR-75): the pin could be moved onto the E-Stop GPIO | `rftxpin` |
+| a payload a later release adds | handled | refused until it is added to the list | |
+
+The portal itself still serves the static frontend, and the access point still opens while the gateway is down.
+
+## Refusal report
+
+Before this change a refused step left one log line and nothing else, so Softproxy logged an actuation that never reached the shocker (softproxy #27 review, finding 4). `SafetyCaps::Admit` now counts every refusal in `include/softproxy/RefusalReport.h` and writes one log line. Gateway and serial `rftransmit` commands both pass there.
+
+| Trace | Form | Read by |
+| --- | --- | --- |
+| Hub log (serial) | `softproxy-refusal seq=<n> channel=<shock\|vibrate> verdict=<name>`, level warning, kept by the production log level `INFO` | Softproxy on the local serial path |
+| Gateway heartbeat | `Pong.softproxy_cap_refusals` (`uint32`, field 2, vtable offset 8): refusals since boot, saturating at 16777215. `Pong.softproxy_last_refusal` (`uint8`, field 3, vtable offset 10): verdict code of the latest refusal | the gateway, on every Ping |
+| Serial `safetycaps` | `SafetyCaps\|refusals\|count=<n>,last=<name>` after the two channel lines | the operator or Softproxy |
+
+The verdict names are those in the cap table above, plus `caps-not-set` and `boot-hold`. Wire codes: 0 none, 2 `caps-not-set`, 3 `boot-hold`, 4 `over-intensity`, 5 `over-pulse-ms`, 6 `over-pulses`, 7 `gap`, 8 `hourly`, 9 `daily`. A receiver that sees `softproxy_cap_refusals` rise between two heartbeats knows that many steps were refused. The count lives in RAM and restarts at 0 after any reboot, which a lower `uptime` in the same `Pong` shows.
+
+The two fields come after `uptime` and `rssi`, so a gateway built from the upstream schema reads the heartbeat as before and ignores them. `softproxy/schemas/HubToGatewayMessage.fbs` holds the fork schema. The `schemas` submodule still points at upstream commit `aaceae18`, and `include/serialization/_fbs/HubToGatewayMessage_generated.h` was edited to match the fork schema without running `flatc`.
 
 ## Who can set the caps
 
@@ -56,19 +87,24 @@ The caps live in their own NVS namespace (`spcaps`), outside the config file. `r
 | File | Role |
 | --- | --- |
 | `include/softproxy/CapLimiter.h` | decision logic, cold boot hold and the retained state seal, no Arduino or ESP-IDF dependency |
-| `include/softproxy/Lockout.h` | the OTA install and gateway restart lockouts |
+| `include/softproxy/Lockout.h` | the OTA install, gateway restart and captive portal enable lockouts, and the local socket allow list |
+| `include/softproxy/RefusalReport.h` | the refusal count, the wire codes and the hub log line, no Arduino or ESP-IDF dependency |
 | `include/softproxy/SafetyCaps.h`, `src/softproxy/SafetyCaps.cpp` | NVS store, mutex, the `Admit` gate, the hub clock and the RTC no-init copy of the counters |
-| `src/OtaUpdateManager.cpp`, `src/message_handlers/websocket/gateway/Trigger.cpp` | apply the lockouts |
+| `src/OtaUpdateManager.cpp`, `src/message_handlers/websocket/gateway/Trigger.cpp`, `src/captiveportal/Manager.cpp` | apply the gateway lockouts |
+| `src/message_handlers/websocket/Local.cpp` | applies the local socket allow list |
+| `src/serialization/WSGateway.cpp`, `softproxy/schemas/HubToGatewayMessage.fbs` | the two `Pong` refusal fields |
 | `src/CommandHandler.cpp` | `HandleCommand` calls `SafetyCaps::Admit` after the E-Stop check, before the radio. Gateway and serial `rftransmit` commands both pass here |
 | `src/serial/command_handlers/safetycaps.cpp` | the `safetycaps` serial command |
 | `src/config/Config.cpp` | `FactoryReset` clears the caps |
 | `test/native/test_cap_limiter.cpp` | host test of the decision logic, the retained state and the lockout constants |
-| `.github/workflows/softproxy-host-test.yml` | runs the host test on pushes and PRs to `softproxy/**` |
+| `test/native/test_local_lockdown.cpp` | host test of the local socket allow list, the portal lockout, the refusal count, the wire codes and the log line |
+| `.github/workflows/softproxy-host-test.yml` | runs both host tests on pushes and PRs to `softproxy/**` |
 
-Run the host test with:
+Run the host tests with:
 
 ```sh
 g++ -std=c++20 -Wall -Wextra -Werror -Iinclude test/native/test_cap_limiter.cpp -o cap_limiter_test && ./cap_limiter_test
+g++ -std=c++20 -Wall -Wextra -Werror -Iinclude test/native/test_local_lockdown.cpp -o local_lockdown_test && ./local_lockdown_test
 ```
 
 ## Not covered here
@@ -76,4 +112,7 @@ g++ -std=c++20 -Wall -Wextra -Werror -Iinclude test/native/test_cap_limiter.cpp 
 - The hub cannot see a request's purpose, schedule or arm state. Those stay Softproxy server checks 4 to 8.
 - Hourly and daily counters do not survive a power cycle. The cold boot hold spaces stages after one, and the server counters stay the authority (see Fail closed).
 - RTC no-init retention across a software, panic and watchdog reset is ESP-IDF behaviour, not yet checked on the PiShock boards.
+- The upstream live control gateway (`openshock/live-control-gateway:3.17.0`) does not read the two `Pong` fields. They reach it on the wire, but Softproxy sees them only through a gateway change or by reading the serial log and `safetycaps`.
+- The refusal count restarts after every reboot. A refusal just before a reboot shows in the hub log, not in the next heartbeat.
+- The TypeScript code generated for the frontend (`frontend/src/lib/_fbs`) still has the upstream `Pong`. The frontend never reads it.
 - Raising a cap needs only serial access. Whether to also require the E-Stop to be engaged while caps change is an open operator decision.

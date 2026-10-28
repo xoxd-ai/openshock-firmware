@@ -305,9 +305,9 @@ bool CommandHandler::HandleCommand(ShockerModelType model, uint16_t shockerId, S
   }
 
   // Softproxy caps (ADR-0008 decision 6). Every shock and vibrate command passes here before the radio.
+  // Admit counts and logs each refusal (softproxy/RefusalReport.h).
   Softproxy::Verdict verdict = Softproxy::SafetyCaps::Admit(type, intensity, durationMs);
   if (!Softproxy::Admitted(verdict)) {
-    OS_LOGW(TAG, "Refusing shocker command: Softproxy cap %s", Softproxy::VerdictName(verdict));
     return false;
   }
 

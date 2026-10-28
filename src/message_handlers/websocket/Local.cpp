@@ -2,8 +2,11 @@
 
 const char* const TAG = "LocalMessageHandlers";
 
+#include "captiveportal/Manager.h"
 #include "Logging.h"
 #include "message_handlers/impl/WSLocal.h"
+#include "serialization/WSLocal.h"
+#include "softproxy/Lockout.h"
 
 #include "serialization/_fbs/LocalToHubMessage_generated.h"
 
@@ -70,6 +73,15 @@ void MessageHandlers::WebSocket::HandleLocalBinary(uint8_t socketId, tcb::span<c
 
   if (msg->payload_type() < PayloadType::MIN || msg->payload_type() > PayloadType::MAX) {
     Handlers::HandleInvalidMessage(socketId, msg);
+    return;
+  }
+
+  // Softproxy fork (SP-46): the port 81 socket runs only the commands softproxy/Lockout.h allows. The E-Stop,
+  // E-Stop pin, Wi-Fi and account-link commands refuse here and stay on the serial port.
+  const char* payloadName = Schemas::EnumNameLocalToHubMessagePayload(msg->payload_type());
+  if (!Softproxy::LocalSocketAllows(payloadName)) {
+    OS_LOGW(TAG, "Refusing local socket command %s from client #%u, use the serial port", payloadName, socketId);
+    Serialization::Local::SerializeErrorMessage("refused_local_command", [socketId](tcb::span<const uint8_t> data) { return CaptivePortal::SendMessageBIN(socketId, data); });
     return;
   }
 

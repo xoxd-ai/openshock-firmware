@@ -48,6 +48,7 @@ static ChannelCaps s_shock     = {};
 static ChannelCaps s_vibrate   = {};
 static ChannelLimiter s_shockLimiter;
 static ChannelLimiter s_vibrateLimiter;
+static RefusalReport s_refusals;
 
 // Survives a warm restart. Its content is garbage after a cold boot, which the checksum rejects.
 static RTC_NOINIT_ATTR RetainedLimiters s_retained;
@@ -274,12 +275,9 @@ bool SafetyCaps::Clear()
   return true;
 }
 
-Verdict SafetyCaps::Admit(ShockerCommandType type, uint8_t intensity, uint16_t durationMs)
+// Checks a shock or vibrate command under the caps mutex.
+static Verdict admitCapped(ShockerCommandType type, uint8_t intensity, uint16_t durationMs)
 {
-  if (type != ShockerCommandType::Shock && type != ShockerCommandType::Vibrate) {
-    return Verdict::NotCapped;
-  }
-
   ScopedLock lock__(&s_capsMutex);
   if (!lock__.isLocked()) {
     return Verdict::CapsNotSet;
@@ -293,4 +291,28 @@ Verdict SafetyCaps::Admit(ShockerCommandType type, uint8_t intensity, uint16_t d
   Verdict verdict   = type == ShockerCommandType::Shock ? s_shockLimiter.Admit(s_shock, intensity, durationMs, now) : s_vibrateLimiter.Admit(s_vibrate, intensity, durationMs, now);
   sealRetained(now);
   return verdict;
+}
+
+Verdict SafetyCaps::Admit(ShockerCommandType type, uint8_t intensity, uint16_t durationMs)
+{
+  if (type != ShockerCommandType::Shock && type != ShockerCommandType::Vibrate) {
+    return Verdict::NotCapped;
+  }
+
+  Verdict verdict = admitCapped(type, intensity, durationMs);
+
+  // Count and log every refusal after the mutex is released, so the log never holds the cap lock.
+  uint32_t seq = s_refusals.Record(verdict);
+  if (seq != 0) {
+    char line[kRefusalLineSize];
+    FormatRefusalLine(line, sizeof(line), seq, type == ShockerCommandType::Shock ? "shock" : "vibrate", verdict);
+    OS_LOGW(TAG, "%s", line);
+  }
+
+  return verdict;
+}
+
+RefusalSnapshot SafetyCaps::GetRefusals()
+{
+  return s_refusals.Snapshot();
 }

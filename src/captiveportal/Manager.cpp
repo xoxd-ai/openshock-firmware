@@ -10,6 +10,7 @@ const char* const TAG = "CaptivePortal";
 #include "Core.h"
 #include "GatewayConnectionManager.h"
 #include "Logging.h"
+#include "softproxy/Lockout.h"
 
 #include <ESPAsyncWebServer.h>
 #include <WebSocketsServer.h>
@@ -135,6 +136,12 @@ bool CaptivePortal::Init()
 
 void CaptivePortal::SetAlwaysEnabled(bool alwaysEnabled)
 {
+  // Softproxy fork (SP-46): no caller may hold the portal open (softproxy/Lockout.h). Disabling still works.
+  if (alwaysEnabled && !Softproxy::kAllowGatewayCaptivePortalEnable) {
+    OS_LOGW(TAG, "Refusing to hold the captive portal open, disabled in this fork");
+    alwaysEnabled = false;
+  }
+
   s_alwaysEnabled = alwaysEnabled;
   Config::SetCaptivePortalConfig({
     .alwaysEnabled = alwaysEnabled,

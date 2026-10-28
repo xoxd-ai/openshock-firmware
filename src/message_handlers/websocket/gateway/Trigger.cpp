@@ -43,6 +43,11 @@ void _Private::HandleTrigger(const OpenShock::Serialization::Gateway::GatewayToH
       EStopManager::Trigger();
       break;
     case TriggerType::CaptivePortalEnable:
+      // Softproxy fork (SP-46): the gateway may not hold the portal open (softproxy/Lockout.h).
+      if (!OpenShock::Softproxy::kAllowGatewayCaptivePortalEnable) {
+        OS_LOGW(TAG, "Ignoring gateway captive portal enable trigger, disabled in this fork");
+        break;
+      }
       OpenShock::CaptivePortal::SetAlwaysEnabled(true);
       break;
     case TriggerType::CaptivePortalDisable:
