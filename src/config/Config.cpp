@@ -9,6 +9,7 @@ const char* const TAG = "Config";
 #include "config/RootConfig.h"
 #include "Logging.h"
 #include "ReadWriteMutex.h"
+#include "softproxy/SafetyCaps.h"
 
 #include <FS.h>
 #include <LittleFS.h>
@@ -251,6 +252,11 @@ void Config::FactoryReset()
 
   if (!_trySaveConfig()) {
     OS_PANIC(TAG, "Failed to save default config. Recommend formatting microcontroller and re-flashing firmware");
+  }
+
+  // The Softproxy caps sit outside the config file. A factory reset returns them to 0 as well.
+  if (!Softproxy::SafetyCaps::Clear()) {
+    OS_LOGE(TAG, "Failed to erase the stored Softproxy caps during factory reset");
   }
 
   OS_LOGI(TAG, "Factory reset complete");

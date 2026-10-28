@@ -15,6 +15,7 @@ const char* const TAG = "CommandHandler";
 #include "radio/RFTransmitter.h"
 #include "ReadWriteMutex.h"
 #include "SimpleMutex.h"
+#include "softproxy/SafetyCaps.h"
 #include "util/TaskUtils.h"
 
 #include <freertos/queue.h>
@@ -176,6 +177,11 @@ bool CommandHandler::Init()
   }
   initialized = true;
 
+  // Load the Softproxy caps first. If they fail to load they stay 0, and shock and vibrate refuse.
+  if (!Softproxy::SafetyCaps::Init()) {
+    OS_LOGE(TAG, "Failed to load Softproxy caps, shock and vibrate commands will refuse");
+  }
+
   Config::RFConfig rfConfig;
   if (!Config::GetRFConfig(rfConfig)) {
     OS_LOGE(TAG, "Failed to get RF config");
@@ -295,6 +301,13 @@ bool CommandHandler::HandleCommand(ShockerModelType model, uint16_t shockerId, S
 {
   if (EStopManager::IsEStopped()) {
     OS_LOGD(TAG, "Ignoring shocker command due to EmergencyStop being activated");
+    return false;
+  }
+
+  // Softproxy caps (ADR-0008 decision 6). Every shock and vibrate command passes here before the radio.
+  Softproxy::Verdict verdict = Softproxy::SafetyCaps::Admit(type, intensity, durationMs);
+  if (!Softproxy::Admitted(verdict)) {
+    OS_LOGW(TAG, "Refusing shocker command: Softproxy cap %s", Softproxy::VerdictName(verdict));
     return false;
   }
 
