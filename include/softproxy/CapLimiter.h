@@ -108,12 +108,15 @@ namespace OpenShock::Softproxy {
     }
   }
 
-  constexpr bool Admitted(Verdict v) { return v == Verdict::Allow || v == Verdict::NotCapped; }
+  constexpr bool Admitted(Verdict v)
+  {
+    return v == Verdict::Allow || v == Verdict::NotCapped;
+  }
 
   /// Counts events in a sliding window with fixed buckets. A bucket counts while any part of it lies
   /// inside the window, so the count can overstate by up to one bucket and never understates. An
   /// overstatement only refuses sooner.
-  template <uint32_t WindowMs, uint32_t BucketMs>
+  template<uint32_t WindowMs, uint32_t BucketMs>
   class WindowCounter {
     static_assert(BucketMs > 0 && WindowMs % BucketMs == 0, "the window must be a whole number of buckets");
     static constexpr std::size_t N = WindowMs / BucketMs + 1;
@@ -143,7 +146,7 @@ namespace OpenShock::Softproxy {
 
     void Add(int64_t nowMs)
     {
-      const int64_t current = nowMs / BucketMs;
+      const int64_t current  = nowMs / BucketMs;
       const std::size_t slot = static_cast<std::size_t>(current % static_cast<int64_t>(N));
       if (m_index[slot] != current) {
         m_index[slot] = static_cast<int32_t>(current);

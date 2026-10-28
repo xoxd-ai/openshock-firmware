@@ -25,13 +25,13 @@ static int s_failures = 0;
     }                                                             \
   } while (0)
 
-#define CHECK_VERDICT(actual, expected)                                                                                          \
-  do {                                                                                                                          \
-    Verdict a__ = (actual);                                                                                                     \
-    if (a__ != (expected)) {                                                                                                    \
-      std::printf("FAIL %s:%d: got %s, want %s\n", __FILE__, __LINE__, VerdictName(a__), VerdictName(expected));                \
-      ++s_failures;                                                                                                             \
-    }                                                                                                                           \
+#define CHECK_VERDICT(actual, expected)                                                                          \
+  do {                                                                                                           \
+    Verdict a__ = (actual);                                                                                      \
+    if (a__ != (expected)) {                                                                                     \
+      std::printf("FAIL %s:%d: got %s, want %s\n", __FILE__, __LINE__, VerdictName(a__), VerdictName(expected)); \
+      ++s_failures;                                                                                              \
+    }                                                                                                            \
   } while (0)
 
 static const int64_t kSec  = 1000;
@@ -86,7 +86,7 @@ static void zeroCapsRefuse()
 
 static void incoherentCapsRefuse()
 {
-  ChannelCaps over = fixture();
+  ChannelCaps over     = fixture();
   over.maxIntensityPct = 101;
   CHECK(!CapsCoherent(over));
 
@@ -192,7 +192,7 @@ static void stageJoin()
   CHECK_VERDICT(l.Admit(c, 1, 100, t0 + 300), Verdict::Allow);        // joins, pulse 2, ends t0+400
   CHECK_VERDICT(l.Admit(c, 1, 100, t0 + 600), Verdict::OverPulses);   // inside the join window, stage full
   CHECK_VERDICT(l.Admit(c, 1, 100, t0 + 901), Verdict::Gap);          // outside the window, inside the gap
-  CHECK(l.StagesLastHour(t0 + 901) == 1);                              // joined pulses do not count as stages
+  CHECK(l.StagesLastHour(t0 + 901) == 1);                             // joined pulses do not count as stages
   CHECK_VERDICT(l.Admit(c, 1, 100, t0 + 60 * kSec), Verdict::Allow);  // stage 2
 
   // With stageJoinMs at 0 every command is its own stage, so the gap applies between pulses.
@@ -220,10 +220,10 @@ static void windowNeverUnderstates()
 {
   WindowCounter<3'600'000, 60'000> counter;
   std::vector<int64_t> events;
-  uint64_t seed = 0x9E3779B97F4A7C15ULL;
+  uint64_t seed = 0x9E'37'79'B9'7F'4A'7C'15ULL;
   int64_t now   = 0;
   for (int i = 0; i < 4000; ++i) {
-    seed = seed * 6364136223846793005ULL + 1442695040888963407ULL;
+    seed = seed * 6'364'136'223'846'793'005ULL + 1'442'695'040'888'963'407ULL;
     now += static_cast<int64_t>((seed >> 33) % (5 * kMin));
     if ((seed >> 20) & 1) {
       counter.Add(now);

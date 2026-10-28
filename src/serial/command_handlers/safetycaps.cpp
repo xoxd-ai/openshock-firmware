@@ -57,11 +57,11 @@ static void _handleSafetyCapsSet(std::string_view arg, OpenShock::ShockerCommand
   }
 
   ChannelCaps caps = {};
-  bool ok          = OpenShock::Convert::ToUint8(parts[0], caps.maxIntensityPct)     //
-         && OpenShock::Convert::ToUint16(parts[1], caps.maxPulseMs)         //
-         && OpenShock::Convert::ToUint16(parts[2], caps.maxPulsesPerStage)  //
-         && OpenShock::Convert::ToUint32(parts[3], caps.minGapSec)          //
-         && OpenShock::Convert::ToUint16(parts[4], caps.maxPerHour)         //
+  bool ok          = OpenShock::Convert::ToUint8(parts[0], caps.maxIntensityPct)  //
+         && OpenShock::Convert::ToUint16(parts[1], caps.maxPulseMs)               //
+         && OpenShock::Convert::ToUint16(parts[2], caps.maxPulsesPerStage)        //
+         && OpenShock::Convert::ToUint32(parts[3], caps.minGapSec)                //
+         && OpenShock::Convert::ToUint16(parts[4], caps.maxPerHour)               //
          && OpenShock::Convert::ToUint16(parts[5], caps.maxPerDay);
   if (ok && parts.size() == 7) {
     ok = OpenShock::Convert::ToUint32(parts[6], caps.stageJoinMs);
