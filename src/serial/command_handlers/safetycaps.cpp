@@ -46,6 +46,10 @@ static void _handleSafetyCapsGetCommand(std::string_view arg, bool isAutomated)
 
   printChannel("shock", shock, OpenShock::ShockerCommandType::Shock);
   printChannel("vibrate", vibrate, OpenShock::ShockerCommandType::Vibrate);
+
+  // The same refusal count and latest verdict that the gateway heartbeat carries.
+  auto refusals = OpenShock::Softproxy::SafetyCaps::GetRefusals();
+  SERPR_RESPONSE("SafetyCaps|refusals|count=%u,last=%s", static_cast<unsigned>(refusals.count), OpenShock::Softproxy::RefusalCodeName(refusals.lastCode));
 }
 
 static void _handleSafetyCapsSet(std::string_view arg, OpenShock::ShockerCommandType type)

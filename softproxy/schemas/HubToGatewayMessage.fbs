@@ -1,0 +1,70 @@
+// xoxd-ai fork copy of OpenShock/flatbuffers-schemas HubToGatewayMessage.fbs at commit aaceae189d7e8513091f52b8d5046c7c6da20b71 (the
+// schemas submodule pin), with two Pong fields added for the Softproxy cap refusal report (SOFTPROXY.md,
+// include/softproxy/RefusalReport.h). include/serialization/_fbs/HubToGatewayMessage_generated.h carries the
+// matching code. The new fields come last, so a reader built from the upstream schema ignores them.
+
+include "./Types/SemVer.fbs";
+include "./Types/FirmwareBootType.fbs";
+include "./Types/OtaUpdateProgressTask.fbs";
+
+attribute "fs_serializer";
+
+namespace OpenShock.Serialization.Gateway;
+
+table Pong {
+  uptime:uint64;
+  rssi:int32;
+
+  // xoxd-ai fork: Softproxy cap refusals since boot, saturating at 16777215.
+  softproxy_cap_refusals:uint32;
+
+  // xoxd-ai fork: verdict of the latest refusal, 0 before the first. 2 caps-not-set, 3 boot-hold,
+  // 4 over-intensity, 5 over-pulse-ms, 6 over-pulses, 7 gap, 8 hourly, 9 daily.
+  softproxy_last_refusal:uint8;
+}
+
+table BootStatus {
+  boot_type:Types.FirmwareBootType;
+  firmware_version:Types.SemVer (required);
+  ota_update_id:int32;
+}
+
+table OtaUpdateStarted {
+  update_id:int32;
+  version:Types.SemVer (required);
+}
+
+table OtaUpdateProgress {
+  update_id:int32;
+  task:Types.OtaUpdateProgressTask;
+  progress:float32;
+}
+
+table OtaUpdateFailed {
+  update_id:int32;
+  message:string;
+  fatal:bool;
+}
+
+union HubToGatewayMessagePayload {
+  /// Respond to a ping message
+  Pong,
+
+  /// Report the current boot status, used to report firmware version and OTA update results
+  BootStatus,
+
+  /// Report that an OTA update has started
+  OtaUpdateStarted,
+
+  /// Report the progress of an OTA update
+  OtaUpdateProgress,
+
+  /// Report that an OTA update has failed
+  OtaUpdateFailed
+}
+
+table HubToGatewayMessage (fs_serializer) {
+  payload:HubToGatewayMessagePayload (required);
+}
+
+root_type HubToGatewayMessage;

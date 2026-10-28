@@ -1,4 +1,4 @@
-# Softproxy fork: runs the host test of the cap decision logic (SOFTPROXY.md). Linear: TIN-7545.
+# Softproxy fork: runs the host tests of the cap decision logic, the SP-46 local lockdown and the refusal report (SOFTPROXY.md). Linear: TIN-7545.
 name: softproxy-host-test
 
 on:
@@ -27,3 +27,8 @@ jobs:
         run: |
           g++ -std=c++20 -Wall -Wextra -Werror -Iinclude test/native/test_cap_limiter.cpp -o cap_limiter_test
           ./cap_limiter_test
+
+      - name: Build and run the local lockdown and refusal report test
+        run: |
+          g++ -std=c++20 -Wall -Wextra -Werror -Iinclude test/native/test_local_lockdown.cpp -o local_lockdown_test
+          ./local_lockdown_test

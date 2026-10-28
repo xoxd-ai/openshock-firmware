@@ -9,6 +9,7 @@
 
 #include "ShockerCommandType.h"
 #include "softproxy/CapLimiter.h"
+#include "softproxy/RefusalReport.h"
 
 #include <cstdint>
 
@@ -29,5 +30,9 @@ namespace OpenShock::Softproxy::SafetyCaps {
   bool Clear();
 
   /// Checks one command and records it when it is admitted. Stop, Sound and Light return `NotCapped`.
+  /// A refusal is counted and logged (include/softproxy/RefusalReport.h).
   Verdict Admit(ShockerCommandType type, uint8_t intensity, uint16_t durationMs);
+
+  /// Refusals since boot and the latest one's wire code, for the gateway heartbeat and the serial port. Takes no lock.
+  RefusalSnapshot GetRefusals();
 }  // namespace OpenShock::Softproxy::SafetyCaps

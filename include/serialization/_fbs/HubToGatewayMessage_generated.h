@@ -121,7 +121,9 @@ struct Pong FLATBUFFERS_FINAL_CLASS : private ::flatbuffers::Table {
   }
   enum FlatBuffersVTableOffset FLATBUFFERS_VTABLE_UNDERLYING_TYPE {
     VT_UPTIME = 4,
-    VT_RSSI = 6
+    VT_RSSI = 6,
+    VT_SOFTPROXY_CAP_REFUSALS = 8,
+    VT_SOFTPROXY_LAST_REFUSAL = 10
   };
   uint64_t uptime() const {
     return GetField<uint64_t>(VT_UPTIME, 0);
@@ -129,10 +131,18 @@ struct Pong FLATBUFFERS_FINAL_CLASS : private ::flatbuffers::Table {
   int32_t rssi() const {
     return GetField<int32_t>(VT_RSSI, 0);
   }
+  uint32_t softproxy_cap_refusals() const {
+    return GetField<uint32_t>(VT_SOFTPROXY_CAP_REFUSALS, 0);
+  }
+  uint8_t softproxy_last_refusal() const {
+    return GetField<uint8_t>(VT_SOFTPROXY_LAST_REFUSAL, 0);
+  }
   bool Verify(::flatbuffers::Verifier &verifier) const {
     return VerifyTableStart(verifier) &&
            VerifyField<uint64_t>(verifier, VT_UPTIME, 8) &&
            VerifyField<int32_t>(verifier, VT_RSSI, 4) &&
+           VerifyField<uint32_t>(verifier, VT_SOFTPROXY_CAP_REFUSALS, 4) &&
+           VerifyField<uint8_t>(verifier, VT_SOFTPROXY_LAST_REFUSAL, 1) &&
            verifier.EndTable();
   }
 };
@@ -146,6 +156,12 @@ struct PongBuilder {
   }
   void add_rssi(int32_t rssi) {
     fbb_.AddElement<int32_t>(Pong::VT_RSSI, rssi, 0);
+  }
+  void add_softproxy_cap_refusals(uint32_t softproxy_cap_refusals) {
+    fbb_.AddElement<uint32_t>(Pong::VT_SOFTPROXY_CAP_REFUSALS, softproxy_cap_refusals, 0);
+  }
+  void add_softproxy_last_refusal(uint8_t softproxy_last_refusal) {
+    fbb_.AddElement<uint8_t>(Pong::VT_SOFTPROXY_LAST_REFUSAL, softproxy_last_refusal, 0);
   }
   explicit PongBuilder(::flatbuffers::FlatBufferBuilder &_fbb)
         : fbb_(_fbb) {
@@ -161,10 +177,14 @@ struct PongBuilder {
 inline ::flatbuffers::Offset<Pong> CreatePong(
     ::flatbuffers::FlatBufferBuilder &_fbb,
     uint64_t uptime = 0,
-    int32_t rssi = 0) {
+    int32_t rssi = 0,
+    uint32_t softproxy_cap_refusals = 0,
+    uint8_t softproxy_last_refusal = 0) {
   PongBuilder builder_(_fbb);
   builder_.add_uptime(uptime);
+  builder_.add_softproxy_cap_refusals(softproxy_cap_refusals);
   builder_.add_rssi(rssi);
+  builder_.add_softproxy_last_refusal(softproxy_last_refusal);
   return builder_.Finish();
 }
 
