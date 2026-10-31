@@ -67,7 +67,7 @@ Before this change a refused step left one log line and nothing else, so Softpro
 
 The verdict names are those in the cap table above, plus `caps-not-set` and `boot-hold`. Wire codes: 0 none, 2 `caps-not-set`, 3 `boot-hold`, 4 `over-intensity`, 5 `over-pulse-ms`, 6 `over-pulses`, 7 `gap`, 8 `hourly`, 9 `daily`. A receiver that sees `softproxy_cap_refusals` rise between two heartbeats knows that many steps were refused. The count lives in RAM and restarts at 0 after any reboot, which a lower `uptime` in the same `Pong` shows.
 
-The two fields come after `uptime` and `rssi`, so a gateway built from the upstream schema reads the heartbeat as before and ignores them. `softproxy/schemas/HubToGatewayMessage.fbs` holds the fork schema. The `schemas` submodule still points at upstream commit `aaceae18`, and `include/serialization/_fbs/HubToGatewayMessage_generated.h` was edited to match the fork schema without running `flatc`.
+The two fields come after `uptime` and `rssi`, so a gateway built from the upstream schema reads the heartbeat as before and ignores them. `softproxy/schemas/HubToGatewayMessage.fbs` holds the fork schema. The `schemas` submodule still points at upstream commit `aaceae18`. `include/serialization/_fbs/HubToGatewayMessage_generated.h` is byte-identical to the output of `scripts/flatc` (version 25.9.23) for that fork schema, laid over the submodule, with the C++ flags in `scripts/generate_schemas.py`. `scripts/generate_schemas.py` itself reads only the submodule, so running it unchanged would drop the two fields.
 
 ## Who can set the caps
 
@@ -96,9 +96,10 @@ The caps live in their own NVS namespace (`spcaps`), outside the config file. `r
 | `src/CommandHandler.cpp` | `HandleCommand` calls `SafetyCaps::Admit` after the E-Stop check, before the radio. Gateway and serial `rftransmit` commands both pass here |
 | `src/serial/command_handlers/safetycaps.cpp` | the `safetycaps` serial command |
 | `src/config/Config.cpp` | `FactoryReset` clears the caps |
-| `test/native/test_cap_limiter.cpp` | host test of the decision logic, the retained state and the lockout constants |
+| `test/native/test_cap_limiter.cpp` | host test of the decision logic, the retained state and the lockout constants. Every cap at 0 is checked against all 256 intensities by all 65536 durations |
 | `test/native/test_local_lockdown.cpp` | host test of the local socket allow list, the portal lockout, the refusal count, the wire codes and the log line |
-| `.github/workflows/softproxy-host-test.yml` | runs both host tests on pushes and PRs to `softproxy/**` |
+| `test/native/test_command_paths.cpp`, `test/native/stubs/` | host test that links the real `HandleCommand`, `SafetyCaps`, gateway and local dispatchers, `Trigger`, `SetRfTxPinCommand`, serial `rftransmit` and `rftxpin` and the five encoders, with fakes only at the hardware edge. Its header gives the command. It needs the pinned flatbuffers headers, so `softproxy-host-test.yml` does not run it yet |
+| `.github/workflows/softproxy-host-test.yml` | runs the first two host tests on pushes and PRs to `softproxy/**` |
 
 Run the host tests with:
 
@@ -115,4 +116,6 @@ g++ -std=c++20 -Wall -Wextra -Werror -Iinclude test/native/test_local_lockdown.c
 - The upstream live control gateway (`openshock/live-control-gateway:3.17.0`) does not read the two `Pong` fields. They reach it on the wire, but Softproxy sees them only through a gateway change or by reading the serial log and `safetycaps`.
 - The refusal count restarts after every reboot. A refusal just before a reboot shows in the hub log, not in the next heartbeat.
 - The TypeScript code generated for the frontend (`frontend/src/lib/_fbs`) still has the upstream `Pong`. The frontend never reads it.
-- Raising a cap needs only serial access. Whether to also require the E-Stop to be engaged while caps change is an open operator decision.
+- SP-113 (TIN-7125 `b8345799`) is not implemented at this commit. It rules two things: the fork refuses moving the RF transmitter onto the E-Stop GPIO, and a cap can rise only while the E-Stop is engaged. Today raising a cap needs only serial access, and serial `rftxpin` and `estop pin` do not check the pin against each other, so a person at the serial port can still put the transmitter on the E-Stop GPIO. SPR-75 closes that path on port 81 only.
+- No `Pishock-*` board environment defines `OPENSHOCK_ESTOP_PIN`, so the E-Stop starts disabled with no pin until `estop pin` and `estop enabled` run over serial.
+- A serial `rftransmit` command in the host test comes from a fake parser, so `JsonSerial::ParseShockerCommand` is read, not run.
