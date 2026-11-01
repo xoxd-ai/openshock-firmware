@@ -1,6 +1,6 @@
 # Softproxy cap enforcement (xoxd-ai fork)
 
-This fork of `OpenShock/Firmware` starts from tag `1.5.2` (commit `5546c13eb745e4fb2b4ca7b0f4160de8b261872c`). It adds one change: the hub checks every shock and vibrate command against operator-set caps before the radio sends it. Softproxy's alarm service checks the same caps first (Softproxy ADR-0008 decision 6, `Device.dhall` server check 3). The hub check is the second line. A step over the intensity, pulse, per-stage or gap caps cannot reach the shocker even when the server sends it. The hourly and daily caps hold across a warm restart, and a power cycle costs a full cold boot hold (see Fail closed). To keep the gateway from removing the check, the fork also refuses over-the-air installs and ignores the gateway restart trigger (see Remote paths). The captive portal's local socket refuses the E-Stop, Wi-Fi and account-link commands (SP-46, see Local socket). Each refusal reaches the hub log and the gateway heartbeat (see Refusal report). Linear: TIN-7545.
+This fork of `OpenShock/Firmware` starts from tag `1.5.2` (commit `5546c13eb745e4fb2b4ca7b0f4160de8b261872c`). It adds one change: the hub checks every shock and vibrate command against operator-set caps before the radio sends it. Softproxy's alarm service checks the same caps first (Softproxy ADR-0008 decision 6, `Device.dhall` server check 3). The hub check is the second line. A step over the intensity, pulse, per-stage or gap caps cannot reach the shocker even when the server sends it. The hourly and daily caps hold across a warm restart, and a power cycle costs a full cold boot hold (see Fail closed). To keep the gateway from removing the check, the fork also refuses over-the-air installs and ignores the gateway restart trigger (see Remote paths). The captive portal's local socket refuses the E-Stop, Wi-Fi and account-link commands (SP-46, see Local socket). The hub refuses shock and vibrate unless a live E-Stop stands behind them, and a cap rises only with the E-Stop engaged (SP-113, see Kill path). Each cap or E-Stop refusal reaches the hub log and the gateway heartbeat (see Refusal report). Linear: TIN-7545.
 
 ## What the hub enforces
 
@@ -53,21 +53,48 @@ The captive portal opens an access point with no password whenever the gateway i
 | `SetRfTxPinCommand` | allowed | refused (SPR-75): the pin could be moved onto the E-Stop GPIO | `rftxpin` |
 | a payload a later release adds | handled | refused until it is added to the list | |
 
-The portal itself still serves the static frontend, and the access point still opens while the gateway is down.
+The portal itself still serves the static frontend, and the access point still opens while the gateway is down. It no longer opens because the radio failed while the gateway is connected (`kOpenPortalOnRadioFailure`), since the socket has no repair command to offer.
+
+The socket's defragmenter holds one fragmented message to `kLocalSocketMaxMessageBytes` (4096 bytes, the verifier limit) and uses `TinyVec::try_append`, so an endless fragment stream or a failed allocation drops the message and disconnects the client. Upstream appended with no bound until the `TinyVec` panic restarted the hub, before the allow list saw any message. A client can still spend heap in other ways, so the kill path does not depend on the hub never restarting (see Kill path).
+
+## Kill path
+
+The E-Stop is software on the same ESP32 that drives the radio. `include/softproxy/KillPath.h` holds its rules, and `src/EStopManager.cpp` applies them.
+
+| Rule | Behaviour |
+| --- | --- |
+| Armed | `IsArmed` needs the checker task running on a valid input pin, with a sample in the last 1000 milliseconds. `HandleCommand` refuses shock and vibrate otherwise (`estop-not-armed`). This covers no pin, a disabled task, a stalled task and a config that fell back to defaults while the caps survived. Stop, Sound and Light still pass when not armed |
+| Engaged | The latch is one retained value, written only through `estopmanager_setlatch`. While engaged every command refuses (`estop-engaged`), including Stop, as upstream does. The transmit task ends sequences in flight with their 300 millisecond terminator |
+| Release | Only the hold-to-clear releases it: a new press held for 5 seconds, then the release. A cold boot also starts released, which is the current rule. Whether a cold boot should start engaged is an open decision |
+| Restart | The latch lives in RTC no-init memory, so a software reset, panic or watchdog comes back engaged, and `Init` restores it before any command can arrive. Starting the task reads the latch and never writes it. A button held across a restart does not count as a new press |
+| Gateway `Trigger` `EmergencyStop` | Latches at once, with or without a checker task. With no task nothing can release it but a power cycle |
+| Serial `estop` | `estop enabled false` and a new `estop pin` refuse while the E-Stop is engaged or any cap is above 0. `safetycaps clear` unlocks them once the E-Stop is released. `estop enabled true` refuses with no valid pin. `estop state` prints the running state, where `estop enabled` and `estop pin` print the stored config |
+| Pin separation (SP-113 rule 1) | The E-Stop pin refuses the stored RF TX pin, the board's default RF TX pin, the board LED pins and, on a plain ESP32, GPIO 34 to 39, which have no internal pull-up. The RF TX pin refuses the stored and running E-Stop pins and the LED pins. The rule reads the pin set at run time, because no `Pishock-*` env defines `OPENSHOCK_ESTOP_PIN` and the two envs differ on RF TX (12 on `Pishock-2023`, 15 on `Pishock-Lite-2021`). `rftxpin`, `estop pin`, `jsonconfig`, `rawconfig`, `SaveFromFlatBuffer` and both `Init` paths all check it. `jsonconfig` and `rawconfig` also set `rf.txPin` and the E-Stop fields, so they obey the same lock as serial `estop` |
+| Boot | A stored config that breaks these rules leaves the E-Stop off, which is not armed, so shock and vibrate refuse. A stored RF TX pin on the E-Stop pin or a board LED also leaves the radio off, and `rftxpin` repairs it. The hub still boots, so the serial port stays usable |
+| Cap rise (SP-113 rule 2) | `SafetyCaps::Set` refuses a write that raises any cap unless the E-Stop is armed and engaged. With no pin configured nothing can engage it, so every rise refuses, and an engagement from the gateway `Trigger` does not count because no checker task stands behind it. A lower `minGapSec` and a higher `stageJoinMs` count as rises. Lowering and `safetycaps clear` need no E-Stop |
+
+Order at the attended session, with every cap at 0: `estop pin <n>`, `estop enabled true`, check `estop state`, press the button, `safetycaps ...`, then the hold-to-clear.
+
+What the firmware cannot see:
+
+- The input is pulled up and a press reads low, so the switch must close to ground when pressed. A cut wire or an unplugged cable reads as released, and nothing detects it. Fixing that needs a hardware choice, for example a normally closed or supervised circuit with firmware polarity to match.
+- A momentary button leaves the latch to hold the state. A latching button stays pressed: releasing it engages nothing and clears only after the hold.
+- The button that engages also clears, with no second factor. A press during the 250 millisecond rearm window is ignored unless still held at its end.
 
 ## Refusal report
 
-Before this change a refused step left one log line and nothing else, so Softproxy logged an actuation that never reached the shocker (softproxy #27 review, finding 4). `SafetyCaps::Admit` now counts every refusal in `include/softproxy/RefusalReport.h` and writes one log line. Gateway and serial `rftransmit` commands both pass there.
+Before this change a refused step left one log line and nothing else, so Softproxy logged an actuation that never reached the shocker (softproxy #27 review, finding 4). `SafetyCaps::Admit` now counts every cap refusal in `include/softproxy/RefusalReport.h` and writes one log line, and `HandleCommand` does the same for the E-Stop refusals through `SafetyCaps::RecordRefusal`. Gateway and serial `rftransmit` commands both pass there. A Stop, Sound or Light refused by an engaged E-Stop logs `channel=other`.
 
 | Trace | Form | Read by |
 | --- | --- | --- |
-| Hub log (serial) | `softproxy-refusal seq=<n> channel=<shock\|vibrate> verdict=<name>`, level warning, kept by the production log level `INFO` | Softproxy on the local serial path |
-| Gateway heartbeat | `Pong.softproxy_cap_refusals` (`uint32`, field 2, vtable offset 8): refusals since boot, saturating at 16777215. `Pong.softproxy_last_refusal` (`uint8`, field 3, vtable offset 10): verdict code of the latest refusal | the gateway, on every Ping |
-| Serial `safetycaps` | `SafetyCaps\|refusals\|count=<n>,last=<name>` after the two channel lines | the operator or Softproxy |
+| Hub log (serial) | `softproxy-refusal seq=<n> channel=<shock\|vibrate\|other> verdict=<name>`, level warning, kept by the production log level `INFO` | Softproxy on the local serial path |
+| Gateway heartbeat | `Pong.softproxy_cap_refusals` (`uint32`, field 2, vtable offset 8): refusals since boot, saturating at 16777215. `Pong.softproxy_last_refusal` (`uint8`, field 3, vtable offset 10): verdict code of the latest refusal. `Pong.softproxy_estop` (`uint8`, field 4, vtable offset 12): bit 0 armed, bit 1 engaged | the gateway, on every Ping |
+| Serial `safetycaps` | `SafetyCaps\|refusals\|count=<n>,last=<name>` and `SafetyCaps\|estop\|armed=<bool>,engaged=<bool>` after the two channel lines | the operator or Softproxy |
+| Hub log on an E-Stop change | `softproxy-estop state=<idle\|active\|active-clearing\|awaiting-release>`, level warning | Softproxy on the local serial path |
 
-The verdict names are those in the cap table above, plus `caps-not-set` and `boot-hold`. Wire codes: 0 none, 2 `caps-not-set`, 3 `boot-hold`, 4 `over-intensity`, 5 `over-pulse-ms`, 6 `over-pulses`, 7 `gap`, 8 `hourly`, 9 `daily`. A receiver that sees `softproxy_cap_refusals` rise between two heartbeats knows that many steps were refused. The count lives in RAM and restarts at 0 after any reboot, which a lower `uptime` in the same `Pong` shows.
+The verdict names are those in the cap table above, plus `caps-not-set`, `boot-hold`, `estop-engaged` and `estop-not-armed`. Wire codes: 0 none, 2 `caps-not-set`, 3 `boot-hold`, 4 `over-intensity`, 5 `over-pulse-ms`, 6 `over-pulses`, 7 `gap`, 8 `hourly`, 9 `daily`, 10 `estop-engaged`, 11 `estop-not-armed`. A receiver that sees `softproxy_cap_refusals` rise between two heartbeats knows that many steps were refused. The count lives in RAM and restarts at 0 after any reboot, which a lower `uptime` in the same `Pong` shows.
 
-The two fields come after `uptime` and `rssi`, so a gateway built from the upstream schema reads the heartbeat as before and ignores them. `softproxy/schemas/HubToGatewayMessage.fbs` holds the fork schema. The `schemas` submodule still points at upstream commit `aaceae18`. `include/serialization/_fbs/HubToGatewayMessage_generated.h` is byte-identical to the output of `scripts/flatc` (version 25.9.23) for that fork schema, laid over the submodule, with the C++ flags in `scripts/generate_schemas.py`. `scripts/generate_schemas.py` itself reads only the submodule, so running it unchanged would drop the two fields.
+The three fields come after `uptime` and `rssi`, so a gateway built from the upstream schema reads the heartbeat as before and ignores them. `softproxy/schemas/HubToGatewayMessage.fbs` holds the fork schema. The `schemas` submodule still points at upstream commit `aaceae18`. `include/serialization/_fbs/HubToGatewayMessage_generated.h` is byte-identical to the output of `scripts/flatc` (version 25.9.23) for that fork schema, laid over the submodule, with the C++ flags in `scripts/generate_schemas.py`. `scripts/generate_schemas.py` itself reads only the submodule, so running it unchanged would drop the three fields.
 
 ## Who can set the caps
 
@@ -80,28 +107,32 @@ The caps live in their own NVS namespace (`spcaps`), outside the config file. `r
 | `safetycaps vibrate ...` | store the vibrate caps, same arguments |
 | `safetycaps clear` | set every cap to 0 |
 
-`factoryreset` also clears the caps. The operator sets the values at an attended calibration session (Softproxy SP-10). The real values live only in the Softproxy private registry and never in this repository. Softproxy's alarm service must never send `safetycaps shock` or `safetycaps vibrate`. It may read `safetycaps` and refuse when the hub caps differ from the registry.
+Raising a cap needs the E-Stop armed and engaged (see Kill path). `factoryreset` also clears the caps. The operator sets the values at an attended calibration session (Softproxy SP-10). The real values live only in the Softproxy private registry and never in this repository. Softproxy's alarm service must never send `safetycaps shock` or `safetycaps vibrate`. It may read `safetycaps` and refuse when the hub caps differ from the registry.
 
 ## Code
 
 | File | Role |
 | --- | --- |
 | `include/softproxy/CapLimiter.h` | decision logic, cold boot hold and the retained state seal, no Arduino or ESP-IDF dependency |
-| `include/softproxy/Lockout.h` | the OTA install, gateway restart and captive portal enable lockouts, and the local socket allow list |
+| `include/softproxy/Lockout.h` | the OTA install, gateway restart and captive portal lockouts, the local socket allow list and its message bound |
+| `include/softproxy/KillPath.h` | the pin rules, the cap rise rule, the E-Stop config rule, the wire code and the retained latch, no Arduino or ESP-IDF dependency |
+| `src/EStopManager.cpp` | the latch, the armed state, the checker task and the `estop` refusals |
+| `src/WebSocketDeFragger.cpp`, `include/TinyVec.h`, `src/captiveportal/CaptivePortalInstance.cpp` | the message bound on port 81 and the disconnect after an overflow |
 | `include/softproxy/RefusalReport.h` | the refusal count, the wire codes and the hub log line, no Arduino or ESP-IDF dependency |
 | `include/softproxy/SafetyCaps.h`, `src/softproxy/SafetyCaps.cpp` | NVS store, mutex, the `Admit` gate, the hub clock and the RTC no-init copy of the counters |
 | `src/OtaUpdateManager.cpp`, `src/message_handlers/websocket/gateway/Trigger.cpp`, `src/captiveportal/Manager.cpp` | apply the gateway lockouts |
 | `src/message_handlers/websocket/Local.cpp` | applies the local socket allow list |
-| `src/serialization/WSGateway.cpp`, `softproxy/schemas/HubToGatewayMessage.fbs` | the two `Pong` refusal fields |
-| `src/CommandHandler.cpp` | `HandleCommand` calls `SafetyCaps::Admit` after the E-Stop check, before the radio. Gateway and serial `rftransmit` commands both pass here |
+| `src/serialization/WSGateway.cpp`, `softproxy/schemas/HubToGatewayMessage.fbs` | the three `Pong` fields |
+| `src/CommandHandler.cpp` | `HandleCommand` calls the E-Stop checks and `SafetyCaps::Admit` before the radio, and `SetRfTxPin` applies the pin rule. Gateway and serial `rftransmit` commands both pass here |
 | `src/serial/command_handlers/safetycaps.cpp` | the `safetycaps` serial command |
-| `src/config/Config.cpp` | `FactoryReset` clears the caps |
+| `src/config/Config.cpp` | `FactoryReset` clears the caps, and the whole-config writers apply the E-Stop rule |
 | `test/native/test_cap_limiter.cpp` | host test of the decision logic, the retained state and the lockout constants. Every cap at 0 is checked against all 256 intensities by all 65536 durations |
 | `test/native/test_local_lockdown.cpp` | host test of the local socket allow list, the portal lockout, the refusal count, the wire codes and the log line |
-| `test/native/test_command_paths.cpp`, `test/native/stubs/` | host test that links the real `HandleCommand`, `SafetyCaps`, gateway and local dispatchers, `Trigger`, `SetRfTxPinCommand`, serial `rftransmit` and `rftxpin` and the five encoders, with fakes only at the hardware edge. Its header gives the command. It needs the pinned flatbuffers headers, so `softproxy-host-test.yml` does not run it yet |
-| `.github/workflows/softproxy-host-test.yml` | runs the first two host tests on pushes and PRs to `softproxy/**` |
+| `test/native/test_command_paths.cpp`, `test/native/stubs/` | host test that links the real `HandleCommand`, `SafetyCaps`, gateway and local dispatchers, `Trigger`, `SetRfTxPinCommand`, serial `rftransmit` and `rftxpin` and the five encoders. Fakes: the hardware edge, and the firmware logic in `EStopManager` (one boolean), `RFTransmitter`, `Config` and `CaptivePortal`. Its header gives the command |
+| `test/native/test_kill_path.cpp`, `test/native/kill_stubs/` | host test of the real `EStopManager` task and latch, `HandleCommand`, `SafetyCaps`, `RFTransmitter` and its task, `Sequence`, serial `estop`, `rftxpin` and `safetycaps`, gateway `Trigger` and `WebSocketDeFragger`, built once for each `Pishock-*` RF TX default. Fakes: GPIO, RMT, FreeRTOS, NVS, `Config` and the number parser in `Convert`. Its header gives the command |
+| `.github/workflows/softproxy-host-test.yml` | runs all four host tests on pushes and PRs to `softproxy/**` and on PRs to the cap branch |
 
-Run the host tests with:
+Run the first two host tests with:
 
 ```sh
 g++ -std=c++20 -Wall -Wextra -Werror -Iinclude test/native/test_cap_limiter.cpp -o cap_limiter_test && ./cap_limiter_test
@@ -113,9 +144,13 @@ g++ -std=c++20 -Wall -Wextra -Werror -Iinclude test/native/test_local_lockdown.c
 - The hub cannot see a request's purpose, schedule or arm state. Those stay Softproxy server checks 4 to 8.
 - Hourly and daily counters do not survive a power cycle. The cold boot hold spaces stages after one, and the server counters stay the authority (see Fail closed).
 - RTC no-init retention across a software, panic and watchdog reset is ESP-IDF behaviour, not yet checked on the PiShock boards.
-- The upstream live control gateway (`openshock/live-control-gateway:3.17.0`) does not read the two `Pong` fields. They reach it on the wire, but Softproxy sees them only through a gateway change or by reading the serial log and `safetycaps`.
+- The upstream live control gateway (`openshock/live-control-gateway:3.17.0`) does not read the three `Pong` fields. They reach it on the wire, but Softproxy sees them only through a gateway change or by reading the serial log and `safetycaps`.
 - The refusal count restarts after every reboot. A refusal just before a reboot shows in the hub log, not in the next heartbeat.
 - The TypeScript code generated for the frontend (`frontend/src/lib/_fbs`) still has the upstream `Pong`. The frontend never reads it.
-- SP-113 (TIN-7125 `b8345799`) is not implemented at this commit. It rules two things: the fork refuses moving the RF transmitter onto the E-Stop GPIO, and a cap can rise only while the E-Stop is engaged. Today raising a cap needs only serial access, and serial `rftxpin` and `estop pin` do not check the pin against each other, so a person at the serial port can still put the transmitter on the E-Stop GPIO. SPR-75 closes that path on port 81 only.
-- No `Pishock-*` board environment defines `OPENSHOCK_ESTOP_PIN`, so the E-Stop starts disabled with no pin until `estop pin` and `estop enabled` run over serial.
+- No `Pishock-*` board environment defines `OPENSHOCK_ESTOP_PIN`, so the E-Stop starts with no pin, not armed, until `estop pin` and `estop enabled` run over serial. Until then every shock and vibrate command refuses.
+- RTC no-init retention of the E-Stop latch is the same unverified ESP-IDF behaviour as the counters above.
+- The E-Stop rules are host-tested with a fake GPIO. A switch, a cable, a cable pull and the board are tests for the attended session.
+- The keep-alive task and the `Config.cpp` writers are read, not run: the host test sets `keepAliveEnabled` false and has no filesystem. It tests the decision `KillConfigChangeAllowed` and scans that each writer calls it.
 - A serial `rftransmit` command in the host test comes from a fake parser, so `JsonSerial::ParseShockerCommand` is read, not run.
+- Stack margin on `main_app` for the refusal path is not profiled. `SealRetained` and `RestoreRetained` no longer put the 2 kilobyte record on the stack. The path still runs `snprintf` and a log call on each refusal.
+- At every cap 0 the image can still transmit. Stop becomes a vibrate frame at intensity 0, as do the keep-alive and every terminator, and Sound is uncapped up to 65535 milliseconds. The encoding is non-electrical by source reading only. What a receiver does with a vibrate frame at intensity 0 is unmeasured.
