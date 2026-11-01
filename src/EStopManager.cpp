@@ -10,13 +10,17 @@ const char* const TAG = "EStopManager";
 #include "events/Events.h"
 #include "Logging.h"
 #include "SimpleMutex.h"
+#include "softproxy/KillPath.h"
+#include "softproxy/SafetyCaps.h"
 #include "util/TaskUtils.h"
 
 #include <driver/gpio.h>
+#include <esp_attr.h>
 #include <freertos/queue.h>
 #include <freertos/task.h>
 #include <freertos/timers.h>
 
+#include <atomic>
 #include <cstdint>
 
 using namespace OpenShock;
@@ -29,17 +33,50 @@ const uint16_t k_estopCheckMask       = 0xFFFF >> ((sizeof(uint16_t) * 8) - k_es
 // Grace period after deactivation (prevents immediate re-trigger on release bounce/EMI)
 const uint32_t k_estopRearmGraceTime = 250;  // tune as needed
 
+// The checker counts as dead when it has not sampled for this long, so a stalled task cannot read as armed.
+const uint32_t k_estopSampleStaleTime = 1000;
+
 static OpenShock::SimpleMutex s_estopMutex = {};
 static gpio_num_t s_estopPin               = GPIO_NUM_NC;
 static TaskHandle_t s_estopTask            = nullptr;
 
-static EStopState s_lastPublishedState = EStopState::Idle;
-static bool s_estopActive              = false;
-static int64_t s_estopActivatedAt      = 0;
+static EStopState s_lastPublishedState      = EStopState::Idle;
+static std::atomic<bool> s_estopActive      = {false};
+static int64_t s_estopActivatedAt           = 0;
+static std::atomic<uint32_t> s_lastSampleMs = {0};
 
 static volatile bool s_externallyTriggered = false;
 
 static bool s_estopInitialized = false;
+
+// The latch. Only `estopmanager_setlatch` writes it, so RAM and the retained copy never disagree. Survives a warm
+// restart. Its content is garbage after a cold boot, which the check rejects.
+static RTC_NOINIT_ATTR Softproxy::RetainedEStop s_retainedLatch;
+static portMUX_TYPE s_latchMux = portMUX_INITIALIZER_UNLOCKED;
+
+static void estopmanager_setlatch(bool engaged)
+{
+  portENTER_CRITICAL(&s_latchMux);
+  s_estopActive.store(engaged);
+  Softproxy::SealEStop(s_retainedLatch, engaged);
+  portEXIT_CRITICAL(&s_latchMux);
+}
+
+static const char* estopmanager_statename(EStopState state)
+{
+  switch (state) {
+    case EStopState::Idle:
+      return "idle";
+    case EStopState::Active:
+      return "active";
+    case EStopState::ActiveClearing:
+      return "active-clearing";
+    case EStopState::AwaitingRelease:
+      return "awaiting-release";
+    default:
+      return "unknown";
+  }
+}
 
 static void estopmanager_updateexternals(EStopState state)
 {
@@ -48,6 +85,8 @@ static void estopmanager_updateexternals(EStopState state)
   }
 
   s_lastPublishedState = state;
+
+  OS_LOGW(TAG, "softproxy-estop state=%s", estopmanager_statename(state));
 
   // Post the current state as the event payload
   ESP_ERROR_CHECK(esp_event_post(OPENSHOCK_EVENTS, OPENSHOCK_EVENT_ESTOP_STATE_CHANGED, &state, sizeof(state), portMAX_DELAY));
@@ -58,14 +97,13 @@ static void estopmgr_checkertask(void* pvParameters)
 {
   (void)pvParameters;
 
-  // Ensure known initial state
-  s_lastPublishedState = EStopState::Idle;
-  s_estopActive        = false;
-  s_estopActivatedAt   = 0;
+  // The latch outlives this task. Starting the task reads it and never writes it, so a restart of the task cannot
+  // clear an engaged E-Stop. Only the hold-to-clear below releases it.
+  const bool startedEngaged = s_estopActive.load();
 
   uint16_t history = 0xFFFF;  // Bit history of samples, 0 is pressed
 
-  EStopState state      = EStopState::Idle;
+  EStopState state      = startedEngaged ? EStopState::Active : EStopState::Idle;
   int64_t deactivatesAt = 0;
 
   // Rearm grace state
@@ -73,7 +111,8 @@ static void estopmgr_checkertask(void* pvParameters)
   bool rearmBlocked = false;
 
   // Debounced button state: true == pressed, false == released
-  bool lastBtnState = false;
+  // Started engaged, a button held across the restart is not a new press, so it cannot start the hold-to-clear.
+  bool lastBtnState = startedEngaged;
 
   for (;;) {
     // Sleep for the update rate
@@ -81,18 +120,15 @@ static void estopmgr_checkertask(void* pvParameters)
 
     // Get current time
     int64_t now = OpenShock::millis();
+    s_lastSampleMs.store(static_cast<uint32_t>(now));
 
     // Handle external trigger: forcibly set the E-Stop active.
     if (s_externallyTriggered) {
       s_externallyTriggered = false;
 
-      if (!s_estopActive) {
-        s_estopActivatedAt = now;
-      }
-
-      s_estopActive = true;
-      state         = EStopState::Active;
-      rearmBlocked  = false;
+      estopmanager_setlatch(true);
+      state        = EStopState::Active;
+      rearmBlocked = false;
 
       estopmanager_updateexternals(state);
 
@@ -127,8 +163,8 @@ static void estopmgr_checkertask(void* pvParameters)
 
         if (btnState) {
           state              = EStopState::Active;
-          s_estopActive      = true;
           s_estopActivatedAt = now;
+          estopmanager_setlatch(true);
         }
         break;
 
@@ -151,8 +187,8 @@ static void estopmgr_checkertask(void* pvParameters)
 
       case EStopState::AwaitingRelease:
         if (!btnState) {  // fully released -> clear E-Stop
-          state         = EStopState::Idle;
-          s_estopActive = false;
+          state = EStopState::Idle;
+          estopmanager_setlatch(false);
 
           // Start grace period to prevent immediate re-trigger.
           rearmBlocked = true;
@@ -172,6 +208,10 @@ static void estopmgr_checkertask(void* pvParameters)
 static bool estopmgr_setestopenabled(bool enabled)
 {
   if (enabled) {
+    if (!OpenShock::IsValidInputPin(s_estopPin)) {
+      OS_LOGE(TAG, "Refusing to start the EStop with no valid pin: %hhi", static_cast<int8_t>(s_estopPin));
+      return false;
+    }
     if (s_estopTask == nullptr) {
       if (TaskUtils::TaskCreateUniversal(estopmgr_checkertask, TAG, 4096, nullptr, 5, &s_estopTask, 1) != pdPASS) {  // TODO: Profile stack size and set priority
         OS_LOGE(TAG, "Failed to create EStop event handler task");
@@ -186,6 +226,27 @@ static bool estopmgr_setestopenabled(bool enabled)
     }
   }
 
+  return true;
+}
+
+// Whether the E-Stop settings are locked: they stay put while it is engaged or any cap can let a command through.
+static bool estopmgr_settingslocked()
+{
+  return s_estopActive.load() || Softproxy::SafetyCaps::AnySet();
+}
+
+// Whether `pin` may be the E-Stop pin, against the stored RF TX pin. A failed read refuses.
+static bool estopmgr_pinallowed(gpio_num_t pin)
+{
+  gpio_num_t txPin;
+  if (!OpenShock::Config::GetRFConfigTxPin(txPin)) {
+    OS_LOGE(TAG, "Failed to get RF TX pin from config");
+    return false;
+  }
+  if (Softproxy::EStopPinConflicts(pin, txPin)) {
+    OS_LOGE(TAG, "EStop pin %hhi conflicts with the RF TX pin, a board LED or has no pull-up", static_cast<int8_t>(pin));
+    return false;
+  }
   return true;
 }
 
@@ -256,6 +317,13 @@ bool EStopManager::Init()
   }
   s_estopInitialized = true;
 
+  // Restore the latch before anything can send a command. A warm restart comes back engaged.
+  bool engaged = false;
+  if (Softproxy::RestoreEStop(s_retainedLatch, engaged) && engaged) {
+    OS_LOGW(TAG, "Restored an engaged EStop after a warm restart");
+  }
+  estopmanager_setlatch(engaged);
+
   Config::EStopConfig cfg;
   if (!OpenShock::Config::GetEStop(cfg)) {
     OS_LOGE(TAG, "Failed to get EStop pin from config");
@@ -264,14 +332,15 @@ bool EStopManager::Init()
 
   OpenShock::ScopedLock lock__(&s_estopMutex);
 
-  if (!estopmgr_set_pin_impl(cfg.gpioPin)) {
-    OS_LOGE(TAG, "Failed to set EStop pin");
-    return false;
+  // A stored config can hold a bad pin. The E-Stop then stays off, which is not armed, so shock and vibrate refuse.
+  // Returning false here would restart the hub in a loop and take the serial port with it.
+  if (!estopmgr_pinallowed(cfg.gpioPin) || !estopmgr_set_pin_impl(cfg.gpioPin)) {
+    OS_LOGE(TAG, "EStop stays off, shock and vibrate commands will refuse");
+    return true;
   }
 
-  if (!estopmgr_setestopenabled(cfg.enabled)) {
-    OS_LOGE(TAG, "Failed to create EStop event handler task");
-    return false;
+  if (cfg.enabled && !estopmgr_setestopenabled(true)) {
+    OS_LOGE(TAG, "EStop stays off, shock and vibrate commands will refuse");
   }
 
   return true;
@@ -281,13 +350,18 @@ bool EStopManager::SetEStopEnabled(bool enabled)
 {
   OpenShock::ScopedLock lock__(&s_estopMutex);
 
-  if (s_estopPin == GPIO_NUM_NC) {
+  if (!enabled && estopmgr_settingslocked()) {
+    OS_LOGW(TAG, "Refusing to disable the EStop while it is engaged or a cap is set");
+    return false;
+  }
+
+  if (enabled && s_estopPin == GPIO_NUM_NC) {
     gpio_num_t pin;
     if (!OpenShock::Config::GetEStopGpioPin(pin)) {
       OS_LOGE(TAG, "Failed to get EStop pin from config");
       return false;
     }
-    if (!estopmgr_set_pin_impl(pin)) {
+    if (!estopmgr_pinallowed(pin) || !estopmgr_set_pin_impl(pin)) {
       OS_LOGE(TAG, "Failed to set EStop pin");
       return false;
     }
@@ -300,12 +374,41 @@ bool EStopManager::SetEStopPin(gpio_num_t pin)
 {
   OpenShock::ScopedLock lock__(&s_estopMutex);
 
+  if (pin == s_estopPin) {
+    return true;
+  }
+
+  if (estopmgr_settingslocked()) {
+    OS_LOGW(TAG, "Refusing to move the EStop pin while it is engaged or a cap is set");
+    return false;
+  }
+
+  if (!estopmgr_pinallowed(pin)) {
+    return false;
+  }
+
   return estopmgr_set_pin_impl(pin);
 }
 
 bool EStopManager::IsEStopped()
 {
-  return s_estopActive;
+  return s_estopActive.load();
+}
+
+bool EStopManager::IsArmed()
+{
+  if (s_estopTask == nullptr || !OpenShock::IsValidInputPin(s_estopPin)) {
+    return false;
+  }
+
+  // Read the sample first. In the other order a sample between the two reads would wrap the difference.
+  const uint32_t lastSampleMs = s_lastSampleMs.load();
+  return static_cast<uint32_t>(OpenShock::millis()) - lastSampleMs <= k_estopSampleStaleTime;
+}
+
+gpio_num_t EStopManager::GetRunningPin()
+{
+  return s_estopPin;
 }
 
 int64_t EStopManager::LastEStopped()
@@ -315,6 +418,19 @@ int64_t EStopManager::LastEStopped()
 
 void EStopManager::Trigger()
 {
-  // This will be picked up by the checker task and lead to an E-Stop activation
-  s_externallyTriggered = true;
+  // Engage here, not in the checker task, because a hub with no pin has no task. The latch must hold from this call.
+  if (!s_estopActive.load()) {
+    s_estopActivatedAt = OpenShock::millis();
+  }
+  estopmanager_setlatch(true);
+
+  OpenShock::ScopedLock lock__(&s_estopMutex);
+
+  if (s_estopTask != nullptr) {
+    // The checker task moves its state to Active and publishes it.
+    s_externallyTriggered = true;
+    return;
+  }
+
+  estopmanager_updateexternals(EStopState::Active);
 }

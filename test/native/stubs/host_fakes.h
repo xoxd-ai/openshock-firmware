@@ -1,14 +1,17 @@
 #pragma once
 
-// Fakes for the hardware edge of the hub, for test/native/test_command_paths.cpp. The firmware's own command
-// path compiles against these on a host: every header in this directory forwards here, so the radio, the NVS
-// store, the mutexes and the serial and socket transports are fakes, and the code that decides is real.
+// Fakes for test/native/test_command_paths.cpp and test/native/test_kill_path.cpp. The firmware's own code compiles
+// against these on a host: every header in this directory forwards here. Fakes in both tests: the NVS store, the
+// mutexes, the `Config` store and the serial and socket transports. test_command_paths also fakes `RFTransmitter`
+// and `EStopManager`, as firmware logic, not hardware. With SOFTPROXY_KILL_TEST set those two are real, and
+// test_kill_path.cpp supplies FreeRTOS tasks and queues, GPIO, RMT and events.
 
 #include "ShockerCommandType.h"
 #include "ShockerModelType.h"
 #include "span.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cstdarg>
 #include <cstdint>
 #include <cstdio>
@@ -38,6 +41,8 @@ typedef int esp_err_t;
 typedef const char* esp_event_base_t;
 typedef uint32_t nvs_handle_t;
 typedef void (*TaskFunction_t)(void*);
+typedef unsigned int UBaseType_t;
+typedef int portMUX_TYPE;
 
 enum gpio_num_t : int8_t {
   GPIO_NUM_NC = -1,
@@ -60,13 +65,25 @@ enum nvs_open_mode_t {
 #define ESP_ERR_NVS_NOT_FOUND 0x1102
 #define RTC_NOINIT_ATTR
 #define OPENSHOCK_GPIO_INVALID -1
-#define OPENSHOCK_RF_TX_GPIO   12
+#ifndef OPENSHOCK_RF_TX_GPIO
+#define OPENSHOCK_RF_TX_GPIO 12
+#endif
+#define DISABLE_COPY(TypeName)              \
+  TypeName(const TypeName&)       = delete; \
+  void operator=(const TypeName&) = delete
+#define DISABLE_MOVE(TypeName)         \
+  TypeName(TypeName&&)       = delete; \
+  void operator=(TypeName&&) = delete
+#define portMUX_INITIALIZER_UNLOCKED 0
+#define portENTER_CRITICAL(mux)      (void)(mux)
+#define portEXIT_CRITICAL(mux)       (void)(mux)
 
 inline const char* esp_err_to_name(esp_err_t)
 {
   return "fake";
 }
 
+#ifndef SOFTPROXY_KILL_TEST
 inline QueueHandle_t xQueueCreate(int, std::size_t)
 {
   return nullptr;
@@ -92,6 +109,19 @@ inline eTaskState eTaskGetState(TaskHandle_t)
 {
   return eDeleted;
 }
+#else
+QueueHandle_t xQueueCreate(int, std::size_t);
+BaseType_t xQueueReceive(QueueHandle_t, void*, TickType_t);
+BaseType_t xQueueSend(QueueHandle_t, const void*, TickType_t);
+void vQueueDelete(QueueHandle_t);
+void vTaskDelay(TickType_t);
+void vTaskDelete(TaskHandle_t);
+eTaskState eTaskGetState(TaskHandle_t);
+inline int xPortGetCoreID()
+{
+  return 0;
+}
+#endif
 
 // In-memory NVS: one blob, with injectable errors.
 struct FakeNvs {
@@ -159,6 +189,8 @@ inline void hostLog(const char* format, ...)
 #define OS_LOGI(TAG, format, ...) hostLog(format, ##__VA_ARGS__)
 #define OS_LOGW(TAG, format, ...) hostLog(format, ##__VA_ARGS__)
 #define OS_LOGE(TAG, format, ...) hostLog(format, ##__VA_ARGS__)
+extern int g_panics;
+#define OS_PANIC_INSTANT(TAG, format, ...) (hostLog(format, ##__VA_ARGS__), ++g_panics, std::abort())
 
 extern std::string g_serialOut;
 #define SERPR_SYS(format, ...)      hostSerial(format, ##__VA_ARGS__)
@@ -216,6 +248,10 @@ namespace OpenShock {
   {
     return pin >= 0 && pin < 40;
   }
+  constexpr bool IsValidInputPin(int pin)
+  {
+    return pin >= 0 && pin < 40;
+  }
 
   // Mutexes always lock: the host test runs on one thread.
   class SimpleMutex { };
@@ -235,6 +271,7 @@ namespace OpenShock {
     ScopedWriteLock(ReadWriteMutex*, TickType_t = portMAX_DELAY) { }
   };
 
+#ifndef SOFTPROXY_KILL_TEST
   enum class EStopState : uint8_t {
     Idle,
     Active,
@@ -242,8 +279,11 @@ namespace OpenShock {
 
   namespace EStopManager {
     bool IsEStopped();
+    bool IsArmed();
+    gpio_num_t GetRunningPin();
     void Trigger();
   }  // namespace EStopManager
+#endif
 
   namespace Config {
     struct RFConfig {
@@ -259,19 +299,67 @@ namespace OpenShock {
     bool SetRFConfigTxPin(gpio_num_t txPin);
     bool SetRFConfigKeepAliveEnabled(bool enabled);
     bool GetEStop(EStopConfig& out);
+    bool GetEStopEnabled(bool& out);
+    bool SetEStopEnabled(bool enabled);
+    bool GetEStopGpioPin(gpio_num_t& out);
+    bool SetEStopGpioPin(gpio_num_t gpioPin);
   }  // namespace Config
 
+#ifndef SOFTPROXY_KILL_TEST
   namespace TaskUtils {
     inline BaseType_t TaskCreateExpensive(TaskFunction_t, const char*, uint32_t, void*, int, TaskHandle_t*)
     {
       return pdPASS;
     }
   }  // namespace TaskUtils
+#endif
 
   namespace Convert {
     inline bool ToGpioNum(std::string_view text, gpio_num_t& out)
     {
+      if (text.empty() || !std::all_of(text.begin(), text.end(), [](char c) { return c >= '0' && c <= '9'; })) {
+        return false;
+      }
       out = static_cast<gpio_num_t>(std::atoi(std::string(text).c_str()));
+      return true;
+    }
+    template<typename T>
+    inline bool ToUnsignedForTest(std::string_view text, T& out)
+    {
+      uint64_t value = 0;
+      if (text.empty() || text.size() > 19) {
+        return false;
+      }
+      for (char c : text) {
+        if (c < '0' || c > '9') {
+          return false;
+        }
+        value = value * 10 + static_cast<uint64_t>(c - '0');
+      }
+      if (value > static_cast<uint64_t>(static_cast<T>(~T {0}))) {
+        return false;
+      }
+      out = static_cast<T>(value);
+      return true;
+    }
+    inline bool ToUint8(std::string_view text, uint8_t& out)
+    {
+      return ToUnsignedForTest(text, out);
+    }
+    inline bool ToUint16(std::string_view text, uint16_t& out)
+    {
+      return ToUnsignedForTest(text, out);
+    }
+    inline bool ToUint32(std::string_view text, uint32_t& out)
+    {
+      return ToUnsignedForTest(text, out);
+    }
+    inline bool ToBool(std::string_view text, bool& out)
+    {
+      if (text != "true"sv && text != "false"sv) {
+        return false;
+      }
+      out = text == "true"sv;
       return true;
     }
   }  // namespace Convert
@@ -287,6 +375,7 @@ namespace OpenShock {
   extern std::vector<RadioSend> g_radio;
   extern std::vector<gpio_num_t> g_transmitterPins;  // One entry per transmitter built, in order.
 
+#ifndef SOFTPROXY_KILL_TEST
   class RFTransmitter {
   public:
     explicit RFTransmitter(gpio_num_t pin)
@@ -305,6 +394,7 @@ namespace OpenShock {
   private:
     gpio_num_t m_pin;
   };
+#endif
 
   namespace CaptivePortal {
     void SetAlwaysEnabled(bool alwaysEnabled);
@@ -352,6 +442,12 @@ namespace OpenShock {
         m_entries.emplace_back();
         return m_entries.back();
       }
+      template<typename Fn>
+      CommandEntry& addCommand(std::string_view, std::string_view, Fn)
+      {
+        m_entries.emplace_back();
+        return m_entries.back();
+      }
 
     private:
       std::vector<CommandEntry> m_entries;
@@ -359,17 +455,72 @@ namespace OpenShock {
     namespace CommandHandlers {
       CommandGroup RfTransmitHandler();
       CommandGroup RfTxPinHandler();
+      CommandGroup EStopHandler();
+      CommandGroup SafetyCapsHandler();
     }  // namespace CommandHandlers
   }  // namespace Serial
 }  // namespace OpenShock
 
+// The WebSocket event types src/WebSocketDeFragger.cpp handles.
+enum WStype_t {
+  WStype_ERROR,
+  WStype_DISCONNECTED,
+  WStype_CONNECTED,
+  WStype_TEXT,
+  WStype_BIN,
+  WStype_FRAGMENT_TEXT_START,
+  WStype_FRAGMENT_BIN_START,
+  WStype_FRAGMENT,
+  WStype_FRAGMENT_FIN,
+  WStype_PING,
+  WStype_PONG,
+};
+
 // esp_event and esp_system.
 extern esp_event_base_t OPENSHOCK_EVENTS;
 #define OPENSHOCK_EVENT_ESTOP_STATE_CHANGED 1
+#ifndef SOFTPROXY_KILL_TEST
 inline esp_err_t esp_event_handler_register(esp_event_base_t, int32_t, void (*)(void*, esp_event_base_t, int32_t, void*), void*)
 {
   return ESP_OK;
 }
+#else
+esp_err_t esp_event_handler_register(esp_event_base_t, int32_t, void (*)(void*, esp_event_base_t, int32_t, void*), void*);
+esp_err_t esp_event_post(esp_event_base_t, int32_t, const void*, std::size_t, TickType_t);
+#define ESP_ERROR_CHECK(x) (void)(x)
+
+// GPIO and RMT, which test_kill_path.cpp supplies.
+enum gpio_mode_t {
+  GPIO_MODE_INPUT,
+};
+enum gpio_pullup_t {
+  GPIO_PULLUP_ENABLE,
+};
+enum gpio_pulldown_t {
+  GPIO_PULLDOWN_DISABLE,
+};
+enum gpio_int_type_t {
+  GPIO_INTR_DISABLE,
+};
+struct gpio_config_t {
+  uint64_t pin_bit_mask;
+  gpio_mode_t mode;
+  gpio_pullup_t pull_up_en;
+  gpio_pulldown_t pull_down_en;
+  gpio_int_type_t intr_type;
+};
+esp_err_t gpio_config(const gpio_config_t*);
+esp_err_t gpio_reset_pin(gpio_num_t);
+int gpio_get_level(gpio_num_t);
+
+struct rmt_obj_t;
+#define RMT_TX_MODE        1
+#define RMT_MEM_64         64
+rmt_obj_t* rmtInit(int, int, int);
+float rmtSetTick(rmt_obj_t*, float);
+bool rmtDeinit(rmt_obj_t*);
+bool rmtWriteBlocking(rmt_obj_t*, const rmt_data_t*, std::size_t);
+#endif
 extern int g_restarts;
 inline void esp_restart()
 {

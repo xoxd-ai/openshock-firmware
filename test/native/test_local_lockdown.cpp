@@ -165,7 +165,9 @@ static void wireCodeNames()
   CHECK(std::strcmp(RefusalCodeName(0), "none") == 0);
   CHECK(std::strcmp(RefusalCodeName(2), "caps-not-set") == 0);
   CHECK(std::strcmp(RefusalCodeName(9), "daily") == 0);
-  CHECK(std::strcmp(RefusalCodeName(10), "unknown") == 0);
+  CHECK(std::strcmp(RefusalCodeName(10), "estop-engaged") == 0);
+  CHECK(std::strcmp(RefusalCodeName(11), "estop-not-armed") == 0);
+  CHECK(std::strcmp(RefusalCodeName(12), "unknown") == 0);
   CHECK(std::strcmp(RefusalCodeName(255), "unknown") == 0);
 }
 

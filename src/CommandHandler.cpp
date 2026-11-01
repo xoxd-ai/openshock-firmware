@@ -15,6 +15,7 @@ const char* const TAG = "CommandHandler";
 #include "radio/RFTransmitter.h"
 #include "ReadWriteMutex.h"
 #include "SimpleMutex.h"
+#include "softproxy/KillPath.h"
 #include "softproxy/SafetyCaps.h"
 #include "util/TaskUtils.h"
 
@@ -205,21 +206,28 @@ bool CommandHandler::Init()
     }
   }
 
-  s_rfTransmitter = std::make_unique<RFTransmitter>(txPin);
-  if (!s_rfTransmitter->ok()) {
-    OS_LOGE(TAG, "Failed to initialize RF Transmitter");
-    s_rfTransmitter = nullptr;
-    return false;
-  }
-
-  if (rfConfig.keepAliveEnabled) {
-    _internalSetKeepAliveEnabled(true);
-  }
-
   Config::EStopConfig estopConfig;
   if (!Config::GetEStop(estopConfig)) {
     OS_LOGE(TAG, "Failed to get EStop config");
     return false;
+  }
+
+  // SP-113 rule 1 at boot: a stored config can hold a pin that breaks the rule. The radio stays off, and serial
+  // `rftxpin` repairs it. Returning false would restart the hub in a loop and take the serial port with it.
+  if (Softproxy::TxPinConflicts(txPin, estopConfig.gpioPin, EStopManager::GetRunningPin())) {
+    OS_LOGE(TAG, "RF TX pin %hhi is the EStop pin or a board LED, the radio stays off", static_cast<int8_t>(txPin));
+  } else {
+    s_rfTransmitter = std::make_unique<RFTransmitter>(txPin);
+    if (!s_rfTransmitter->ok()) {
+      OS_LOGE(TAG, "Failed to initialize RF Transmitter");
+      s_rfTransmitter = nullptr;
+      return false;
+    }
+
+    // A warm restart can come back engaged. The Idle state event starts the keep-alive after the clear.
+    if (rfConfig.keepAliveEnabled && !EStopManager::IsEStopped()) {
+      _internalSetKeepAliveEnabled(true);
+    }
   }
 
   err = esp_event_handler_register(OPENSHOCK_EVENTS, OPENSHOCK_EVENT_ESTOP_STATE_CHANGED, commandhandler_handleestopstatechange, nullptr);
@@ -241,6 +249,17 @@ bool CommandHandler::Ok()
 SetGPIOResultCode CommandHandler::SetRfTxPin(gpio_num_t txPin)
 {
   if (!OpenShock::IsValidOutputPin(txPin)) {
+    return SetGPIOResultCode::InvalidPin;
+  }
+
+  // SP-113 rule 1: the transmitter never moves onto the E-Stop GPIO, stored or running, or onto a board LED.
+  gpio_num_t estopPin;
+  if (!Config::GetEStopGpioPin(estopPin)) {
+    OS_LOGE(TAG, "Failed to get EStop pin from config");
+    return SetGPIOResultCode::InternalError;
+  }
+  if (Softproxy::TxPinConflicts(txPin, estopPin, EStopManager::GetRunningPin())) {
+    OS_LOGW(TAG, "Refusing RF TX pin %hhi, it is the EStop pin or a board LED", static_cast<int8_t>(txPin));
     return SetGPIOResultCode::InvalidPin;
   }
 
@@ -300,7 +319,14 @@ gpio_num_t CommandHandler::GetRfTxPin()
 bool CommandHandler::HandleCommand(ShockerModelType model, uint16_t shockerId, ShockerCommandType type, uint8_t intensity, uint16_t durationMs)
 {
   if (EStopManager::IsEStopped()) {
-    OS_LOGD(TAG, "Ignoring shocker command due to EmergencyStop being activated");
+    Softproxy::SafetyCaps::RecordRefusal(type, Softproxy::Verdict::EStopEngaged);
+    return false;
+  }
+
+  // Softproxy kill path (SP-113): no shock or vibrate without a live E-Stop behind it. Nothing else would stop a
+  // command once a cap is set, and a wrong config, a cleared config or a stopped task all read as released.
+  if ((type == ShockerCommandType::Shock || type == ShockerCommandType::Vibrate) && !EStopManager::IsArmed()) {
+    Softproxy::SafetyCaps::RecordRefusal(type, Softproxy::Verdict::EStopNotArmed);
     return false;
   }
 

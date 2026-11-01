@@ -1,7 +1,8 @@
 // Host test of the real command paths: gateway, port 81 socket, serial and radio encoders. It links the firmware's
-// own dispatchers, `HandleCommand`, `SafetyCaps` and the encoders. test/native/stubs fakes only the hardware edge.
-// `softproxy-host-test.yml` does not run it yet, because it needs the pinned flatbuffers headers. Run it from the
-// repository root after `pio pkg install -e Pishock-2023`:
+// own dispatchers, `HandleCommand`, `SafetyCaps` and the encoders. test/native/stubs fakes the hardware edge and also
+// three pieces of firmware logic: `EStopManager` (one boolean), `Config` and `CaptivePortal`, plus `RFTransmitter`.
+// So nothing here runs the E-Stop or the radio task. test/native/test_kill_path.cpp runs both for real.
+// `softproxy-host-test.yml` runs it. Run it from the repository root after `pio pkg install -e Pishock-2023`:
 //
 //   FB=.pio/libdeps/Pishock-2023/flatbuffers/include
 //   WS=src/message_handlers/websocket
@@ -66,6 +67,7 @@ namespace OpenShock {
   }
 }  // namespace OpenShock
 
+int g_panics                    = 0;
 static bool s_estopped          = false;
 static int s_estopTriggers      = 0;
 static gpio_num_t s_configTxPin = static_cast<gpio_num_t>(OPENSHOCK_RF_TX_GPIO);
@@ -77,6 +79,14 @@ static int s_localHandlerRuns;
 bool EStopManager::IsEStopped()
 {
   return s_estopped;
+}
+bool EStopManager::IsArmed()
+{
+  return true;
+}
+gpio_num_t EStopManager::GetRunningPin()
+{
+  return GPIO_NUM_NC;
 }
 void EStopManager::Trigger()
 {
@@ -105,6 +115,11 @@ bool Config::SetRFConfigKeepAliveEnabled(bool)
 bool Config::GetEStop(Config::EStopConfig& out)
 {
   out = {.enabled = false, .gpioPin = GPIO_NUM_NC};
+  return true;
+}
+bool Config::GetEStopGpioPin(gpio_num_t& out)
+{
+  out = GPIO_NUM_NC;
   return true;
 }
 void CaptivePortal::SetAlwaysEnabled(bool alwaysEnabled)
@@ -665,7 +680,7 @@ static void gatewayTriggers()
   sendTrigger(GatewaySchema::TriggerType::Restart);
   CHECK(g_restarts == 0);
 
-  // Closing the portal and the remote E-Stop still work.
+  // Closing the portal still works, and the handler reaches `Trigger`. What `Trigger` does is test_kill_path.cpp's.
   sendTrigger(GatewaySchema::TriggerType::CaptivePortalDisable);
   CHECK(s_alwaysOpen.size() == 1);
   CHECK(!s_alwaysOpen.back());

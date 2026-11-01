@@ -3,6 +3,20 @@
 #include "config/Config.h"
 #include "Convert.h"
 #include "estop/EStopManager.h"
+#include "softproxy/KillPath.h"
+
+void _handleEStopStateCommand(std::string_view arg, bool isAutomated)
+{
+  (void)isAutomated;
+
+  if (!arg.empty()) {
+    SERPR_ERROR("Invalid argument (takes no argument)");
+    return;
+  }
+
+  // The running state. `estop enabled` and `estop pin` read the stored config, which can differ until a restart.
+  SERPR_RESPONSE("EStopState|armed=%s,engaged=%s,pin=%hhi", OpenShock::EStopManager::IsArmed() ? "true" : "false", OpenShock::EStopManager::IsEStopped() ? "true" : "false", static_cast<int8_t>(OpenShock::EStopManager::GetRunningPin()));
+}
 
 void _handleEStopEnabledCommand(std::string_view arg, bool isAutomated)
 {
@@ -24,7 +38,7 @@ void _handleEStopEnabledCommand(std::string_view arg, bool isAutomated)
   }
 
   if (!OpenShock::EStopManager::SetEStopEnabled(enabled)) {
-    SERPR_ERROR("Failed to set EStop enabled");
+    SERPR_ERROR("Failed to set EStop enabled (needs a valid pin, and disabling refuses while it is engaged or a cap is set)");
     return;
   }
 
@@ -56,7 +70,7 @@ void _handleEStopPinCommand(std::string_view arg, bool isAutomated)
   }
 
   if (!OpenShock::EStopManager::SetEStopPin(estopPin)) {
-    SERPR_ERROR("Failed to set EStop pin");
+    SERPR_ERROR("Failed to set EStop pin (refused while it is engaged or a cap is set, and for the RF TX pin, a board LED or a pin with no pull-up)");
     return;
   }
 
@@ -71,6 +85,8 @@ void _handleEStopPinCommand(std::string_view arg, bool isAutomated)
 OpenShock::Serial::CommandGroup OpenShock::Serial::CommandHandlers::EStopHandler()
 {
   auto group = OpenShock::Serial::CommandGroup("estop"sv);
+
+  group.addCommand("state"sv, "Get the running E-Stop state: armed, engaged and pin."sv, _handleEStopStateCommand);
 
   auto& getEnabledCommand = group.addCommand("enabled"sv, "Get the E-Stop enabled state."sv, _handleEStopEnabledCommand);
   auto& setEnabledCommand = group.addCommand("enabled"sv, "Set the E-Stop enabled state."sv, _handleEStopEnabledCommand);

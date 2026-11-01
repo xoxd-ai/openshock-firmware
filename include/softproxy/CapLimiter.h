@@ -78,6 +78,8 @@ namespace OpenShock::Softproxy {
     Gap,            // Less than `minGapSec` since the previous stage started.
     Hourly,         // `maxPerHour` stages started in the last 60 minutes.
     Daily,          // `maxPerDay` stages started in the last 24 hours.
+    EStopEngaged,   // The E-Stop is engaged. Any command refuses, capped or not.
+    EStopNotArmed,  // No live E-Stop checker task on a valid pin. Shock and vibrate refuse (include/softproxy/KillPath.h).
   };
 
   constexpr const char* VerdictName(Verdict v)
@@ -103,6 +105,10 @@ namespace OpenShock::Softproxy {
         return "hourly";
       case Verdict::Daily:
         return "daily";
+      case Verdict::EStopEngaged:
+        return "estop-engaged";
+      case Verdict::EStopNotArmed:
+        return "estop-not-armed";
       default:
         return "unknown";
     }
@@ -269,33 +275,31 @@ namespace OpenShock::Softproxy {
     return hash;
   }
 
-  /// Writes the clock and both limiters into `out`, padding included, then seals it with the checksum.
+  /// Writes the clock and both limiters into `out`, padding included, then seals it with the checksum. It writes in
+  /// place because the struct is about 2 kilobytes and this runs on `main_app` for every command. A reset part way
+  /// through fails the checksum, which reads as a cold boot.
   inline void SealRetained(RetainedLimiters& out, int64_t clockMs, const ChannelLimiter& shock, const ChannelLimiter& vibrate)
   {
-    RetainedLimiters r;
-    std::memset(&r, 0, sizeof(r));
-    r.magic   = kRetainedMagic;
-    r.version = kRetainedVersion;
-    r.size    = static_cast<uint16_t>(sizeof(RetainedLimiters));
-    r.clockMs = clockMs;
-    std::memcpy(r.shock, &shock, sizeof(ChannelLimiter));
-    std::memcpy(r.vibrate, &vibrate, sizeof(ChannelLimiter));
-    r.checksum = RetainedChecksum(r);
-    std::memcpy(&out, &r, sizeof(r));
+    std::memset(&out, 0, sizeof(out));
+    out.magic   = kRetainedMagic;
+    out.version = kRetainedVersion;
+    out.size    = static_cast<uint16_t>(sizeof(RetainedLimiters));
+    out.clockMs = clockMs;
+    std::memcpy(out.shock, &shock, sizeof(ChannelLimiter));
+    std::memcpy(out.vibrate, &vibrate, sizeof(ChannelLimiter));
+    out.checksum = RetainedChecksum(out);
   }
 
   /// Restores the clock and both limiters when `in` is sealed by this layout. Returns false and changes
   /// nothing otherwise, which is the cold boot case.
   inline bool RestoreRetained(const RetainedLimiters& in, int64_t& clockMs, ChannelLimiter& shock, ChannelLimiter& vibrate)
   {
-    RetainedLimiters r;
-    std::memcpy(&r, &in, sizeof(r));
-    if (r.magic != kRetainedMagic || r.version != kRetainedVersion || r.size != static_cast<uint16_t>(sizeof(RetainedLimiters)) || r.checksum != RetainedChecksum(r) || r.clockMs < 0) {
+    if (in.magic != kRetainedMagic || in.version != kRetainedVersion || in.size != static_cast<uint16_t>(sizeof(RetainedLimiters)) || in.checksum != RetainedChecksum(in) || in.clockMs < 0) {
       return false;
     }
-    clockMs = r.clockMs;
-    std::memcpy(static_cast<void*>(&shock), r.shock, sizeof(ChannelLimiter));
-    std::memcpy(static_cast<void*>(&vibrate), r.vibrate, sizeof(ChannelLimiter));
+    clockMs = in.clockMs;
+    std::memcpy(static_cast<void*>(&shock), in.shock, sizeof(ChannelLimiter));
+    std::memcpy(static_cast<void*>(&vibrate), in.vibrate, sizeof(ChannelLimiter));
     return true;
   }
 }  // namespace OpenShock::Softproxy

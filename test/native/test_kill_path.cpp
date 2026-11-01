@@ -1,0 +1,1351 @@
+// Host test of the hub E-Stop as a kill path. It compiles the real src/EStopManager.cpp into this file, so a scenario
+// can wipe that file's RAM state as a restart would and leave the retained latch in place. It links the real
+// `HandleCommand`, `SafetyCaps`, `RFTransmitter` and its encoders, the real serial `estop`, `rftxpin` and `safetycaps`
+// commands, the real gateway `Trigger` and the real `WebSocketDeFragger`. Fakes: GPIO, RMT, the `Config` store, NVS,
+// FreeRTOS and the number parser in `Convert`. src/serial/command_handlers/safetycaps.cpp is compiled in here too,
+// because its handlers are static.
+//
+// The FreeRTOS fake runs each task on its own thread with one thread awake at a time, and `advance` steps every task
+// in 5 millisecond ticks, so a run is deterministic. The E-Stop checker runs its real loop with its real local state.
+//
+// kill_stubs holds symlinks to the real TinyVec.h and WebSocketDeFragger.h. A quoted include looks beside the including
+// file first, so through include/ they would reach the real Logging.h and Common.h next to them instead of the stubs.
+//
+// Run from the repository root after `pio pkg install -e Pishock-2023`. The second and third lines set a PiShock
+// layout: an ESP32 with the LED on GPIO 2. Build it once per PiShock RF TX default, TX=12 for Pishock-2023 and TX=15
+// for Pishock-Lite-2021, because the E-Stop pin rule must not depend on either.
+//
+//   FB=.pio/libdeps/Pishock-2023/flatbuffers/include
+//   FLAGS="-std=c++20 -O1 -pthread -DSOFTPROXY_KILL_TEST -DOPENSHOCK_FW_CHIP_ESP32 -DOPENSHOCK_LED_GPIO=2"
+//   FLAGS="$FLAGS -DOPENSHOCK_RF_TX_GPIO=$TX"
+//   INC="-Itest/native/kill_stubs -Itest/native/stubs -Iinclude -I$FB"
+//   SRC="src/CommandHandler.cpp src/softproxy/SafetyCaps.cpp src/WebSocketDeFragger.cpp src/radio/RFTransmitter.cpp"
+//   SRC="$SRC src/radio/rmt/Sequence.cpp src/radio/rmt/*Encoder.cpp src/serial/command_handlers/estop.cpp"
+//   SRC="$SRC src/serial/command_handlers/rftxpin.cpp src/message_handlers/websocket/gateway/Trigger.cpp"
+//   SRC="$SRC src/util/StringUtils.cpp"
+//   g++ $FLAGS $INC -Wl,--wrap=malloc test/native/test_kill_path.cpp $SRC -o kill_path_test && ./kill_path_test
+//
+// Every cap below is a synthetic test value chosen for the arithmetic. None is a body-safety value. The test has no
+// model of the receiver or of the switch, the cable or the board. Those are for the attended session.
+
+#include "../../src/EStopManager.cpp"
+#include "../../src/serial/command_handlers/safetycaps.cpp"
+
+#include "CommandHandler.h"
+#include "message_handlers/impl/WSGateway.h"
+#include "radio/rmt/Sequence.h"
+#include "softproxy/Lockout.h"
+#include "softproxy/SafetyCaps.h"
+#include "WebSocketDeFragger.h"
+
+#include "serialization/_fbs/GatewayToHubMessage_generated.h"
+#include "serialization/_fbs/HubToGatewayMessage_generated.h"
+
+#include <condition_variable>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <deque>
+#include <fstream>
+#include <functional>
+#include <iterator>
+#include <map>
+#include <mutex>
+#include <thread>
+#include <vector>
+
+namespace GatewaySchema = OpenShock::Serialization::Gateway;
+using namespace OpenShock::Softproxy;
+using SafetyCaps::SetResult;
+
+// Fake state declared in host_fakes.h.
+FakeNvs g_nvs;
+std::string g_lastLog;
+std::string g_serialOut;
+esp_event_base_t OPENSHOCK_EVENTS = "fake";
+int g_restarts                    = 0;
+int g_panics                      = 0;
+namespace OpenShock {
+  int64_t g_nowMs = 1'000'000'000;  // Past every cold boot hold of the synthetic caps.
+  namespace Serialization::Local {
+    std::string g_lastError;
+  }
+  namespace Serialization::JsonSerial {
+    ShockerCommand g_serialCommand;
+  }
+}  // namespace OpenShock
+
+void _handleEStopEnabledCommand(std::string_view arg, bool isAutomated);
+void _handleEStopPinCommand(std::string_view arg, bool isAutomated);
+void _handleEStopStateCommand(std::string_view arg, bool isAutomated);
+void _handleRfTxPinCommand(std::string_view arg, bool isAutomated);
+
+static std::size_t s_failMallocAtOrAbove = 0;  // 0 never fails.
+extern "C" void* __real_malloc(std::size_t size);
+extern "C" void* __wrap_malloc(std::size_t size)
+{
+  if (s_failMallocAtOrAbove != 0 && size >= s_failMallocAtOrAbove) {
+    return nullptr;
+  }
+  return __real_malloc(size);
+}
+
+// One thread awake at a time. `resume` hands the token to a task and waits for it back.
+namespace {
+  struct HostTaskExit { };
+  struct HostTask {
+    TaskFunction_t fn;
+    void* arg;
+    std::thread thread;
+    bool killed   = false;
+    bool finished = false;
+  };
+
+  std::mutex s_schedMutex;
+  std::condition_variable s_schedCv;
+  HostTask* s_awake = nullptr;  // nullptr is the test thread.
+  std::vector<HostTask*> s_tasks;
+  thread_local HostTask* t_self = nullptr;
+
+  void resume(HostTask* task)
+  {
+    std::unique_lock<std::mutex> lock(s_schedMutex);
+    s_awake = task;
+    s_schedCv.notify_all();
+    s_schedCv.wait(lock, [] { return s_awake == nullptr; });
+  }
+
+  void hostYield()
+  {
+    HostTask* self = t_self;
+    std::unique_lock<std::mutex> lock(s_schedMutex);
+    s_awake = nullptr;
+    s_schedCv.notify_all();
+    s_schedCv.wait(lock, [self] { return s_awake == self; });
+    if (self->killed) {
+      throw HostTaskExit {};
+    }
+  }
+
+  TaskHandle_t startTask(TaskFunction_t fn, void* arg)
+  {
+    auto* task   = new HostTask;
+    task->fn     = fn;
+    task->arg    = arg;
+    task->thread = std::thread([task] {
+      t_self = task;
+      {
+        std::unique_lock<std::mutex> lock(s_schedMutex);
+        s_schedCv.wait(lock, [task] { return s_awake == task; });
+      }
+      try {
+        if (!task->killed) {
+          task->fn(task->arg);
+        }
+      }
+      catch (const HostTaskExit&) {
+      }
+      std::unique_lock<std::mutex> lock(s_schedMutex);
+      task->finished = true;
+      s_awake        = nullptr;
+      s_schedCv.notify_all();
+    });
+    s_tasks.push_back(task);
+    return task;
+  }
+
+  void reap(HostTask* task)
+  {
+    task->thread.join();
+    s_tasks.erase(std::find(s_tasks.begin(), s_tasks.end(), task));
+    delete task;
+  }
+
+  bool s_stallChecker = false;  // A stalled checker task gets no time.
+
+  void stepTasks()
+  {
+    const std::vector<HostTask*> tasks = s_tasks;
+    for (HostTask* task : tasks) {
+      if (s_stallChecker && task == s_estopTask) {
+        continue;
+      }
+      resume(task);
+      if (task->finished) {
+        reap(task);
+      }
+    }
+  }
+
+  void advance(int64_t ms)
+  {
+    for (int64_t elapsed = 0; elapsed < ms; elapsed += 5) {
+      OpenShock::g_nowMs += 5;
+      stepTasks();
+    }
+  }
+
+  struct HostQueue {
+    std::size_t itemSize;
+    std::deque<std::vector<uint8_t>> items;
+  };
+}  // namespace
+
+BaseType_t TaskUtils::TaskCreateUniversal(TaskFunction_t fn, const char*, uint32_t, void* arg, UBaseType_t, TaskHandle_t* out, BaseType_t)
+{
+  *out = startTask(fn, arg);
+  return pdPASS;
+}
+BaseType_t TaskUtils::TaskCreateExpensive(TaskFunction_t fn, const char*, uint32_t, void* arg, UBaseType_t, TaskHandle_t* out)
+{
+  *out = startTask(fn, arg);
+  return pdPASS;
+}
+void vTaskDelay(TickType_t)
+{
+  if (t_self != nullptr) {
+    hostYield();
+  } else {
+    stepTasks();
+  }
+}
+void vTaskDelete(TaskHandle_t handle)
+{
+  if (handle == nullptr || handle == t_self) {
+    throw HostTaskExit {};
+  }
+  auto* task   = static_cast<HostTask*>(handle);
+  task->killed = true;
+  resume(task);
+  reap(task);
+}
+eTaskState eTaskGetState(TaskHandle_t handle)
+{
+  return std::find(s_tasks.begin(), s_tasks.end(), handle) == s_tasks.end() ? eDeleted : eRunning;
+}
+QueueHandle_t xQueueCreate(int, std::size_t itemSize)
+{
+  return new HostQueue {itemSize, {}};
+}
+void vQueueDelete(QueueHandle_t queue)
+{
+  delete static_cast<HostQueue*>(queue);
+}
+BaseType_t xQueueSend(QueueHandle_t queue, const void* item, TickType_t)
+{
+  auto* q        = static_cast<HostQueue*>(queue);
+  const auto* in = static_cast<const uint8_t*>(item);
+  q->items.emplace_back(in, in + q->itemSize);
+  return pdTRUE;
+}
+BaseType_t xQueueReceive(QueueHandle_t queue, void* out, TickType_t wait)
+{
+  auto* q = static_cast<HostQueue*>(queue);
+  while (q->items.empty()) {
+    if (wait == 0 || t_self == nullptr) {
+      return 0;
+    }
+    hostYield();
+  }
+  std::memcpy(out, q->items.front().data(), q->itemSize);
+  q->items.pop_front();
+  return pdTRUE;
+}
+
+// GPIO. A released button reads 1 through the pull-up, and the button pulls the pin to 0.
+static std::map<int, int> s_gpioLevel;
+static std::vector<int> s_gpioConfigured;
+esp_err_t gpio_config(const gpio_config_t* config)
+{
+  for (int pin = 0; pin < 64; ++pin) {
+    if ((config->pin_bit_mask >> pin) & 1) {
+      s_gpioConfigured.push_back(pin);
+    }
+  }
+  return ESP_OK;
+}
+esp_err_t gpio_reset_pin(gpio_num_t)
+{
+  return ESP_OK;
+}
+int gpio_get_level(gpio_num_t pin)
+{
+  auto it = s_gpioLevel.find(pin);
+  return it == s_gpioLevel.end() ? 1 : it->second;
+}
+
+// RMT. Each write is one frame on the air, and it costs the transmit task one tick.
+struct rmt_obj_t { };
+struct AirFrame {
+  std::vector<uint32_t> words;
+  int64_t atMs;
+};
+static std::vector<AirFrame> s_air;
+static rmt_obj_t s_rmt;
+rmt_obj_t* rmtInit(int, int, int)
+{
+  return &s_rmt;
+}
+float rmtSetTick(rmt_obj_t*, float tick)
+{
+  return tick;
+}
+bool rmtDeinit(rmt_obj_t*)
+{
+  return true;
+}
+bool rmtWriteBlocking(rmt_obj_t*, const rmt_data_t* data, std::size_t size)
+{
+  AirFrame frame {{}, OpenShock::g_nowMs};
+  for (std::size_t i = 0; i < size; ++i) {
+    frame.words.push_back(data[i].val);
+  }
+  s_air.push_back(std::move(frame));
+  vTaskDelay(pdMS_TO_TICKS(5));
+  return true;
+}
+
+// Events run at once on the posting thread.
+static void (*s_estopHandler)(void*, esp_event_base_t, int32_t, void*) = nullptr;
+static std::vector<EStopState> s_published;
+esp_err_t esp_event_handler_register(esp_event_base_t, int32_t, void (*handler)(void*, esp_event_base_t, int32_t, void*), void*)
+{
+  s_estopHandler = handler;
+  return ESP_OK;
+}
+esp_err_t esp_event_post(esp_event_base_t base, int32_t id, const void* data, std::size_t, TickType_t)
+{
+  s_published.push_back(*static_cast<const EStopState*>(data));
+  if (s_estopHandler != nullptr) {
+    s_estopHandler(nullptr, base, id, const_cast<void*>(data));
+  }
+  return ESP_OK;
+}
+
+// `Config` store.
+static bool s_cfgEnabled   = false;
+static gpio_num_t s_cfgPin = GPIO_NUM_NC;
+static gpio_num_t s_cfgTx  = static_cast<gpio_num_t>(OPENSHOCK_RF_TX_GPIO);
+bool Config::GetRFConfig(Config::RFConfig& out)
+{
+  out = {.txPin = s_cfgTx, .keepAliveEnabled = false};
+  return true;
+}
+bool Config::GetRFConfigTxPin(gpio_num_t& out)
+{
+  out = s_cfgTx;
+  return true;
+}
+bool Config::SetRFConfigTxPin(gpio_num_t pin)
+{
+  s_cfgTx = pin;
+  return true;
+}
+bool Config::SetRFConfigKeepAliveEnabled(bool)
+{
+  return true;
+}
+bool Config::GetEStop(Config::EStopConfig& out)
+{
+  out = {.enabled = s_cfgEnabled, .gpioPin = s_cfgPin};
+  return true;
+}
+bool Config::GetEStopEnabled(bool& out)
+{
+  out = s_cfgEnabled;
+  return true;
+}
+bool Config::SetEStopEnabled(bool enabled)
+{
+  s_cfgEnabled = enabled;
+  return true;
+}
+bool Config::GetEStopGpioPin(gpio_num_t& out)
+{
+  out = s_cfgPin;
+  return true;
+}
+bool Config::SetEStopGpioPin(gpio_num_t pin)
+{
+  s_cfgPin = pin;
+  return true;
+}
+void CaptivePortal::SetAlwaysEnabled(bool)
+{
+}
+
+static int s_failures = 0;
+
+#define CHECK(cond)                                               \
+  do {                                                            \
+    if (!(cond)) {                                                \
+      ++s_failures;                                               \
+      std::printf("FAIL %s:%d: %s\n", __FILE__, __LINE__, #cond); \
+    }                                                             \
+  } while (0)
+
+static const gpio_num_t kButton = static_cast<gpio_num_t>(13);
+static const auto kModel        = ShockerModelType::CaiXianlin;
+
+// Synthetic caps. `high` is above `low` in every field.
+static ChannelCaps lowCaps()
+{
+  ChannelCaps c {};
+  c.maxIntensityPct   = 10;
+  c.maxPulseMs        = 100;
+  c.maxPulsesPerStage = 1;
+  c.minGapSec         = 2;
+  c.maxPerHour        = 10;
+  c.maxPerDay         = 20;
+  return c;
+}
+static ChannelCaps highCaps()
+{
+  ChannelCaps c       = lowCaps();
+  c.maxIntensityPct   = 20;
+  c.maxPulseMs        = 2000;
+  c.maxPulsesPerStage = 2;
+  c.maxPerHour        = 20;
+  c.maxPerDay         = 40;
+  return c;
+}
+
+// Everything a restart wipes: this file's RAM state. `s_retainedLatch` survives it, and a cold boot fills it with noise.
+static void restartEStopManager(bool coldBoot)
+{
+  if (s_estopTask != nullptr) {
+    vTaskDelete(s_estopTask);
+    s_estopTask = nullptr;
+  }
+  s_estopPin            = GPIO_NUM_NC;
+  s_lastPublishedState  = EStopState::Idle;
+  s_estopActive         = false;
+  s_estopActivatedAt    = 0;
+  s_lastSampleMs        = 0;
+  s_externallyTriggered = false;
+  s_estopInitialized    = false;
+  if (coldBoot) {
+    std::memset(static_cast<void*>(&s_retainedLatch), 0xA5, sizeof(s_retainedLatch));
+  }
+  CHECK(EStopManager::Init());
+}
+
+// A clean hub: cold boot, nothing wired, caps cleared.
+static void freshHub(bool enabled = false, gpio_num_t pin = GPIO_NUM_NC)
+{
+  s_gpioLevel.clear();
+  s_gpioConfigured.clear();
+  s_stallChecker = false;
+  s_cfgEnabled   = enabled;
+  s_cfgPin       = pin;
+  s_cfgTx        = static_cast<gpio_num_t>(OPENSHOCK_RF_TX_GPIO);
+  (void)SafetyCaps::Clear();
+  restartEStopManager(true);
+  CHECK(CommandHandler::Init());
+  // A stored E-Stop pin on the transmitter is a scenario of its own, and the rule refuses this call.
+  if (pin != s_cfgTx) {
+    CHECK(CommandHandler::SetRfTxPin(s_cfgTx) == SetGPIOResultCode::Success);
+  }
+  advance(50);
+  s_air.clear();
+  s_published.clear();
+  g_serialOut.clear();
+}
+
+static void pressButton(gpio_num_t pin = kButton)
+{
+  s_gpioLevel[pin] = 0;
+}
+static void releaseButton(gpio_num_t pin = kButton)
+{
+  s_gpioLevel[pin] = 1;
+}
+
+// An armed hub with the button wired and released.
+static void armedHub()
+{
+  freshHub(true, kButton);
+  CHECK(EStopManager::IsArmed());
+  CHECK(!EStopManager::IsEStopped());
+}
+
+// Holds the button until the E-Stop is released, the only way that releases it. The press first needs a release,
+// since a held button is no new press. The last wait outlasts the 65 millisecond debounce and the 250 millisecond
+// rearm window, which starts when the debounced release clears the E-Stop.
+static void holdToClear()
+{
+  releaseButton();
+  advance(100);
+  pressButton();
+  advance(5100);
+  releaseButton();
+  advance(350);
+}
+
+static void engageByButton()
+{
+  pressButton();
+  advance(20);
+  CHECK(EStopManager::IsEStopped());
+  releaseButton();
+  advance(100);
+}
+
+static void sendTrigger(GatewaySchema::TriggerType type)
+{
+  flatbuffers::FlatBufferBuilder builder;
+  auto trigger = GatewaySchema::CreateTrigger(builder, type);
+  auto root    = GatewaySchema::CreateGatewayToHubMessage(builder, GatewaySchema::GatewayToHubMessagePayload::Trigger, trigger.Union());
+  builder.Finish(root);
+  OpenShock::MessageHandlers::Server::_Private::HandleTrigger(flatbuffers::GetRoot<GatewaySchema::GatewayToHubMessage>(builder.GetBufferPointer()));
+}
+
+static bool lastRefusalIs(Verdict verdict)
+{
+  return SafetyCaps::GetRefusals().lastCode == static_cast<uint8_t>(verdict);
+}
+
+// An unreadable store counts as set, so the E-Stop settings stay locked. It must run before anything loads the caps,
+// because a load that succeeded is never repeated in a process.
+static void unreadableCapsLockTheEStop()
+{
+  s_cfgEnabled = true;
+  s_cfgPin     = kButton;
+  restartEStopManager(true);
+  advance(50);
+  CHECK(EStopManager::IsArmed());
+
+  // A record exists and cannot be read. With no record at all NVS reports not found, which is a clean state.
+  g_nvs.present   = true;
+  g_nvs.readError = ESP_FAIL;
+  CHECK(!SafetyCaps::Init());
+  CHECK(SafetyCaps::AnySet());
+  CHECK(!EStopManager::SetEStopEnabled(false));
+  CHECK(!EStopManager::SetEStopPin(static_cast<gpio_num_t>(14)));
+  CHECK(EStopManager::IsArmed());
+  g_nvs.readError = ESP_OK;
+  g_nvs.present   = false;
+  CHECK(SafetyCaps::Init());
+  CHECK(!SafetyCaps::AnySet());
+}
+
+// SP-113 rule 1 at boot. It must run before `freshHub`, because `CommandHandler::Init` runs once in a process.
+static void bootWithTxOnEStopLeavesRadioOff()
+{
+  s_cfgEnabled = true;
+  s_cfgPin     = kButton;
+  s_cfgTx      = kButton;
+  restartEStopManager(true);
+  CHECK(!EStopManager::IsArmed());
+  CHECK(CommandHandler::Init());
+  CHECK(!CommandHandler::Ok());
+  CHECK(s_estopHandler != nullptr);
+  CHECK(!CommandHandler::HandleCommand(kModel, 7, ShockerCommandType::Vibrate, 1, 50));
+
+  // Serial `rftxpin` is the repair, and it still refuses the E-Stop pin.
+  s_cfgTx = static_cast<gpio_num_t>(OPENSHOCK_RF_TX_GPIO);
+  CHECK(CommandHandler::SetRfTxPin(kButton) == SetGPIOResultCode::InvalidPin);
+  CHECK(!CommandHandler::Ok());
+  CHECK(CommandHandler::SetRfTxPin(s_cfgTx) == SetGPIOResultCode::Success);
+  CHECK(CommandHandler::Ok());
+}
+
+// SP-113 and finding 4: with no live E-Stop, every shock and vibrate command refuses at any cap, and the refusal shows.
+static void noEStopRefuses()
+{
+  freshHub();
+  CHECK(!EStopManager::IsArmed());
+
+  // Caps can only be there from before the E-Stop went away, so plant them in the store, as `Config::Init` defaults do
+  // when a config load fails and the separate caps namespace survives.
+  armedHub();
+  engageByButton();
+  CHECK(SafetyCaps::Set(ShockerCommandType::Shock, lowCaps()) == SetResult::Stored);
+  CHECK(SafetyCaps::Set(ShockerCommandType::Vibrate, lowCaps()) == SetResult::Stored);
+  holdToClear();
+  CHECK(!EStopManager::IsEStopped());
+  s_cfgEnabled = false;
+  s_cfgPin     = GPIO_NUM_NC;
+  restartEStopManager(false);
+  CHECK(!EStopManager::IsArmed());
+  CHECK(SafetyCaps::AnySet());
+
+  const uint32_t before = SafetyCaps::GetRefusals().count;
+  for (auto type : {ShockerCommandType::Shock, ShockerCommandType::Vibrate}) {
+    CHECK(!CommandHandler::HandleCommand(kModel, 7, type, 1, 50));
+    CHECK(lastRefusalIs(Verdict::EStopNotArmed));
+  }
+  CHECK(SafetyCaps::GetRefusals().count == before + 2);
+  CHECK(g_lastLog.find("verdict=estop-not-armed") != std::string::npos);
+  advance(20);
+  CHECK(s_air.empty());
+
+  // A stop still reaches the radio with no E-Stop, and it carries no energy (encoders in test_command_paths.cpp).
+  CHECK(CommandHandler::HandleCommand(kModel, 7, ShockerCommandType::Stop, 0, 0));
+  advance(20);
+  CHECK(!s_air.empty());
+  (void)SafetyCaps::Clear();
+}
+
+static void armedHubAdmitsWithinCaps()
+{
+  armedHub();
+  engageByButton();
+  CHECK(SafetyCaps::Set(ShockerCommandType::Vibrate, lowCaps()) == SetResult::Stored);
+  CHECK(!CommandHandler::HandleCommand(kModel, 7, ShockerCommandType::Vibrate, 1, 50));
+  CHECK(lastRefusalIs(Verdict::EStopEngaged));
+  CHECK(g_lastLog.find("verdict=estop-engaged") != std::string::npos);
+  CHECK(!CommandHandler::HandleCommand(kModel, 7, ShockerCommandType::Stop, 0, 0));
+  CHECK(g_lastLog.find("channel=other") != std::string::npos);
+  advance(20);
+  CHECK(s_air.empty());
+
+  holdToClear();
+  CHECK(CommandHandler::HandleCommand(kModel, 7, ShockerCommandType::Vibrate, 1, 50));
+  advance(20);
+  CHECK(!s_air.empty());
+}
+
+// Finding: the gateway trigger was a no-op with no checker task, and the flag fired later.
+static void gatewayTriggerLatchesWithNoTask()
+{
+  freshHub();
+  CHECK(s_estopTask == nullptr);
+  sendTrigger(GatewaySchema::TriggerType::EmergencyStop);
+  CHECK(EStopManager::IsEStopped());
+  CHECK(s_published.size() == 1 && s_published.back() == EStopState::Active);
+  CHECK(!s_externallyTriggered);
+
+  // No button can release it, so it holds through a warm restart and ends at a power cycle.
+  restartEStopManager(false);
+  CHECK(EStopManager::IsEStopped());
+  restartEStopManager(true);
+  CHECK(!EStopManager::IsEStopped());
+}
+
+static void gatewayTriggerLatchesWithTask()
+{
+  armedHub();
+  sendTrigger(GatewaySchema::TriggerType::EmergencyStop);
+  CHECK(EStopManager::IsEStopped());
+  advance(10);
+  CHECK(s_published.size() == 1 && s_published.back() == EStopState::Active);
+  holdToClear();
+  CHECK(!EStopManager::IsEStopped());
+  CHECK(s_published.back() == EStopState::Idle);
+}
+
+static void holdToClearNeedsTheFullHold()
+{
+  armedHub();
+  engageByButton();
+
+  // Staying pressed from the engaging press clears nothing.
+  pressButton();
+  advance(4800);
+  releaseButton();
+  advance(100);
+  CHECK(EStopManager::IsEStopped());
+
+  // Clearing happens on the release after the hold, not at the end of the hold.
+  pressButton();
+  advance(5100);
+  CHECK(EStopManager::IsEStopped());
+  releaseButton();
+  advance(100);
+  CHECK(!EStopManager::IsEStopped());
+
+  // A press right after a clear is ignored inside the 250 millisecond rearm window when released before its end.
+  pressButton();
+  advance(50);
+  releaseButton();
+  advance(300);
+  CHECK(!EStopManager::IsEStopped());
+
+  // One still held at the end of the window engages.
+  pressButton();
+  advance(30);
+  CHECK(EStopManager::IsEStopped());
+}
+
+// Findings: a restart, panic or watchdog cleared an engaged E-Stop with no hold.
+static void latchSurvivesWarmRestart()
+{
+  armedHub();
+  engageByButton();
+  restartEStopManager(false);
+  CHECK(EStopManager::IsEStopped());
+  advance(20);
+  CHECK(EStopManager::IsArmed());
+  CHECK(s_published.back() == EStopState::Active);
+  CHECK(!CommandHandler::HandleCommand(kModel, 7, ShockerCommandType::Vibrate, 1, 50));
+
+  // A second restart still comes back engaged, since the first sealed it again.
+  restartEStopManager(false);
+  CHECK(EStopManager::IsEStopped());
+
+  holdToClear();
+  CHECK(!EStopManager::IsEStopped());
+  restartEStopManager(false);
+  CHECK(!EStopManager::IsEStopped());
+}
+
+static void coldBootStartsReleased()
+{
+  armedHub();
+  engageByButton();
+  restartEStopManager(true);
+  advance(20);
+  CHECK(!EStopManager::IsEStopped());
+}
+
+static void corruptLatchReadsAsColdBoot()
+{
+  RetainedEStop r {};
+  bool engaged = false;
+  SealEStop(r, true);
+  CHECK(RestoreEStop(r, engaged) && engaged);
+  SealEStop(r, false);
+  CHECK(RestoreEStop(r, engaged) && !engaged);
+  for (uint32_t bit = 0; bit < 32; ++bit) {
+    for (bool value : {false, true}) {
+      SealEStop(r, value);
+      r.engaged ^= 1u << bit;
+      CHECK(!RestoreEStop(r, engaged));
+      SealEStop(r, value);
+      r.magic ^= 1u << bit;
+      CHECK(!RestoreEStop(r, engaged));
+      SealEStop(r, value);
+      r.check ^= 1u << bit;
+      CHECK(!RestoreEStop(r, engaged));
+    }
+  }
+}
+
+// A button held down across a restart is no new press, so releasing it must not release the E-Stop.
+static void heldButtonAcrossRestartStaysEngaged()
+{
+  armedHub();
+  pressButton();
+  advance(20);
+  CHECK(EStopManager::IsEStopped());
+  restartEStopManager(false);
+  advance(6000);
+  releaseButton();
+  advance(100);
+  CHECK(EStopManager::IsEStopped());
+}
+
+// Finding: `estop pin` and `estop enabled` restarted the task, which cleared the latch.
+static void serialCannotClearTheLatch()
+{
+  armedHub();
+  engageByButton();
+
+  _handleEStopPinCommand("14"sv, false);
+  CHECK(g_serialOut.find("Error|") != std::string::npos);
+  CHECK(EStopManager::GetRunningPin() == kButton);
+  CHECK(s_cfgPin == kButton);
+  CHECK(EStopManager::IsEStopped());
+
+  g_serialOut.clear();
+  _handleEStopEnabledCommand("false"sv, false);
+  CHECK(g_serialOut.find("Error|") != std::string::npos);
+  CHECK(s_estopTask != nullptr);
+  CHECK(s_cfgEnabled);
+  advance(20);
+  CHECK(EStopManager::IsEStopped());
+}
+
+// The latch outlives the task on any route, including one that gets past the serial refusals.
+static void taskRestartKeepsTheLatch()
+{
+  armedHub();
+  engageByButton();
+  CHECK(estopmgr_setestopenabled(false));
+  CHECK(!EStopManager::IsArmed());
+  CHECK(EStopManager::IsEStopped());
+  CHECK(estopmgr_setestopenabled(true));
+  advance(20);
+  CHECK(EStopManager::IsEStopped());
+  CHECK(EStopManager::IsArmed());
+}
+
+static void capsLockTheEStopSettings()
+{
+  armedHub();
+  engageByButton();
+  CHECK(SafetyCaps::Set(ShockerCommandType::Vibrate, lowCaps()) == SetResult::Stored);
+  holdToClear();
+  CHECK(!EStopManager::IsEStopped());
+
+  CHECK(!EStopManager::SetEStopPin(static_cast<gpio_num_t>(14)));
+  CHECK(!EStopManager::SetEStopEnabled(false));
+  CHECK(EStopManager::IsArmed());
+
+  // Clearing the caps unlocks them, and the same-pin write stays a no-op that succeeds.
+  CHECK(SafetyCaps::Clear());
+  CHECK(EStopManager::SetEStopPin(kButton));
+  CHECK(EStopManager::SetEStopPin(static_cast<gpio_num_t>(14)));
+  CHECK(EStopManager::GetRunningPin() == static_cast<gpio_num_t>(14));
+  advance(20);
+  CHECK(EStopManager::IsArmed());
+  CHECK(EStopManager::SetEStopEnabled(false));
+  CHECK(!EStopManager::IsArmed());
+}
+
+static void enableNeedsAValidPin()
+{
+  freshHub();
+  _handleEStopEnabledCommand("true"sv, false);
+  CHECK(g_serialOut.find("Error|") != std::string::npos);
+  CHECK(!s_cfgEnabled);
+  CHECK(s_estopTask == nullptr);
+  CHECK(!EStopManager::IsArmed());
+
+  // A stored config that asks for it at boot gets the same answer, and the hub still boots.
+  freshHub(true, GPIO_NUM_NC);
+  CHECK(s_estopTask == nullptr);
+  CHECK(!EStopManager::IsArmed());
+
+  g_serialOut.clear();
+  _handleEStopPinCommand("13"sv, false);
+  _handleEStopEnabledCommand("true"sv, false);
+  CHECK(g_serialOut.find("Error|") == std::string::npos);
+  advance(20);
+  CHECK(EStopManager::IsArmed());
+}
+
+// A stalled or dead checker reads as not armed, and it recovers when it samples again.
+static void stalledCheckerIsNotArmed()
+{
+  armedHub();
+  engageByButton();
+  CHECK(SafetyCaps::Set(ShockerCommandType::Vibrate, lowCaps()) == SetResult::Stored);
+  holdToClear();
+  s_stallChecker = true;
+  advance(k_estopSampleStaleTime + 50);
+  CHECK(!EStopManager::IsArmed());
+  CHECK(!CommandHandler::HandleCommand(kModel, 7, ShockerCommandType::Vibrate, 1, 50));
+  CHECK(lastRefusalIs(Verdict::EStopNotArmed));
+  s_stallChecker = false;
+  advance(20);
+  CHECK(EStopManager::IsArmed());
+  (void)SafetyCaps::Clear();
+}
+
+// SP-113 rule 2.
+static void capRiseNeedsAnEngagedEStop()
+{
+  freshHub();
+  CHECK(SafetyCaps::Set(ShockerCommandType::Shock, lowCaps()) == SetResult::NeedsEngagedEStop);
+
+  // Engaged by the gateway with no checker task: engaged, but nothing behind it.
+  sendTrigger(GatewaySchema::TriggerType::EmergencyStop);
+  CHECK(SafetyCaps::Set(ShockerCommandType::Shock, lowCaps()) == SetResult::NeedsEngagedEStop);
+  CHECK(!SafetyCaps::AnySet());
+
+  armedHub();
+  CHECK(SafetyCaps::Set(ShockerCommandType::Vibrate, lowCaps()) == SetResult::NeedsEngagedEStop);
+  CHECK(!SafetyCaps::AnySet());
+
+  engageByButton();
+  CHECK(SafetyCaps::Set(ShockerCommandType::Vibrate, lowCaps()) == SetResult::Stored);
+  holdToClear();
+
+  // Lowering, rewriting and clearing take no engaged E-Stop. Each field that rises refuses.
+  CHECK(SafetyCaps::Set(ShockerCommandType::Vibrate, lowCaps()) == SetResult::Stored);
+  CHECK(SafetyCaps::Set(ShockerCommandType::Vibrate, highCaps()) == SetResult::NeedsEngagedEStop);
+  engageByButton();
+  CHECK(SafetyCaps::Set(ShockerCommandType::Vibrate, highCaps()) == SetResult::Stored);
+  holdToClear();
+  CHECK(SafetyCaps::Set(ShockerCommandType::Vibrate, lowCaps()) == SetResult::Stored);
+
+  ChannelCaps sooner = lowCaps();
+  sooner.minGapSec   = 1;
+  CHECK(SafetyCaps::Set(ShockerCommandType::Vibrate, sooner) == SetResult::NeedsEngagedEStop);
+  ChannelCaps joined = lowCaps();
+  joined.stageJoinMs = 1;
+  CHECK(SafetyCaps::Set(ShockerCommandType::Vibrate, joined) == SetResult::NeedsEngagedEStop);
+
+  CHECK(SafetyCaps::Clear());
+  CHECK(!SafetyCaps::AnySet());
+}
+
+static void capsRiseCoversEveryField()
+{
+  const ChannelCaps base = lowCaps();
+  CHECK(!CapsRise(base, base));
+  CHECK(CapsRise(ChannelCaps {}, base));
+  CHECK(!CapsRise(base, ChannelCaps {}));
+  CHECK(!CapsRise(highCaps(), base));
+  auto bumped = [&](auto field, auto value) {
+    ChannelCaps c = base;
+    c.*field      = value;
+    return CapsRise(base, c);
+  };
+  CHECK(bumped(&ChannelCaps::maxIntensityPct, uint8_t {11}));
+  CHECK(bumped(&ChannelCaps::maxPulseMs, uint16_t {101}));
+  CHECK(bumped(&ChannelCaps::maxPulsesPerStage, uint16_t {2}));
+  CHECK(bumped(&ChannelCaps::minGapSec, uint32_t {1}));
+  CHECK(bumped(&ChannelCaps::maxPerHour, uint16_t {11}));
+  CHECK(bumped(&ChannelCaps::maxPerDay, uint16_t {21}));
+  CHECK(bumped(&ChannelCaps::stageJoinMs, uint32_t {1}));
+  CHECK(!CapRiseAllowed(false, false));
+  CHECK(!CapRiseAllowed(true, false));
+  CHECK(!CapRiseAllowed(false, true));
+  CHECK(CapRiseAllowed(true, true));
+}
+
+// SP-113 rule 1, in both directions and at boot.
+static void pinsStaySeparate()
+{
+  const auto tx  = static_cast<gpio_num_t>(OPENSHOCK_RF_TX_GPIO);
+  const auto led = static_cast<gpio_num_t>(kBoardLedPin);
+  CHECK(kBoardRfTxPin == OPENSHOCK_RF_TX_GPIO);
+  CHECK(kBoardLedPin == 2);
+
+  freshHub();
+  CHECK(!EStopManager::SetEStopPin(tx));
+  CHECK(!EStopManager::SetEStopPin(led));
+  CHECK(EStopManager::GetRunningPin() == GPIO_NUM_NC);
+  for (int pin = 34; pin <= 39; ++pin) {
+    CHECK(!EStopManager::SetEStopPin(static_cast<gpio_num_t>(pin)));
+  }
+
+  // The transmitter was moved off the default: the default stays out of bounds, since a bad config falls back to it.
+  CHECK(CommandHandler::SetRfTxPin(static_cast<gpio_num_t>(14)) == SetGPIOResultCode::Success);
+  CHECK(!EStopManager::SetEStopPin(static_cast<gpio_num_t>(14)));
+  CHECK(!EStopManager::SetEStopPin(tx));
+
+  // The other direction, against the running pin, the stored pin and the LED.
+  armedHub();
+  CHECK(CommandHandler::SetRfTxPin(kButton) == SetGPIOResultCode::InvalidPin);
+  CHECK(CommandHandler::SetRfTxPin(led) == SetGPIOResultCode::InvalidPin);
+  CHECK(CommandHandler::GetRfTxPin() == tx);
+  s_cfgPin = static_cast<gpio_num_t>(27);
+  CHECK(CommandHandler::SetRfTxPin(static_cast<gpio_num_t>(27)) == SetGPIOResultCode::InvalidPin);
+
+  g_serialOut.clear();
+  _handleRfTxPinCommand("13"sv, false);
+  CHECK(g_serialOut.find("Error|") != std::string::npos);
+  CHECK(CommandHandler::GetRfTxPin() == tx);
+
+  // A bad argument stops at the parser, with no transmitter rebuilt on a garbage pin.
+  g_serialOut.clear();
+  _handleRfTxPinCommand("twelve"sv, false);
+  CHECK(g_serialOut.find("Invalid argument (number invalid") != std::string::npos);
+  CHECK(g_serialOut.find("Saved config") == std::string::npos);
+  CHECK(CommandHandler::GetRfTxPin() == tx);
+
+  // A stored config with the E-Stop on the transmitter: the hub boots, the task stays off and commands refuse.
+  freshHub(true, tx);
+  CHECK(s_estopTask == nullptr);
+  CHECK(std::find(s_gpioConfigured.begin(), s_gpioConfigured.end(), static_cast<int>(tx)) == s_gpioConfigured.end());
+  CHECK(!EStopManager::IsArmed());
+  CHECK(!CommandHandler::HandleCommand(kModel, 7, ShockerCommandType::Vibrate, 1, 50));
+  CHECK(lastRefusalIs(Verdict::EStopNotArmed));
+
+  // The same for a pin with no pull-up and a stored transmitter on the E-Stop.
+  freshHub(true, static_cast<gpio_num_t>(36));
+  CHECK(!EStopManager::IsArmed());
+  freshHub(true, kButton);
+  s_cfgTx = kButton;
+  restartEStopManager(true);
+  CHECK(!EStopManager::IsArmed());
+  s_cfgTx = tx;
+}
+
+// SP-113 rule 1 keys on the E-Stop pin set at run time. No PiShock env defines OPENSHOCK_ESTOP_PIN and the two envs
+// differ on RF TX, so a compile-time comparison would miss every real hub. `otherEnvTx` is the transmitter of the
+// other PiShock env: on this build it is an ordinary GPIO, so only the run-time pin can refuse it.
+static void pinRuleKeysOnTheRunTimePin()
+{
+  const auto tx        = static_cast<gpio_num_t>(OPENSHOCK_RF_TX_GPIO);
+  const int otherEnvTx = OPENSHOCK_RF_TX_GPIO == 12 ? 15 : 12;
+
+  for (int number : {13, 14, otherEnvTx}) {
+    const auto pin           = static_cast<gpio_num_t>(number);
+    const std::string digits = std::to_string(number);
+
+    // No E-Stop pin set: nothing claims this GPIO, so the radio can go there and come back.
+    freshHub();
+    CHECK(s_cfgPin == GPIO_NUM_NC);
+    CHECK(CommandHandler::SetRfTxPin(pin) == SetGPIOResultCode::Success);
+    CHECK(CommandHandler::SetRfTxPin(tx) == SetGPIOResultCode::Success);
+
+    // Serial `estop pin` sets it, stored and running. Serial `rftxpin` now refuses that GPIO.
+    g_serialOut.clear();
+    _handleEStopPinCommand(digits, false);
+    CHECK(g_serialOut.find("Error|") == std::string::npos);
+    CHECK(s_cfgPin == pin);
+    CHECK(EStopManager::GetRunningPin() == pin);
+    g_serialOut.clear();
+    _handleRfTxPinCommand(digits, false);
+    CHECK(g_serialOut.find("Error|") != std::string::npos);
+    CHECK(CommandHandler::GetRfTxPin() == tx);
+    CHECK(s_cfgTx == tx);
+
+    // Stored but not running yet, as after a config write that waits for a restart.
+    freshHub();
+    s_cfgPin = pin;
+    CHECK(EStopManager::GetRunningPin() == GPIO_NUM_NC);
+    CHECK(CommandHandler::SetRfTxPin(pin) == SetGPIOResultCode::InvalidPin);
+
+    // Running with a different stored pin, as after the stored pin moved away.
+    freshHub(true, pin);
+    s_cfgPin = static_cast<gpio_num_t>(27);
+    CHECK(EStopManager::GetRunningPin() == pin);
+    CHECK(CommandHandler::SetRfTxPin(pin) == SetGPIOResultCode::InvalidPin);
+    CHECK(CommandHandler::GetRfTxPin() == tx);
+  }
+
+  // The other direction on this env's own transmitter, through the serial command.
+  freshHub();
+  g_serialOut.clear();
+  _handleEStopPinCommand(std::to_string(OPENSHOCK_RF_TX_GPIO), false);
+  CHECK(g_serialOut.find("Error|") != std::string::npos);
+  CHECK(EStopManager::GetRunningPin() == GPIO_NUM_NC);
+  CHECK(s_cfgPin == GPIO_NUM_NC);
+}
+
+// SP-113 rule 2 through serial `safetycaps`, the only path that writes a cap. A hub starts here on either PiShock env,
+// with no E-Stop pin, so the button cannot engage it and every rise refuses.
+static void serialCapRiseNeedsTheEStop()
+{
+  constexpr std::string_view kLow  = "10 100 1 2 10 20";
+  constexpr std::string_view kHigh = "20 100 1 2 10 20";
+  constexpr std::string_view kLess = "5 100 1 2 10 20";
+  const char* const kRefused       = "Refused (raising a cap needs the E-Stop armed and engaged";
+
+  const auto refused = [&](void (*handler)(std::string_view, bool), std::string_view args) {
+    g_serialOut.clear();
+    handler(args, false);
+    return g_serialOut.find(kRefused) != std::string::npos;
+  };
+  const auto saved = [&](void (*handler)(std::string_view, bool), std::string_view args) {
+    g_serialOut.clear();
+    handler(args, false);
+    return g_serialOut.find("Saved caps") != std::string::npos;
+  };
+
+  const auto storedVibrateIntensity = [] {
+    ChannelCaps shock {};
+    ChannelCaps vibrate {};
+    SafetyCaps::Get(shock, vibrate);
+    return vibrate.maxIntensityPct;
+  };
+
+  // No pin configured.
+  freshHub();
+  CHECK(s_cfgPin == GPIO_NUM_NC);
+  CHECK(EStopManager::GetRunningPin() == GPIO_NUM_NC);
+  CHECK(refused(_handleSafetyCapsShockCommand, kLow));
+  CHECK(refused(_handleSafetyCapsVibrateCommand, kLow));
+  CHECK(!SafetyCaps::AnySet());
+
+  // Still no pin, engaged from the gateway. No button stands behind it, so it does not count.
+  sendTrigger(GatewaySchema::TriggerType::EmergencyStop);
+  CHECK(EStopManager::IsEStopped());
+  CHECK(refused(_handleSafetyCapsShockCommand, kLow));
+  CHECK(refused(_handleSafetyCapsVibrateCommand, kLow));
+  CHECK(!SafetyCaps::AnySet());
+
+  // The attended order from SOFTPROXY.md, on the real serial commands. Armed and released still refuses.
+  freshHub();
+  _handleEStopPinCommand("13"sv, false);
+  _handleEStopEnabledCommand("true"sv, false);
+  advance(50);
+  CHECK(EStopManager::IsArmed());
+  CHECK(refused(_handleSafetyCapsVibrateCommand, kLow));
+  CHECK(!SafetyCaps::AnySet());
+
+  engageByButton();
+  CHECK(saved(_handleSafetyCapsVibrateCommand, kLow));
+  CHECK(SafetyCaps::AnySet());
+
+  // Released again: a rise refuses and leaves the stored value, and a lower value needs no E-Stop.
+  holdToClear();
+  CHECK(!EStopManager::IsEStopped());
+  CHECK(refused(_handleSafetyCapsVibrateCommand, kHigh));
+  CHECK(storedVibrateIntensity() == 10);
+  CHECK(saved(_handleSafetyCapsVibrateCommand, kLess));
+  CHECK(storedVibrateIntensity() == 5);
+
+  // A malformed request stops before any write, and clear always works.
+  g_serialOut.clear();
+  _handleSafetyCapsShockCommand("10 100"sv, false);
+  CHECK(g_serialOut.find("Error|") != std::string::npos);
+  g_serialOut.clear();
+  _handleSafetyCapsClearCommand(""sv, false);
+  CHECK(g_serialOut.find("Cleared caps") != std::string::npos);
+  CHECK(!SafetyCaps::AnySet());
+}
+
+// `Config::SaveFromJSON`, `SetRaw` and `SaveFromFlatBuffer` are read here, not linked: src/config/Config.cpp needs the
+// real filesystem. The decision they share is tested, and a scan pins that each one calls it.
+static void configWritesAreGated()
+{
+  const KillConfig on {true, 13};
+  CHECK(KillConfigChangeAllowed(on, on, 12, 13, false));
+  CHECK(KillConfigChangeAllowed(on, on, 12, 13, true));
+  CHECK(KillConfigChangeAllowed(on, KillConfig {true, 14}, 12, 13, false));
+  CHECK(!KillConfigChangeAllowed(on, KillConfig {true, 14}, 12, 13, true));
+  CHECK(!KillConfigChangeAllowed(on, KillConfig {false, 13}, 12, 13, true));
+  CHECK(!KillConfigChangeAllowed(on, KillConfig {true, -1}, 12, 13, true));
+  CHECK(!KillConfigChangeAllowed(on, KillConfig {true, 13}, 13, 13, false));
+  CHECK(!KillConfigChangeAllowed(on, KillConfig {true, 2}, 15, 13, false));
+  CHECK(!KillConfigChangeAllowed(on, KillConfig {true, OPENSHOCK_RF_TX_GPIO}, 14, 13, false));
+  CHECK(!KillConfigChangeAllowed(on, KillConfig {true, 36}, 12, 13, false));
+  CHECK(KillConfigChangeAllowed(KillConfig {false, -1}, KillConfig {false, -1}, 12, -1, false));
+  // The transmitter side: the LED, and the pin the checker reads now while the stored pin moves away from it.
+  CHECK(!KillConfigChangeAllowed(on, on, 2, 13, false));
+  CHECK(!KillConfigChangeAllowed(on, KillConfig {true, 14}, 13, 13, false));
+
+  std::ifstream in("src/config/Config.cpp");
+  const std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+  for (const char* writer : {"bool Config::SaveFromJSON(", "bool Config::SaveFromFlatBuffer(", "bool Config::SetRaw("}) {
+    const std::size_t begin = text.find(writer);
+    CHECK(begin != std::string::npos);
+    const std::size_t end = text.find("\n}\n", begin);
+    CHECK(text.substr(begin, end - begin).find("_killConfigChangeAllowed(") != std::string::npos);
+  }
+}
+
+// Port 81: an endless fragment stream from the open access point.
+struct DefragHarness {
+  std::vector<std::vector<uint8_t>> delivered;
+  std::vector<uint8_t> dropped;
+  WebSocketDeFragger defrag;
+  DefragHarness()
+    : defrag([this](uint8_t, WebSocketMessageType, tcb::span<const uint8_t> data) { delivered.emplace_back(data.begin(), data.end()); }, kLocalSocketMaxMessageBytes, [this](uint8_t id) { dropped.push_back(id); })
+  {
+  }
+};
+
+static void fragmentStreamIsBounded()
+{
+  DefragHarness h;
+  const std::vector<uint8_t> fragment(16, 0xAB);
+  h.defrag.handler(1, WStype_FRAGMENT_BIN_START, fragment.data(), fragment.size());
+  for (int i = 0; i < 2000; ++i) {
+    h.defrag.handler(1, WStype_FRAGMENT, fragment.data(), fragment.size());
+  }
+  h.defrag.handler(1, WStype_FRAGMENT_FIN, fragment.data(), fragment.size());
+  CHECK(h.dropped.size() == 1 && h.dropped[0] == 1);
+  CHECK(h.delivered.empty());
+  CHECK(g_panics == 0);
+}
+
+static void fragmentBoundIsExact()
+{
+  const std::vector<uint8_t> half(kLocalSocketMaxMessageBytes / 2, 1);
+  const uint8_t one = 1;
+
+  DefragHarness fits;
+  fits.defrag.handler(1, WStype_FRAGMENT_BIN_START, half.data(), half.size());
+  fits.defrag.handler(1, WStype_FRAGMENT_FIN, half.data(), half.size());
+  CHECK(fits.dropped.empty());
+  CHECK(fits.delivered.size() == 1 && fits.delivered[0].size() == kLocalSocketMaxMessageBytes);
+
+  DefragHarness over;
+  over.defrag.handler(1, WStype_FRAGMENT_BIN_START, half.data(), half.size());
+  over.defrag.handler(1, WStype_FRAGMENT, half.data(), half.size());
+  over.defrag.handler(1, WStype_FRAGMENT_FIN, &one, 1);
+  CHECK(over.dropped.size() == 1);
+  CHECK(over.delivered.empty());
+
+  // One big first fragment, which the library bounds only at 15 kilobytes.
+  DefragHarness big;
+  const std::vector<uint8_t> tooBig(kLocalSocketMaxMessageBytes + 1, 1);
+  big.defrag.handler(2, WStype_FRAGMENT_BIN_START, tooBig.data(), tooBig.size());
+  CHECK(big.dropped.size() == 1 && big.dropped[0] == 2);
+
+  // A dropped client does not touch another's message, and its later fragments do nothing.
+  DefragHarness two;
+  two.defrag.handler(1, WStype_FRAGMENT_BIN_START, tooBig.data(), tooBig.size());
+  two.defrag.handler(3, WStype_FRAGMENT_BIN_START, &one, 1);
+  two.defrag.handler(1, WStype_FRAGMENT, &one, 1);
+  two.defrag.handler(1, WStype_FRAGMENT_FIN, &one, 1);
+  two.defrag.handler(3, WStype_FRAGMENT_FIN, &one, 1);
+  CHECK(two.dropped.size() == 1);
+  CHECK(two.delivered.size() == 1 && two.delivered[0].size() == 2);
+}
+
+// A failed allocation drops the message instead of reaching the TinyVec panic, which restarts the hub.
+static void allocationFailureDropsTheMessage()
+{
+  DefragHarness h;
+  const std::vector<uint8_t> fragment(600, 1);
+  h.defrag.handler(1, WStype_FRAGMENT_BIN_START, fragment.data(), fragment.size());
+  s_failMallocAtOrAbove = 800;
+  h.defrag.handler(1, WStype_FRAGMENT, fragment.data(), fragment.size());
+  s_failMallocAtOrAbove = 0;
+  CHECK(h.dropped.size() == 1);
+  CHECK(g_panics == 0);
+
+  TinyVec<uint8_t> vec;
+  const uint8_t byte    = 1;
+  s_failMallocAtOrAbove = 1;
+  CHECK(!vec.try_append(&byte, 1));
+  s_failMallocAtOrAbove = 0;
+  CHECK(vec.size() == 0);
+  CHECK(vec.try_append(&byte, 1));
+  CHECK(vec.size() == 1);
+  CHECK(vec.try_append(nullptr, 1));
+
+  TinyVec<uint8_t, uint8_t> tiny;
+  uint8_t block[200] = {};
+  CHECK(tiny.try_append(block, 200));
+  CHECK(!tiny.try_append(block, 100));
+  CHECK(tiny.size() == 200);
+}
+
+// The real transmit task: an E-Stop ends a pulse in flight with its terminator, and nothing follows.
+static void estopEndsAPulseInFlight()
+{
+  armedHub();
+  engageByButton();
+  CHECK(SafetyCaps::Set(ShockerCommandType::Vibrate, highCaps()) == SetResult::Stored);
+  holdToClear();
+
+  Rmt::Sequence expected(kModel, 7, 0);
+  CHECK(expected.fill(ShockerCommandType::Vibrate, 20));
+  const std::vector<uint32_t> payload(reinterpret_cast<const uint32_t*>(expected.payload()), reinterpret_cast<const uint32_t*>(expected.payload()) + expected.size());
+  const std::vector<uint32_t> terminator(reinterpret_cast<const uint32_t*>(expected.terminator()), reinterpret_cast<const uint32_t*>(expected.terminator()) + expected.size());
+  CHECK(payload != terminator);
+
+  s_air.clear();
+  CHECK(CommandHandler::HandleCommand(kModel, 7, ShockerCommandType::Vibrate, 20, 2000));
+  advance(200);
+  CHECK(s_air.size() > 5);
+  for (const auto& frame : s_air) {
+    CHECK(frame.words == payload);
+  }
+
+  // The pulse has 1800 milliseconds left when the button goes down.
+  s_air.clear();
+  const int64_t pressedAt = g_nowMs;
+  pressButton();
+  advance(10);
+  CHECK(EStopManager::IsEStopped());
+  CHECK(!CommandHandler::HandleCommand(kModel, 7, ShockerCommandType::Vibrate, 20, 2000));
+  advance(1000);
+
+  std::size_t payloadFrames = 0;
+  for (const auto& frame : s_air) {
+    if (frame.words == payload) {
+      ++payloadFrames;
+      CHECK(frame.atMs <= pressedAt + 15);
+    } else {
+      CHECK(frame.words == terminator);
+    }
+  }
+  CHECK(payloadFrames <= 3);
+  CHECK(s_air.back().words == terminator);
+  CHECK(s_air.back().atMs <= pressedAt + 10 + 300 + 15);
+
+  // Quiet for good, and a command queued before the latch cannot start after it.
+  const std::size_t frames = s_air.size();
+  advance(500);
+  CHECK(s_air.size() == frames);
+  (void)SafetyCaps::Clear();
+}
+
+static void gatewayTriggerEndsAPulseInFlightWithNoTask()
+{
+  armedHub();
+  engageByButton();
+  CHECK(SafetyCaps::Set(ShockerCommandType::Vibrate, highCaps()) == SetResult::Stored);
+  holdToClear();
+  CHECK(CommandHandler::HandleCommand(kModel, 7, ShockerCommandType::Vibrate, 20, 2000));
+  advance(100);
+
+  // The checker stops running while the pulse is on the air. The trigger must still end it.
+  s_stallChecker = true;
+  sendTrigger(GatewaySchema::TriggerType::EmergencyStop);
+  advance(500);
+  s_air.clear();
+  advance(100);
+  CHECK(s_air.empty());
+  s_stallChecker = false;
+  (void)SafetyCaps::Clear();
+}
+
+static void stateIsReadable()
+{
+  CHECK(EStopWireCode(false, false) == 0);
+  CHECK(EStopWireCode(true, false) == 1);
+  CHECK(EStopWireCode(false, true) == 2);
+  CHECK(EStopWireCode(true, true) == 3);
+
+  flatbuffers::FlatBufferBuilder builder;
+  auto pong = GatewaySchema::CreatePong(builder, 1, 2, 3, 4, EStopWireCode(true, true));
+  builder.Finish(pong);
+  CHECK(flatbuffers::GetRoot<GatewaySchema::Pong>(builder.GetBufferPointer())->softproxy_estop() == 3);
+
+  armedHub();
+  g_serialOut.clear();
+  _handleEStopStateCommand(""sv, false);
+  CHECK(g_serialOut.find("EStopState|armed=true,engaged=false,pin=13") != std::string::npos);
+  engageByButton();
+  g_serialOut.clear();
+  _handleEStopStateCommand(""sv, false);
+  CHECK(g_serialOut.find("EStopState|armed=true,engaged=true,pin=13") != std::string::npos);
+
+  freshHub();
+  g_serialOut.clear();
+  _handleEStopStateCommand(""sv, false);
+  CHECK(g_serialOut.find("EStopState|armed=false,engaged=false,pin=-1") != std::string::npos);
+}
+
+#define SCENARIO(name)                             \
+  do {                                             \
+    const int failuresBefore = s_failures;         \
+    name();                                        \
+    if (s_failures != failuresBefore) {            \
+      std::printf("scenario failed: %s\n", #name); \
+    }                                              \
+  } while (0)
+
+int main()
+{
+  // `_Exit` below skips the stdio flush, because the task threads never join. A buffered failure line would be lost.
+  std::setvbuf(stdout, nullptr, _IONBF, 0);
+
+  SCENARIO(unreadableCapsLockTheEStop);
+  SCENARIO(bootWithTxOnEStopLeavesRadioOff);
+  SCENARIO(noEStopRefuses);
+  SCENARIO(armedHubAdmitsWithinCaps);
+  SCENARIO(gatewayTriggerLatchesWithNoTask);
+  SCENARIO(gatewayTriggerLatchesWithTask);
+  SCENARIO(holdToClearNeedsTheFullHold);
+  SCENARIO(latchSurvivesWarmRestart);
+  SCENARIO(coldBootStartsReleased);
+  SCENARIO(corruptLatchReadsAsColdBoot);
+  SCENARIO(heldButtonAcrossRestartStaysEngaged);
+  SCENARIO(serialCannotClearTheLatch);
+  SCENARIO(taskRestartKeepsTheLatch);
+  SCENARIO(capsLockTheEStopSettings);
+  SCENARIO(enableNeedsAValidPin);
+  SCENARIO(stalledCheckerIsNotArmed);
+  SCENARIO(capRiseNeedsAnEngagedEStop);
+  SCENARIO(capsRiseCoversEveryField);
+  SCENARIO(pinsStaySeparate);
+  SCENARIO(pinRuleKeysOnTheRunTimePin);
+  SCENARIO(serialCapRiseNeedsTheEStop);
+  SCENARIO(configWritesAreGated);
+  SCENARIO(fragmentStreamIsBounded);
+  SCENARIO(fragmentBoundIsExact);
+  SCENARIO(allocationFailureDropsTheMessage);
+  SCENARIO(estopEndsAPulseInFlight);
+  SCENARIO(gatewayTriggerEndsAPulseInFlightWithNoTask);
+  SCENARIO(stateIsReadable);
+
+  if (s_failures != 0) {
+    std::printf("%d check(s) failed\n", s_failures);
+    std::_Exit(EXIT_FAILURE);
+  }
+  std::printf("kill path: all checks passed\n");
+  std::_Exit(EXIT_SUCCESS);
+}

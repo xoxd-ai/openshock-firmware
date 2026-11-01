@@ -1,9 +1,9 @@
 #pragma once
 
-// Report of the Softproxy cap refusals (include/softproxy/CapLimiter.h), so a refused step reaches
+// Report of the Softproxy cap and E-Stop refusals (include/softproxy/CapLimiter.h), so a refused step reaches
 // Softproxy instead of reading as an actuation (TIN-7545). Each refusal leaves two traces:
 //
-// - one hub log line, `softproxy-refusal seq=<n> channel=<shock|vibrate> verdict=<name>`, on the serial log;
+// - one hub log line, `softproxy-refusal seq=<n> channel=<shock|vibrate|other> verdict=<name>`, on the serial log;
 // - the gateway heartbeat: the hub's `Pong` carries `softproxy_cap_refusals` (count since boot) and
 //   `softproxy_last_refusal` (wire code of the latest refusal). A receiver that sees the count rise between
 //   two heartbeats knows that many steps were refused. A lower `uptime` marks a reboot, which restarts the count.
@@ -30,6 +30,8 @@ namespace OpenShock::Softproxy {
   static_assert(static_cast<uint8_t>(Verdict::Gap) == 7);
   static_assert(static_cast<uint8_t>(Verdict::Hourly) == 8);
   static_assert(static_cast<uint8_t>(Verdict::Daily) == 9);
+  static_assert(static_cast<uint8_t>(Verdict::EStopEngaged) == 10);
+  static_assert(static_cast<uint8_t>(Verdict::EStopNotArmed) == 11);
 
   /// One consistent reading of the report.
   struct RefusalSnapshot {
@@ -79,7 +81,7 @@ namespace OpenShock::Softproxy {
     if (code == 0) {
       return "none";
     }
-    if (code > static_cast<uint8_t>(Verdict::Daily)) {
+    if (code > static_cast<uint8_t>(Verdict::EStopNotArmed)) {
       return "unknown";
     }
     return VerdictName(static_cast<Verdict>(code));

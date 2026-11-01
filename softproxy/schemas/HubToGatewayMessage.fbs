@@ -1,5 +1,5 @@
 // xoxd-ai fork copy of OpenShock/flatbuffers-schemas HubToGatewayMessage.fbs at commit aaceae189d7e8513091f52b8d5046c7c6da20b71 (the
-// schemas submodule pin), with two Pong fields added for the Softproxy cap refusal report (SOFTPROXY.md,
+// schemas submodule pin), with three Pong fields added for the Softproxy refusal report and E-Stop state (SOFTPROXY.md,
 // include/softproxy/RefusalReport.h). include/serialization/_fbs/HubToGatewayMessage_generated.h carries the
 // matching code. The new fields come last, so a reader built from the upstream schema ignores them.
 
@@ -19,8 +19,11 @@ table Pong {
   softproxy_cap_refusals:uint32;
 
   // xoxd-ai fork: verdict of the latest refusal, 0 before the first. 2 caps-not-set, 3 boot-hold,
-  // 4 over-intensity, 5 over-pulse-ms, 6 over-pulses, 7 gap, 8 hourly, 9 daily.
+  // 4 over-intensity, 5 over-pulse-ms, 6 over-pulses, 7 gap, 8 hourly, 9 daily, 10 estop-engaged, 11 estop-not-armed.
   softproxy_last_refusal:uint8;
+
+  // xoxd-ai fork: E-Stop state. Bit 0 armed, bit 1 engaged.
+  softproxy_estop:uint8;
 }
 
 table BootStatus {
