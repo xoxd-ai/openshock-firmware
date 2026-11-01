@@ -5,6 +5,7 @@
 // can check them.
 
 #include <array>
+#include <cstddef>
 #include <string_view>
 
 namespace OpenShock::Softproxy {
@@ -22,6 +23,15 @@ namespace OpenShock::Softproxy {
   /// while the gateway is unreachable, as upstream does, but the gateway can no longer hold it open.
   /// `CaptivePortalDisable` still works, since it only closes the portal.
   constexpr bool kAllowGatewayCaptivePortalEnable = false;
+
+  /// The fork keeps the portal closed when only the radio fails. Upstream opens it so a phone can fix the RF TX pin,
+  /// but the local socket serves no command here, so the portal would add an open access point and no repair path.
+  constexpr bool kOpenPortalOnRadioFailure = false;
+
+  /// Largest message, in bytes, that the port 81 socket accepts. The flatbuffers verifier uses it too. The
+  /// defragmenter holds a fragmented message to this bound, and an unbounded one could exhaust the heap and restart
+  /// the hub from the open access point (`WebSocketDeFragger`).
+  constexpr std::size_t kLocalSocketMaxMessageBytes = 4096;
 
   /// Local socket commands (captive portal WebSocket, port 81) that the fork still serves, by their
   /// `LocalToHubMessagePayload` name. The socket has no authentication and the portal access point has no

@@ -63,7 +63,7 @@ void MessageHandlers::WebSocket::HandleLocalBinary(uint8_t socketId, tcb::span<c
 
   // Validate buffer
   flatbuffers::Verifier::Options verifierOptions {
-    .max_size = 4096,  // TODO: Profile this
+    .max_size = Softproxy::kLocalSocketMaxMessageBytes,
   };
   flatbuffers::Verifier verifier(data.data(), data.size(), verifierOptions);
   if (!msg->Verify(verifier)) {

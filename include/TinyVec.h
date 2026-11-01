@@ -84,6 +84,25 @@ public:
     _cap  = new_cap;
   }
 
+  /// Like `reserve`, but returns false on an allocation failure instead of restarting the hub. For input a remote
+  /// client controls.
+  [[nodiscard]] bool try_reserve(SizeType new_cap) noexcept
+  {
+    if (new_cap <= _cap) return true;
+    if (sizeof(T) && new_cap > std::numeric_limits<SizeType>::max() / sizeof(T)) return false;
+
+    void* newbuf = malloc(size_t(new_cap) * sizeof(T));
+    if (!newbuf) return false;
+    if (_data) {
+      memcpy(newbuf, _data, size_t(_len) * sizeof(T));
+      free(_data);
+    }
+
+    _data = static_cast<T*>(newbuf);
+    _cap  = new_cap;
+    return true;
+  }
+
   void resize(SizeType new_len)
   {
     if (new_len > _cap) reserve(next_cap(new_len));
@@ -102,6 +121,18 @@ public:
     if (new_len > _cap) reserve(next_cap(new_len));
     memcpy(_data + _len, src, size_t(count) * sizeof(T));
     _len = new_len;
+  }
+
+  /// Like `append`, but returns false and changes nothing on an overflow or allocation failure.
+  [[nodiscard]] bool try_append(const T* src, SizeType count) noexcept
+  {
+    if (!src || count == 0) return true;
+    if (count > std::numeric_limits<SizeType>::max() - _len) return false;
+    SizeType new_len = _len + count;
+    if (new_len > _cap && !try_reserve(next_cap(new_len))) return false;
+    memcpy(_data + _len, src, size_t(count) * sizeof(T));
+    _len = new_len;
+    return true;
   }
 
   void assign(const T* src, SizeType count)

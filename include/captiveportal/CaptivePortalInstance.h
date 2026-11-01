@@ -40,5 +40,6 @@ namespace OpenShock::CaptivePortal {
     fs::LittleFSFS m_fileSystem;
     DNSServer m_dnsServer;
     TaskHandle_t m_taskHandle;
+    uint32_t m_socketsToDrop;  // Clients to disconnect, one bit per socket id. Set and read on the portal task.
   };
 }  // namespace OpenShock::CaptivePortal

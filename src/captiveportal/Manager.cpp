@@ -81,7 +81,7 @@ static void captiveportal_stop()
 static void captiveportal_updateloop(void*)
 {
   bool gatewayConnected = GatewayConnectionManager::IsConnected();
-  bool commandHandlerOk = CommandHandler::Ok();
+  bool commandHandlerOk = CommandHandler::Ok() || !Softproxy::kOpenPortalOnRadioFailure;
   bool shouldBeRunning  = (s_alwaysEnabled || !gatewayConnected || !commandHandlerOk) && !s_forceClosed;
 
   if (s_instance == nullptr) {
