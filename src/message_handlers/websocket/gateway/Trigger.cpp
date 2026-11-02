@@ -25,7 +25,7 @@ void _Private::HandleTrigger(const OpenShock::Serialization::Gateway::GatewayToH
 
   auto triggerType = msg->type();
 
-  // An EmergencyStop passes while engaged, because a hold-to-clear in progress would otherwise release the hub after it.
+  // An EmergencyStop passes while engaged, because a clear in progress would otherwise release the hub after it.
   if (EStopManager::IsEStopped() && triggerType != TriggerType::EmergencyStop) {
     OS_LOGD(TAG, "Ignoring trigger command due to EmergencyStop being activated");
     return;

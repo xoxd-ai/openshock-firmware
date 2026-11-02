@@ -54,6 +54,7 @@
 #include <map>
 #include <mutex>
 #include <random>
+#include <set>
 #include <sys/wait.h>
 #include <thread>
 #include <unistd.h>
@@ -271,26 +272,39 @@ BaseType_t xQueueReceive(QueueHandle_t queue, void* out, TickType_t wait)
   return pdTRUE;
 }
 
-// GPIO. A released button reads 1 through the pull-up, and the button pulls the pin to 0.
+// GPIO. The E-Stop is a latching mushroom with a normally closed contact to ground (R-SOFTPROXY-ESTOP-NC, SP-174). Up
+// closes the contact, which reads 0 and means run. Down opens it, which reads 1 through the pull-up and means stop,
+// until it is twisted up. A pin with nothing wired reads 1 through the pull-up, as a cut or unplugged cable does. With
+// no pull-up it floats, and the fake reads that as 0, run, the unsafe case.
 static std::map<int, int> s_gpioLevel;
 static std::vector<int> s_gpioConfigured;
+static std::set<int> s_gpioPullUp;
 esp_err_t gpio_config(const gpio_config_t* config)
 {
   for (int pin = 0; pin < 64; ++pin) {
     if ((config->pin_bit_mask >> pin) & 1) {
       s_gpioConfigured.push_back(pin);
+      if (config->pull_up_en == GPIO_PULLUP_ENABLE) {
+        s_gpioPullUp.insert(pin);
+      } else {
+        s_gpioPullUp.erase(pin);
+      }
     }
   }
   return ESP_OK;
 }
-esp_err_t gpio_reset_pin(gpio_num_t)
+esp_err_t gpio_reset_pin(gpio_num_t pin)
 {
+  s_gpioPullUp.erase(pin);
   return ESP_OK;
 }
 int gpio_get_level(gpio_num_t pin)
 {
   auto it = s_gpioLevel.find(pin);
-  return it == s_gpioLevel.end() ? 1 : it->second;
+  if (it != s_gpioLevel.end()) {
+    return it->second;
+  }
+  return s_gpioPullUp.count(pin) != 0 ? 1 : 0;
 }
 
 // RMT. Each write is one frame on the air, and it costs the transmit task one tick.
@@ -412,6 +426,8 @@ static int s_failures = 0;
   } while (0)
 
 static const gpio_num_t kButton = static_cast<gpio_num_t>(13);
+static const int kRunLevel       = 0;
+static const int kStopLevel      = 1;
 static const auto kModel        = ShockerModelType::CaiXianlin;
 
 // Synthetic caps. `high` is above `low` in every field.
@@ -464,10 +480,12 @@ static void restartEStopManager(bool coldBoot)
   bootEStopManager(coldBoot ? ESP_RST_POWERON : ESP_RST_SW, coldBoot);
 }
 
-// A clean hub: cold boot, nothing wired, caps cleared. It starts engaged with source cold-boot (SP-158).
+// A clean hub: cold boot, the button wired with the mushroom up, caps cleared. It starts engaged with source cold-boot
+// (SP-158). Every other pin has nothing wired, so it reads open.
 static void freshHub(bool enabled = false, gpio_num_t pin = GPIO_NUM_NC)
 {
   s_gpioLevel.clear();
+  s_gpioLevel[kButton] = kRunLevel;
   s_gpioConfigured.clear();
   s_stallChecker = false;
   s_cfgEnabled   = enabled;
@@ -487,26 +505,30 @@ static void freshHub(bool enabled = false, gpio_num_t pin = GPIO_NUM_NC)
   g_serialOut.clear();
 }
 
-static void pressButton(gpio_num_t pin = kButton)
+// The mushroom stays where it is put. Down opens the contact, and up closes it.
+static void pushDown(gpio_num_t pin = kButton)
 {
-  s_gpioLevel[pin] = 0;
+  s_gpioLevel[pin] = kStopLevel;
 }
-static void releaseButton(gpio_num_t pin = kButton)
+static void twistUp(gpio_num_t pin = kButton)
 {
-  s_gpioLevel[pin] = 1;
+  s_gpioLevel[pin] = kRunLevel;
+}
+// The cable is cut or unplugged: nothing drives the pin, and the pull-up reads it open.
+static void cutCable(gpio_num_t pin = kButton)
+{
+  s_gpioLevel.erase(pin);
 }
 
-// Holds the button until the E-Stop is released, the only way that releases it. The press first needs a release,
-// since a held button is no new press. The last wait outlasts the 65 millisecond debounce and the 250 millisecond
-// rearm window, which starts when the debounced release clears the E-Stop.
-static void holdToClear(gpio_num_t pin = kButton)
+// The only way that releases the E-Stop (SP-174): the mushroom measured down for a full 65 millisecond window, then
+// twisted up and left up for the 5 second clear time. The clear starts once a full window reads low, so the last wait
+// is 65 milliseconds plus the clear time plus margin. Pushing it down first changes nothing on an engaged hub.
+static void twistToClear(gpio_num_t pin = kButton)
 {
-  releaseButton(pin);
+  pushDown(pin);
   advance(100);
-  pressButton(pin);
-  advance(5100);
-  releaseButton(pin);
-  advance(350);
+  twistUp(pin);
+  advance(5200);
 }
 
 // An armed hub with the button wired and released: the cold boot latch cleared by hand, as SP-158 requires.
@@ -515,7 +537,7 @@ static void armedHub()
   freshHub(true, kButton);
   CHECK(EStopManager::IsArmed());
   CHECK(EStopManager::GetLatchSource() == EStopLatchSource::ColdBoot);
-  holdToClear();
+  twistToClear();
   CHECK(EStopManager::IsArmed());
   CHECK(!EStopManager::IsEStopped());
   s_published.clear();
@@ -533,16 +555,14 @@ static void releasedHubWithNoTask()
   s_published.clear();
 }
 
-// A real press: one low sample engages, and the press lasts past the 65 millisecond window that confirms it. The task
-// must have read a full window of the released pin first.
+// A real press: one high sample engages, and the mushroom stays down past the 65 millisecond window that confirms it.
+// The task must have read a full window of the mushroom up, the contact closed, first. The mushroom latches, so it stays down after this.
 static void engageByButton(gpio_num_t pin = kButton)
 {
-  pressButton(pin);
+  pushDown(pin);
   advance(20);
   CHECK(EStopManager::IsEStopped());
   advance(80);
-  releaseButton(pin);
-  advance(100);
 }
 
 static void sendTrigger(GatewaySchema::TriggerType type)
@@ -616,7 +636,7 @@ static void noEStopRefuses()
   engageByButton();
   CHECK(SafetyCaps::Set(ShockerCommandType::Shock, lowCaps()) == SetResult::Stored);
   CHECK(SafetyCaps::Set(ShockerCommandType::Vibrate, lowCaps()) == SetResult::Stored);
-  holdToClear();
+  twistToClear();
   CHECK(!EStopManager::IsEStopped());
   s_cfgEnabled = false;
   s_cfgPin     = GPIO_NUM_NC;
@@ -655,7 +675,7 @@ static void armedHubAdmitsWithinCaps()
   advance(20);
   CHECK(s_air.empty());
 
-  holdToClear();
+  twistToClear();
   CHECK(CommandHandler::HandleCommand(kModel, 7, ShockerCommandType::Vibrate, 1, 50));
   advance(20);
   CHECK(!s_air.empty());
@@ -686,48 +706,78 @@ static void gatewayTriggerLatchesWithTask()
   CHECK(EStopManager::IsEStopped());
   advance(10);
   CHECK(s_published.size() == 1 && s_published.back() == EStopState::Active);
-  holdToClear();
+
+  // The mushroom was up when the stop came, so leaving it up clears nothing. It has to go down and up again.
+  advance(6000);
+  CHECK(EStopManager::IsEStopped());
+  twistToClear();
   CHECK(!EStopManager::IsEStopped());
   CHECK(s_published.back() == EStopState::Idle);
 }
 
-static void holdToClearNeedsTheFullHold()
+static void twistToClearNeedsTheFullTime()
 {
   armedHub();
 
-  // The press that engaged is no clear, however long it stays down.
-  pressButton();
+  // A latched mushroom held down for minutes never clears. Down is stopped, read as a level, always (SP-174).
+  pushDown();
+  advance(3 * 60 * 1000);
+  CHECK(EStopManager::IsEStopped());
+  CHECK(s_published.size() == 1 && s_published.back() == EStopState::Active);
+  CHECK(!CommandHandler::HandleCommand(kModel, 7, ShockerCommandType::Stop, 0, 50));
+
+  // Twisted up, it clears after a full low window and the clear time, and not before.
+  twistUp();
+  advance(65 + 4900);
+  CHECK(EStopManager::IsEStopped());
+  CHECK(s_published.back() == EStopState::ActiveClearing);
+  advance(200);
+  CHECK(!EStopManager::IsEStopped());
+  CHECK(s_published.back() == EStopState::Idle);
+
+  // A high level engages at once, with no rearm window after the clear.
+  pushDown();
+  advance(5);
+  CHECK(EStopManager::IsEStopped());
+  twistToClear();
+  CHECK(!EStopManager::IsEStopped());
+}
+
+// A push during the clear stops it: the hub stays engaged, the source does not change, and no command passes. Only a
+// new twist up clears. During the clear the latch still refuses a rise, whatever set it.
+static void aPushDuringTheClearStopsIt()
+{
+  armedHub();
+  engageByButton();
+  CHECK(EStopManager::GetLatchSource() == EStopLatchSource::Button);
+  twistUp();
+  advance(2000);
+  CHECK(s_published.back() == EStopState::ActiveClearing);
+  pushDown();
+  for (int i = 0; i < 1000; ++i) {
+    advance(5);
+    CHECK(EStopManager::IsEStopped());
+  }
+  CHECK(EStopManager::GetLatchSource() == EStopLatchSource::Button);
+  CHECK(s_published.back() == EStopState::Active);
+  CHECK(!CommandHandler::HandleCommand(kModel, 7, ShockerCommandType::Stop, 0, 50));
+  twistUp();
+  advance(5200);
+  CHECK(!EStopManager::IsEStopped());
+
+  // On the cold boot latch, a clear under way neither confirms a press nor allows a rise.
+  freshHub(true, kButton);
+  pushDown();
+  advance(100);
+  twistUp();
+  advance(1000);
+  CHECK(s_published.back() == EStopState::ActiveClearing);
+  CHECK(EStopManager::GetLatchSource() == EStopLatchSource::ColdBoot);
+  CHECK(SafetyCaps::Set(ShockerCommandType::Vibrate, lowCaps()) == SetResult::NeedsEngagedEStop);
+  pushDown();
   advance(6000);
-  releaseButton();
-  advance(400);
-  CHECK(EStopManager::IsEStopped());
-
-  // Staying pressed from the engaging press clears nothing.
-  pressButton();
-  advance(4800);
-  releaseButton();
-  advance(100);
-  CHECK(EStopManager::IsEStopped());
-
-  // Clearing happens on the release after the hold, not at the end of the hold.
-  pressButton();
-  advance(5100);
-  CHECK(EStopManager::IsEStopped());
-  releaseButton();
-  advance(100);
-  CHECK(!EStopManager::IsEStopped());
-
-  // A press right after a clear is ignored inside the 250 millisecond rearm window when released before its end.
-  pressButton();
-  advance(50);
-  releaseButton();
-  advance(300);
-  CHECK(!EStopManager::IsEStopped());
-
-  // One still held at the end of the window engages.
-  pressButton();
-  advance(30);
-  CHECK(EStopManager::IsEStopped());
+  CHECK(EStopManager::GetLatchSource() == EStopLatchSource::ColdBoot);
+  CHECK(!SafetyCaps::AnySet());
 }
 
 // Findings: a restart, panic or watchdog cleared an engaged E-Stop with no hold.
@@ -746,14 +796,15 @@ static void latchSurvivesWarmRestart()
   restartEStopManager(false);
   CHECK(EStopManager::IsEStopped());
 
-  holdToClear();
+  twistToClear();
   CHECK(!EStopManager::IsEStopped());
   restartEStopManager(false);
   CHECK(!EStopManager::IsEStopped());
 }
 
-// SP-158: a cold boot refuses every command, Stop included, until the hold-to-clear. Nothing else releases it, so a
-// power cycle with nobody at the hub leaves every command refused until the operator clears it by hand.
+// SP-158: a cold boot refuses every command, Stop included, until the clear. Nothing else releases it, so a power cycle
+// with nobody at the hub leaves every command refused until the operator clears it by hand. A mushroom already up at
+// the boot proves no twist, so it has to go down and up again (SP-174).
 static void coldBootStartsEngaged()
 {
   // No pin stored: nothing can clear it, and no command reaches the radio.
@@ -768,11 +819,11 @@ static void coldBootStartsEngaged()
   CHECK(EStopManager::IsEStopped());
   CHECK(s_air.empty());
 
-  // A hub in service, caps stored and pin wired, loses power. Time alone releases nothing.
+  // A hub in service, caps stored and pin wired, loses power with the mushroom up. Time alone releases nothing.
   armedHub();
   engageByButton();
   CHECK(SafetyCaps::Set(ShockerCommandType::Vibrate, lowCaps()) == SetResult::Stored);
-  holdToClear();
+  twistToClear();
   CHECK(CommandHandler::HandleCommand(kModel, 7, ShockerCommandType::Vibrate, 1, 50));
   advance(3000);
   restartEStopManager(true);
@@ -784,10 +835,10 @@ static void coldBootStartsEngaged()
   CHECK(lastRefusalIs(Verdict::EStopEngaged));
   CHECK(s_air.empty());
 
-  // The caps keep the settings locked through the power cycle. The hold-to-clear is what brings commands back.
+  // The caps keep the settings locked through the power cycle. The clear is what brings commands back.
   CHECK(!EStopManager::SetEStopPin(static_cast<gpio_num_t>(14)));
   CHECK(!EStopManager::SetEStopEnabled(false));
-  holdToClear();
+  twistToClear();
   CHECK(!EStopManager::IsEStopped());
   CHECK(CommandHandler::HandleCommand(kModel, 7, ShockerCommandType::Vibrate, 1, 50));
   advance(20);
@@ -823,13 +874,9 @@ static void coldBootLatchLeavesSettingsOpen()
   advance(50);
   CHECK(EStopManager::GetLatchSource() == EStopLatchSource::ColdBoot);
 
-  // A press on the old pin does nothing. The hold-to-clear runs on the pin the checker reads.
+  // A twist on the old pin does nothing. The clear runs on the pin the checker reads.
   CHECK(EStopManager::GetRunningPin() == static_cast<gpio_num_t>(14));
-  releaseButton(kButton);
-  pressButton(kButton);
-  advance(5200);
-  releaseButton(kButton);
-  advance(350);
+  twistToClear(kButton);
   CHECK(EStopManager::IsEStopped());
 }
 
@@ -858,11 +905,11 @@ static void armedTriggerDoesNotAllowARise()
   CHECK(SafetyCaps::Set(ShockerCommandType::Vibrate, lowCaps()) == SetResult::NeedsEngagedEStop);
   CHECK(!SafetyCaps::AnySet());
 
-  // A short press during a held latch starts the hold-to-clear and is no engagement, whatever set the latch.
+  // Pushing the mushroom down during a held latch is no engagement, whatever set the latch.
   engageByButton();
   CHECK(EStopManager::GetLatchSource() == EStopLatchSource::ColdBoot);
   CHECK(SafetyCaps::Set(ShockerCommandType::Vibrate, lowCaps()) == SetResult::NeedsEngagedEStop);
-  holdToClear();
+  twistToClear();
   sendTrigger(GatewaySchema::TriggerType::EmergencyStop);
   advance(20);
   engageByButton();
@@ -870,7 +917,7 @@ static void armedTriggerDoesNotAllowARise()
   CHECK(SafetyCaps::Set(ShockerCommandType::Vibrate, lowCaps()) == SetResult::NeedsEngagedEStop);
 
   // Only a clear and then a press from released counts.
-  holdToClear();
+  twistToClear();
   CHECK(!EStopManager::IsEStopped());
   engageByButton();
   CHECK(EStopManager::GetLatchSource() == EStopLatchSource::Button);
@@ -887,7 +934,7 @@ static void latchKeepsItsFirstSource()
   EStopManager::Trigger();
   advance(20);
   CHECK(EStopManager::GetLatchSource() == EStopLatchSource::Button);
-  holdToClear();
+  twistToClear();
 
   s_externallyTriggered = true;
   advance(10);
@@ -895,48 +942,41 @@ static void latchKeepsItsFirstSource()
   CHECK(EStopManager::GetLatchSource() == EStopLatchSource::Gateway);
 }
 
-// A gateway stop reaches a hold-to-clear in progress, so the hub does not release after it. A press under way then
-// counts for nothing and the hold needs a new press. The other triggers stay ignored while engaged.
+// A gateway stop reaches a clear in progress, so the hub does not release after it. The mushroom measured down before the
+// stop then counts for nothing, and the clear needs it down and up again. The other triggers stay ignored while engaged.
 static void emergencyStopInterruptsAClear()
 {
   armedHub();
   engageByButton();
 
-  // During the hold.
-  pressButton();
+  // During the clear.
+  twistUp();
   advance(1000);
+  CHECK(s_published.back() == EStopState::ActiveClearing);
   sendTrigger(GatewaySchema::TriggerType::EmergencyStop);
   advance(5200);
-  releaseButton();
-  advance(400);
   CHECK(EStopManager::IsEStopped());
   CHECK(EStopManager::GetLatchSource() == EStopLatchSource::Button);
-
-  // After the hold, waiting for the release.
-  pressButton();
-  advance(5100);
-  sendTrigger(GatewaySchema::TriggerType::EmergencyStop);
-  advance(20);
-  releaseButton();
-  advance(400);
+  advance(6000);
   CHECK(EStopManager::IsEStopped());
 
   // The same holds on the cold boot latch.
   freshHub(true, kButton);
-  pressButton();
+  pushDown();
+  advance(100);
+  twistUp();
   advance(1000);
   sendTrigger(GatewaySchema::TriggerType::EmergencyStop);
   advance(5200);
-  releaseButton();
-  advance(400);
+  CHECK(EStopManager::IsEStopped());
   CHECK(EStopManager::GetLatchSource() == EStopLatchSource::ColdBoot);
 
   const int portalCalls = s_portalCalls;
   sendTrigger(GatewaySchema::TriggerType::CaptivePortalDisable);
   CHECK(s_portalCalls == portalCalls);
 
-  // A new press still clears.
-  holdToClear();
+  // A new push and twist still clears.
+  twistToClear();
   CHECK(!EStopManager::IsEStopped());
 }
 
@@ -954,7 +994,7 @@ static void sourceSurvivesWarmRestart()
   CHECK(!EStopManager::SetEStopEnabled(false));
   CHECK(SafetyCaps::Set(ShockerCommandType::Vibrate, lowCaps()) == SetResult::Stored);
   (void)SafetyCaps::Clear();
-  holdToClear();
+  twistToClear();
   sendTrigger(GatewaySchema::TriggerType::EmergencyStop);
   advance(20);
   CHECK(!EStopManager::SetEStopPin(static_cast<gpio_num_t>(14)));
@@ -974,7 +1014,7 @@ static void onlyAnAllowedResetKeepsTheLatch()
     CHECK(EStopManager::GetLatchSource() == EStopLatchSource::ColdBoot);
     CHECK(!CommandHandler::HandleCommand(kModel, 7, ShockerCommandType::Stop, 0, 50));
     CHECK(lastRefusalIs(Verdict::EStopEngaged));
-    holdToClear();
+    twistToClear();
 
     // A sealed `Button`, which must not carry its rise across a power loss.
     engageByButton();
@@ -983,7 +1023,7 @@ static void onlyAnAllowedResetKeepsTheLatch()
     advance(20);
     CHECK(EStopManager::GetLatchSource() == EStopLatchSource::ColdBoot);
     CHECK(SafetyCaps::Set(ShockerCommandType::Vibrate, lowCaps()) == SetResult::NeedsEngagedEStop);
-    holdToClear();
+    twistToClear();
   }
 
   for (esp_reset_reason_t reason : {ESP_RST_SW, ESP_RST_PANIC, ESP_RST_INT_WDT, ESP_RST_TASK_WDT, ESP_RST_WDT}) {
@@ -995,8 +1035,34 @@ static void onlyAnAllowedResetKeepsTheLatch()
     bootEStopManager(reason, false);
     advance(20);
     CHECK(EStopManager::GetLatchSource() == EStopLatchSource::Button);
-    holdToClear();
+    twistToClear();
   }
+}
+
+// SP-172: a panic or watchdog reset keeps the latch as it was, engaged or released, with its source. So a crash loop
+// never forces a stop: a released hub that restarts over and over comes back released each time.
+static void crashLoopNeverForcesAStop()
+{
+  armedHub();
+  for (int i = 0; i < 20; ++i) {
+    bootEStopManager(i % 2 == 0 ? ESP_RST_PANIC : ESP_RST_TASK_WDT, false);
+    advance(50);
+    CHECK(!EStopManager::IsEStopped());
+    CHECK(EStopManager::GetLatchSource() == EStopLatchSource::Released);
+  }
+  CHECK(CommandHandler::HandleCommand(kModel, 7, ShockerCommandType::Stop, 0, 50));
+
+  // An engaged hub stays engaged with its source through the same loop, and the mushroom still clears it. The press
+  // comes after the restarted task has measured a full run window, so it counts as a button.
+  advance(100);
+  engageByButton();
+  for (int i = 0; i < 20; ++i) {
+    bootEStopManager(i % 2 == 0 ? ESP_RST_INT_WDT : ESP_RST_WDT, false);
+    advance(50);
+    CHECK(EStopManager::GetLatchSource() == EStopLatchSource::Button);
+  }
+  twistToClear();
+  CHECK(!EStopManager::IsEStopped());
 }
 
 // The armed half of the rise rule through the real `Set`: a button latch with no live checker behind it allows no rise.
@@ -1037,13 +1103,13 @@ static void buttonLatchWithADeadCheckerAllowsNoRise()
   CHECK(EStopManager::SetEStopPin(kButton));
 }
 
-// One low sample engages, which is the safe side, but it can be noise on the line. It proves no press (SP-156).
-static void oneLowSampleProvesNoPress()
+// One high sample engages, which is the safe side, but it can be noise on the line. It proves no press (SP-156).
+static void oneHighSampleProvesNoPress()
 {
   armedHub();
-  pressButton();
+  pushDown();
   advance(5);
-  releaseButton();
+  twistUp();
   advance(200);
   CHECK(EStopManager::IsEStopped());
   CHECK(EStopManager::GetLatchSource() == EStopLatchSource::Unconfirmed);
@@ -1052,6 +1118,14 @@ static void oneLowSampleProvesNoPress()
   CHECK(!EStopManager::SetEStopEnabled(false));
   CHECK(!CommandHandler::HandleCommand(kModel, 7, ShockerCommandType::Stop, 0, 50));
 
+  // The mushroom was never measured down, so leaving it up clears nothing.
+  advance(6000);
+  CHECK(EStopManager::IsEStopped());
+
+  // A real press on the same task after the glitch is a press during a held latch, so it restates nothing.
+  engageByButton();
+  CHECK(EStopManager::GetLatchSource() == EStopLatchSource::Unconfirmed);
+
   // A warm restart keeps it, and a press during the held latch restates nothing.
   restartEStopManager(false);
   advance(20);
@@ -1059,78 +1133,74 @@ static void oneLowSampleProvesNoPress()
   engageByButton();
   CHECK(EStopManager::GetLatchSource() == EStopLatchSource::Unconfirmed);
   CHECK(SafetyCaps::Set(ShockerCommandType::Vibrate, lowCaps()) == SetResult::NeedsEngagedEStop);
-  holdToClear();
+  twistToClear();
   CHECK(!EStopManager::IsEStopped());
 
-  // A real press reads as a button at the 13th low sample, and a press that bounces first does too.
-  pressButton();
+  // A real press reads as a button at the 13th high sample, and a press that bounces first does too.
+  pushDown();
   advance(60);
   CHECK(EStopManager::GetLatchSource() == EStopLatchSource::Unconfirmed);
   advance(10);
   CHECK(EStopManager::GetLatchSource() == EStopLatchSource::Button);
-  holdToClear();
-  pressButton();
+  twistToClear();
+  pushDown();
   advance(5);
-  releaseButton();
+  twistUp();
   advance(5);
-  pressButton();
+  pushDown();
   advance(100);
   CHECK(EStopManager::GetLatchSource() == EStopLatchSource::Button);
-  holdToClear();
+  twistToClear();
 }
 
-// A noisy line can hold the debounced state down for the whole hold. Only a solid press may run the hold-to-clear.
+// Only a stable low level for the clear time releases. A noisy line on a latched mushroom must not read as a twist up.
 static void pulseTrainClearsNothing()
 {
   armedHub();
   engageByButton();
   CHECK(SafetyCaps::Set(ShockerCommandType::Vibrate, lowCaps()) == SetResult::Stored);
 
-  // A low sample in every window, for longer than the hold. The caps are set, so a release here would admit the next
-  // command with nobody at the button.
+  // A low sample in every window on a mushroom held down, for longer than the clear time. The caps are set, so a
+  // release here would admit the next command with nobody at the hub.
   for (int i = 0; i < 100; ++i) {
-    pressButton();
+    twistUp();
     advance(5);
-    releaseButton();
+    pushDown();
     advance(55);
   }
+  CHECK(EStopManager::IsEStopped());
+
+  // Mostly low, and still never a full window.
+  for (int i = 0; i < 100; ++i) {
+    twistUp();
+    advance(55);
+    pushDown();
+    advance(5);
+  }
+  CHECK(EStopManager::IsEStopped());
+
+  // Long low stretches cut by one high sample before each would end the clear.
+  for (int i = 0; i < 10; ++i) {
+    twistUp();
+    advance(4000);
+    pushDown();
+    advance(5);
+  }
+  twistUp();
   advance(400);
   CHECK(EStopManager::IsEStopped());
   CHECK(EStopManager::GetLatchSource() == EStopLatchSource::Button);
   CHECK(!CommandHandler::HandleCommand(kModel, 7, ShockerCommandType::Vibrate, 1, 50));
   CHECK(lastRefusalIs(Verdict::EStopEngaged));
   (void)SafetyCaps::Clear();
-
-  // A solid start that turns noisy ends the hold, so the hub does not release on the end of the noise.
-  pressButton();
-  advance(100);
-  for (int i = 0; i < 100; ++i) {
-    releaseButton();
-    advance(5);
-    pressButton();
-    advance(55);
-  }
-  releaseButton();
-  advance(400);
-  CHECK(EStopManager::IsEStopped());
-
-  // A high sample in every window: mostly low, and still never a full window.
-  for (int i = 0; i < 100; ++i) {
-    pressButton();
-    advance(55);
-    releaseButton();
-    advance(5);
-  }
-  advance(400);
-  CHECK(EStopManager::IsEStopped());
-  holdToClear();
+  twistToClear();
   CHECK(!EStopManager::IsEStopped());
 
-  // The same train on a released hub engages, and it never reads as a button.
+  // A high sample in every window on a released hub engages, and it never reads as a button.
   for (int i = 0; i < 100; ++i) {
-    pressButton();
+    pushDown();
     advance(5);
-    releaseButton();
+    twistUp();
     advance(55);
   }
   advance(400);
@@ -1138,100 +1208,91 @@ static void pulseTrainClearsNothing()
   CHECK(SafetyCaps::Set(ShockerCommandType::Vibrate, lowCaps()) == SetResult::NeedsEngagedEStop);
 }
 
-// Contact bounce is not noise: a press that bounces still counts once, as a button, and a hold is timed from the solid
-// press. One high sample in the hold restarts it.
+// Contact bounce on the push still counts once, as a button. A bounce during the twist up restarts the clear, which is
+// timed from the first full low window after the last high sample.
 static void bounceCountsAsOnePress()
 {
   const auto bounce = [] {
     for (int i = 0; i < 6; ++i) {
-      s_gpioLevel[kButton] = i % 2;
+      s_gpioLevel[kButton] = i % 2 == 0 ? kRunLevel : kStopLevel;
       advance(5);
     }
   };
 
   armedHub();
   bounce();
-  pressButton();
+  pushDown();
   advance(70);
   CHECK(EStopManager::GetLatchSource() == EStopLatchSource::Button);
   CHECK(s_published.size() == 1 && s_published.back() == EStopState::Active);
-  bounce();
-  releaseButton();
-  advance(100);
-  CHECK(EStopManager::GetLatchSource() == EStopLatchSource::Button);
 
-  // One high sample late in a hold costs the time already held.
-  pressButton();
-  advance(4900);
-  releaseButton();
+  // A bounce late in the twist costs the time already up.
+  twistUp();
+  advance(3000);
+  pushDown();
   advance(5);
-  pressButton();
-  advance(4900);
-  releaseButton();
-  advance(400);
+  twistUp();
+  advance(2200);
   CHECK(EStopManager::IsEStopped());
-
-  // Bounce at both ends of a full hold clears it once and starts no new engagement.
-  bounce();
-  pressButton();
-  advance(5200);
-  CHECK(EStopManager::IsEStopped());
-  bounce();
-  releaseButton();
-  advance(100);
+  advance(3000);
   CHECK(!EStopManager::IsEStopped());
+
+  // Bounce at both ends: the push engages once, and the twist clears once, timed from after the bounce.
   bounce();
-  releaseButton();
+  pushDown();
+  advance(100);
+  CHECK(EStopManager::IsEStopped());
+  bounce();
+  twistUp();
+  advance(4900);
+  CHECK(EStopManager::IsEStopped());
   advance(300);
   CHECK(!EStopManager::IsEStopped());
   CHECK(s_published.back() == EStopState::Idle);
 }
 
-// Random samples at each density, with a fixed seed. Nothing here is a held level, so a latch never releases, and a
-// released hub engages but never reads a press. A burst of 13 low samples would read as a press, which is why the
-// released part stops at 20 percent.
+// Random samples at each density, with a fixed seed. None holds a low level for the clear time, so a latch never
+// releases, and a released hub engages but never reads a press. A burst of 13 high samples would read as a press, which
+// is why the released part stops at 20 percent.
 static void noiseProvesNothing()
 {
   std::mt19937 rng(7545);
-  const auto noise = [&](uint32_t lowPercent) {
+  const auto noise = [&](uint32_t stopPercent) {
     for (int i = 0; i < 1200; ++i) {
-      s_gpioLevel[kButton] = rng() % 100 < lowPercent ? 0 : 1;
+      s_gpioLevel[kButton] = rng() % 100 < stopPercent ? kStopLevel : kRunLevel;
       advance(5);
     }
-    releaseButton();
+    twistUp();
     advance(400);
   };
 
   armedHub();
   engageByButton();
   CHECK(SafetyCaps::Set(ShockerCommandType::Vibrate, lowCaps()) == SetResult::Stored);
-  for (uint32_t lowPercent : {1u, 5u, 20u, 50u, 80u, 95u}) {
-    noise(lowPercent);
+  for (uint32_t stopPercent : {1u, 5u, 20u, 50u, 80u, 95u}) {
+    noise(stopPercent);
     CHECK(EStopManager::IsEStopped());
     CHECK(EStopManager::GetLatchSource() == EStopLatchSource::Button);
     CHECK(!CommandHandler::HandleCommand(kModel, 7, ShockerCommandType::Vibrate, 1, 50));
   }
   CHECK(SafetyCaps::Clear());
 
-  holdToClear();
-  for (uint32_t lowPercent : {5u, 20u}) {
+  twistToClear();
+  for (uint32_t stopPercent : {5u, 20u}) {
     CHECK(!EStopManager::IsEStopped());
-    noise(lowPercent);
+    noise(stopPercent);
     CHECK(EStopManager::GetLatchSource() == EStopLatchSource::Unconfirmed);
     CHECK(SafetyCaps::Set(ShockerCommandType::Vibrate, lowCaps()) == SetResult::NeedsEngagedEStop);
-    holdToClear();
+    twistToClear();
   }
 }
 
-// SP-156 with the E-Stop settings open, at released with every cap 0. A pin already low when the task starts shows no
-// edge, however long it stays low, so it engages and proves nothing.
-static void aLowPinProvesNoPress()
+// SP-156 with the E-Stop settings open, at released with every cap 0. A pin already open when the task starts, as an
+// unwired pin is, shows no edge, however long it stays open, so it engages and proves nothing.
+static void anOpenPinProvesNoPress()
 {
-  const auto other = static_cast<gpio_num_t>(14);
-
-  // `estop pin` onto a low pin.
+  // `estop pin` onto a pin with nothing wired.
   armedHub();
-  pressButton(other);
   g_serialOut.clear();
   _handleEStopPinCommand("14"sv, false);
   CHECK(g_serialOut.find("Error|") == std::string::npos);
@@ -1243,67 +1304,168 @@ static void aLowPinProvesNoPress()
   CHECK(EStopManager::GetLatchSource() == EStopLatchSource::Unconfirmed);
   CHECK(SafetyCaps::Set(ShockerCommandType::Vibrate, lowCaps()) == SetResult::NeedsEngagedEStop);
 
-  // The latch locks the settings. A pin strapped low never gives a clear, so a power cycle is the way out: the cold
-  // boot latch opens them again.
+  // The latch locks the settings. A pin with nothing wired never gives a clear, so a power cycle is the way out: the
+  // cold boot latch opens them again.
   CHECK(!EStopManager::SetEStopPin(kButton));
   restartEStopManager(true);
   advance(200);
   CHECK(EStopManager::GetLatchSource() == EStopLatchSource::ColdBoot);
   CHECK(EStopManager::SetEStopPin(kButton));
-  releaseButton(other);
 
-  // `estop enabled true` onto a low pin. Letting go and pressing again restates nothing, and a rise then needs a clear
-  // and a new press.
+  // `estop enabled true` onto a pushed mushroom. Twisting up and pushing down again restates nothing, and a rise then needs a
+  // clear and a new press.
   armedHub();
   CHECK(EStopManager::SetEStopEnabled(false));
-  pressButton();
+  pushDown();
   CHECK(EStopManager::SetEStopEnabled(true));
   advance(200);
   CHECK(EStopManager::GetLatchSource() == EStopLatchSource::Unconfirmed);
-  releaseButton();
+  twistUp();
   advance(100);
   engageByButton();
   CHECK(EStopManager::GetLatchSource() == EStopLatchSource::Unconfirmed);
-  holdToClear();
+  twistToClear();
   CHECK(!EStopManager::IsEStopped());
   engageByButton();
   CHECK(EStopManager::GetLatchSource() == EStopLatchSource::Button);
-  holdToClear();
+  twistToClear();
 
-  // A warm restart of a released hub onto a pin held low.
-  pressButton();
+  // A warm restart of a released hub onto a pushed mushroom.
+  pushDown();
   restartEStopManager(false);
   advance(200);
   CHECK(EStopManager::GetLatchSource() == EStopLatchSource::Unconfirmed);
-  releaseButton();
+  twistUp();
   advance(100);
-  holdToClear();
+  twistToClear();
 
-  // A press before the task has read a full released window proves nothing. After one it does.
+  // A press before the task has read a full window with the contact closed proves nothing. After one it does.
   CHECK(EStopManager::SetEStopEnabled(false));
   CHECK(EStopManager::SetEStopEnabled(true));
   advance(30);
   engageByButton();
   CHECK(EStopManager::GetLatchSource() == EStopLatchSource::Unconfirmed);
-  holdToClear();
+  twistToClear();
   CHECK(EStopManager::SetEStopEnabled(false));
   CHECK(EStopManager::SetEStopEnabled(true));
   advance(100);
   engageByButton();
   CHECK(EStopManager::GetLatchSource() == EStopLatchSource::Button);
-  holdToClear();
+  twistToClear();
 
-  // On a fresh hub the same rule guards the clear: a held level with no measured release before it releases nothing.
+  // The clear needs no measured run before the push: a hub that boots with the mushroom down clears by the twist. A
+  // rise still needs a press from a measured run after that.
   freshHub();
+  pushDown();
   _handleEStopPinCommand("13"sv, false);
   _handleEStopEnabledCommand("true"sv, false);
-  advance(30);
-  pressButton();
-  advance(5200);
-  releaseButton();
-  advance(400);
+  advance(200);
   CHECK(EStopManager::GetLatchSource() == EStopLatchSource::ColdBoot);
+  twistUp();
+  advance(5200);
+  CHECK(!EStopManager::IsEStopped());
+  engageByButton();
+  CHECK(EStopManager::GetLatchSource() == EStopLatchSource::Button);
+}
+
+// R-SOFTPROXY-ESTOP-NC: an open circuit means stop. A cable cut or unplugged on a running hub engages at once and holds
+// for as long as it stays cut. The firmware cannot tell a cut from a press, or a reconnected cable from a twist up.
+static void cableCutStops()
+{
+  armedHub();
+  engageByButton();
+  CHECK(SafetyCaps::Set(ShockerCommandType::Vibrate, highCaps()) == SetResult::Stored);
+  twistToClear();
+  CHECK(!EStopManager::IsEStopped());
+  CHECK(CommandHandler::HandleCommand(kModel, 7, ShockerCommandType::Vibrate, 20, 2000));
+  advance(100);
+
+  s_air.clear();
+  const int64_t cutAt = g_nowMs;
+  cutCable();
+  advance(5);
   CHECK(EStopManager::IsEStopped());
+  CHECK(!CommandHandler::HandleCommand(kModel, 7, ShockerCommandType::Vibrate, 1, 50));
+  CHECK(lastRefusalIs(Verdict::EStopEngaged));
+  advance(3 * 60 * 1000);
+  CHECK(EStopManager::IsEStopped());
+  CHECK(EStopManager::IsArmed());
+  CHECK(!s_air.empty());
+  CHECK(s_air.back().atMs <= cutAt + 5 + 300 + 15);
+
+  // The cut follows a measured run, so it reads as a press. A reconnected cable held closed for the clear time clears,
+  // as a twist up would, and a shorter one does not.
+  CHECK(EStopManager::GetLatchSource() == EStopLatchSource::Button);
+  twistUp();
+  advance(2000);
+  cutCable();
+  advance(5);
+  twistUp();
+  advance(65 + 4900);
+  CHECK(EStopManager::IsEStopped());
+  advance(200);
+  CHECK(!EStopManager::IsEStopped());
+
+  // A cut on a released hub engages too. One shorter than a window is no measured down, so reconnecting clears nothing.
+  CHECK(SafetyCaps::Clear());
+  cutCable();
+  advance(5);
+  CHECK(EStopManager::IsEStopped());
+  twistUp();
+  advance(6000);
+  CHECK(EStopManager::IsEStopped());
+}
+
+// An unwired pin reads open, which is stop. A hub that boots onto one stays engaged and never shows a button: no run
+// level was ever measured, so no press can follow one (SP-156, SP-158).
+static void unwiredPinAtBootStops()
+{
+  freshHub(true, kButton);
+  cutCable();
+  restartEStopManager(true);
+  advance(3 * 60 * 1000);
+  CHECK(EStopManager::IsArmed());
+  CHECK(EStopManager::IsEStopped());
+  CHECK(EStopManager::GetLatchSource() == EStopLatchSource::ColdBoot);
+  CHECK(SafetyCaps::Set(ShockerCommandType::Vibrate, lowCaps()) == SetResult::NeedsEngagedEStop);
+  CHECK(!CommandHandler::HandleCommand(kModel, 7, ShockerCommandType::Stop, 0, 50));
+
+  // A warm restart of a released hub onto an unwired pin engages with no button source, however long it stays open.
+  armedHub();
+  cutCable();
+  restartEStopManager(false);
+  advance(3 * 60 * 1000);
+  CHECK(EStopManager::IsEStopped());
+  CHECK(EStopManager::GetLatchSource() == EStopLatchSource::Unconfirmed);
+  CHECK(SafetyCaps::Set(ShockerCommandType::Vibrate, lowCaps()) == SetResult::NeedsEngagedEStop);
+  CHECK(!SafetyCaps::AnySet());
+}
+
+// Contact bounce as the mushroom is twisted up does not clear. The clear is timed from the first full low window after
+// the last bounce, so the hub stays engaged until a stable closed contact has lasted the clear time.
+static void bounceOnCloseDoesNotClear()
+{
+  armedHub();
+  engageByButton();
+  for (int round = 0; round < 3; ++round) {
+    for (int i = 0; i < 8; ++i) {
+      s_gpioLevel[kButton] = i % 2 == 0 ? kRunLevel : kStopLevel;
+      advance(5);
+    }
+    twistUp();
+    advance(1500);
+  }
+  for (int i = 0; i < 8; ++i) {
+    s_gpioLevel[kButton] = i % 2 == 0 ? kRunLevel : kStopLevel;
+    advance(5);
+  }
+  const int64_t lastBounce = g_nowMs;
+  twistUp();
+  advance(5000);
+  CHECK(g_nowMs - lastBounce == 5000);
+  CHECK(EStopManager::IsEStopped());
+  advance(100);
+  CHECK(!EStopManager::IsEStopped());
 }
 
 // Upstream enabled keep-alive on every Idle state, so a stored `false` came back after each clear.
@@ -1312,13 +1474,13 @@ static void keepAliveFollowsTheStoredSetting()
   armedHub();
   const int starts = s_keepAliveStarts;
   engageByButton();
-  holdToClear();
+  twistToClear();
   CHECK(s_keepAliveStarts == starts);
 
   s_cfgKeepAlive = true;
   engageByButton();
   CHECK(s_keepAliveStarts == starts);
-  holdToClear();
+  twistToClear();
   CHECK(s_keepAliveStarts == starts + 1);
   CHECK(eTaskGetState(s_keepAliveTask) != eDeleted);
 
@@ -1326,7 +1488,7 @@ static void keepAliveFollowsTheStoredSetting()
   engageByButton();
   CHECK(eTaskGetState(s_keepAliveTask) == eDeleted);
   s_cfgKeepAlive = false;
-  holdToClear();
+  twistToClear();
   CHECK(s_keepAliveStarts == starts + 1);
 }
 
@@ -1356,7 +1518,7 @@ static void bootKeepAliveWaitsForTheClear()
     CHECK(CommandHandler::Ok());
     advance(50);
     CHECK(s_keepAliveStarts == 0);
-    holdToClear();
+    twistToClear();
     CHECK(!EStopManager::IsEStopped());
     CHECK(s_keepAliveStarts == 1);
   });
@@ -1371,7 +1533,7 @@ static void bootKeepAliveStartsWhenReleased()
     s_cfgKeepAlive = true;
     restartEStopManager(true);
     advance(50);
-    holdToClear();
+    twistToClear();
     CHECK(!EStopManager::IsEStopped());
     restartEStopManager(false);
     CHECK(!EStopManager::IsEStopped());
@@ -1418,18 +1580,22 @@ static void corruptLatchReadsAsColdBoot()
   CHECK(EStopManager::GetLatchSource() == EStopLatchSource::ColdBoot);
 }
 
-// A button held down across a restart is no new press, so releasing it must not release the E-Stop.
+// A mushroom down across a warm restart keeps the hub stopped for as long as it stays down, and the restarted task
+// measures it down again, so the twist up clears it as usual.
 static void heldButtonAcrossRestartStaysEngaged()
 {
   armedHub();
-  pressButton();
+  pushDown();
   advance(20);
   CHECK(EStopManager::IsEStopped());
   restartEStopManager(false);
   advance(6000);
-  releaseButton();
-  advance(100);
   CHECK(EStopManager::IsEStopped());
+  twistUp();
+  advance(4900);
+  CHECK(EStopManager::IsEStopped());
+  advance(300);
+  CHECK(!EStopManager::IsEStopped());
 }
 
 // Finding: `estop pin` and `estop enabled` restarted the task, which cleared the latch.
@@ -1472,20 +1638,23 @@ static void capsLockTheEStopSettings()
   armedHub();
   engageByButton();
   CHECK(SafetyCaps::Set(ShockerCommandType::Vibrate, lowCaps()) == SetResult::Stored);
-  holdToClear();
+  twistToClear();
   CHECK(!EStopManager::IsEStopped());
 
   CHECK(!EStopManager::SetEStopPin(static_cast<gpio_num_t>(14)));
   CHECK(!EStopManager::SetEStopEnabled(false));
   CHECK(EStopManager::IsArmed());
 
-  // Clearing the caps unlocks them, and the same-pin write stays a no-op that succeeds.
+  // Clearing the caps unlocks them, and the same-pin write stays a no-op that succeeds. The new pin has a closed
+  // contact wired, so the move does not engage.
   CHECK(SafetyCaps::Clear());
+  twistUp(static_cast<gpio_num_t>(14));
   CHECK(EStopManager::SetEStopPin(kButton));
   CHECK(EStopManager::SetEStopPin(static_cast<gpio_num_t>(14)));
   CHECK(EStopManager::GetRunningPin() == static_cast<gpio_num_t>(14));
   advance(20);
   CHECK(EStopManager::IsArmed());
+  CHECK(!EStopManager::IsEStopped());
   CHECK(EStopManager::SetEStopEnabled(false));
   CHECK(!EStopManager::IsArmed());
 }
@@ -1518,7 +1687,7 @@ static void stalledCheckerIsNotArmed()
   armedHub();
   engageByButton();
   CHECK(SafetyCaps::Set(ShockerCommandType::Vibrate, lowCaps()) == SetResult::Stored);
-  holdToClear();
+  twistToClear();
   s_stallChecker = true;
   advance(k_estopSampleStaleTime + 50);
   CHECK(!EStopManager::IsArmed());
@@ -1557,14 +1726,14 @@ static void capRiseNeedsAnEngagedEStop()
 
   engageByButton();
   CHECK(SafetyCaps::Set(ShockerCommandType::Vibrate, lowCaps()) == SetResult::Stored);
-  holdToClear();
+  twistToClear();
 
   // Lowering, rewriting and clearing take no engaged E-Stop. Each field that rises refuses.
   CHECK(SafetyCaps::Set(ShockerCommandType::Vibrate, lowCaps()) == SetResult::Stored);
   CHECK(SafetyCaps::Set(ShockerCommandType::Vibrate, highCaps()) == SetResult::NeedsEngagedEStop);
   engageByButton();
   CHECK(SafetyCaps::Set(ShockerCommandType::Vibrate, highCaps()) == SetResult::Stored);
-  holdToClear();
+  twistToClear();
   CHECK(SafetyCaps::Set(ShockerCommandType::Vibrate, lowCaps()) == SetResult::Stored);
 
   ChannelCaps sooner = lowCaps();
@@ -1577,7 +1746,7 @@ static void capRiseNeedsAnEngagedEStop()
   // A shorter join window needs the E-Stop too: it can turn a refused `over-pulses` into a new stage.
   engageByButton();
   CHECK(SafetyCaps::Set(ShockerCommandType::Vibrate, joined) == SetResult::Stored);
-  holdToClear();
+  twistToClear();
   CHECK(SafetyCaps::Set(ShockerCommandType::Vibrate, lowCaps()) == SetResult::NeedsEngagedEStop);
 
   CHECK(SafetyCaps::Clear());
@@ -1630,6 +1799,24 @@ static void pinsStaySeparate()
     CHECK(!EStopManager::SetEStopPin(static_cast<gpio_num_t>(pin)));
   }
 
+  // The strapping pins and the flash pins, on both PiShock builds. The fake `Chipset` accepts all of them, so only the
+  // E-Stop rule refuses here. Each pin is refused by `IsEStopReservedPin` itself, also where the LED or this env's
+  // transmitter would refuse it anyway, so both envs refuse 12 and 15.
+  for (int pin : {0, 2, 5, 12, 15, 6, 7, 8, 9, 10, 11}) {
+    CHECK(IsEStopReservedPin(pin));
+    CHECK(EStopPinConflicts(pin, 27));
+    CHECK(!EStopManager::SetEStopPin(static_cast<gpio_num_t>(pin)));
+    CHECK(!KillConfigChangeAllowed(KillConfig {false, -1}, KillConfig {true, pin}, 27, -1, false));
+    g_serialOut.clear();
+    _handleEStopPinCommand(std::to_string(pin), false);
+    CHECK(g_serialOut.find("Error|") != std::string::npos);
+    CHECK(EStopManager::GetRunningPin() == GPIO_NUM_NC);
+    CHECK(s_cfgPin == GPIO_NUM_NC);
+  }
+  for (int pin : {4, 13, 14, 16, 17, 18, 19, 21, 22, 23, 25, 26, 27, 32, 33}) {
+    CHECK(!IsEStopReservedPin(pin));
+  }
+
   // The transmitter was moved off the default: the default stays out of bounds, since a bad config falls back to it.
   CHECK(CommandHandler::SetRfTxPin(static_cast<gpio_num_t>(14)) == SetGPIOResultCode::Success);
   CHECK(!EStopManager::SetEStopPin(static_cast<gpio_num_t>(14)));
@@ -1663,9 +1850,15 @@ static void pinsStaySeparate()
   CHECK(!CommandHandler::HandleCommand(kModel, 7, ShockerCommandType::Vibrate, 1, 50));
   CHECK(lastRefusalIs(Verdict::EStopEngaged));
 
-  // The same for a pin with no pull-up and a stored transmitter on the E-Stop.
+  // The same for a pin with no pull-up, a strapping pin and a stored transmitter on the E-Stop.
   freshHub(true, static_cast<gpio_num_t>(36));
   CHECK(!EStopManager::IsArmed());
+  for (int pin : {0, 5, 12, 15}) {
+    freshHub(true, static_cast<gpio_num_t>(pin));
+    CHECK(s_estopTask == nullptr);
+    CHECK(!EStopManager::IsArmed());
+    CHECK(EStopManager::IsEStopped());
+  }
   freshHub(true, kButton);
   s_cfgTx = kButton;
   restartEStopManager(true);
@@ -1674,14 +1867,13 @@ static void pinsStaySeparate()
 }
 
 // SP-113 rule 1 keys on the E-Stop pin set at run time. No PiShock env defines OPENSHOCK_ESTOP_PIN and the two envs
-// differ on RF TX, so a compile-time comparison would miss every real hub. `otherEnvTx` is the transmitter of the
-// other PiShock env: on this build it is an ordinary GPIO, so only the run-time pin can refuse it.
+// differ on RF TX, so a compile-time comparison would miss every real hub. The transmitter of the other PiShock env is
+// a strapping pin on both builds, so the E-Stop refuses it (pinsStaySeparate) and ordinary GPIOs stand in here.
 static void pinRuleKeysOnTheRunTimePin()
 {
-  const auto tx        = static_cast<gpio_num_t>(OPENSHOCK_RF_TX_GPIO);
-  const int otherEnvTx = OPENSHOCK_RF_TX_GPIO == 12 ? 15 : 12;
+  const auto tx = static_cast<gpio_num_t>(OPENSHOCK_RF_TX_GPIO);
 
-  for (int number : {13, 14, otherEnvTx}) {
+  for (int number : {13, 14, 25}) {
     const auto pin           = static_cast<gpio_num_t>(number);
     const std::string digits = std::to_string(number);
 
@@ -1778,7 +1970,7 @@ static void serialCapRiseNeedsTheEStop()
   CHECK(EStopManager::IsArmed());
   CHECK(EStopManager::IsEStopped());
   CHECK(refused(_handleSafetyCapsVibrateCommand, kLow));
-  holdToClear();
+  twistToClear();
   CHECK(!EStopManager::IsEStopped());
   CHECK(refused(_handleSafetyCapsVibrateCommand, kLow));
   CHECK(!SafetyCaps::AnySet());
@@ -1788,7 +1980,7 @@ static void serialCapRiseNeedsTheEStop()
   CHECK(SafetyCaps::AnySet());
 
   // Released again: a rise refuses and leaves the stored value, and a lower value needs no E-Stop.
-  holdToClear();
+  twistToClear();
   CHECK(!EStopManager::IsEStopped());
   CHECK(refused(_handleSafetyCapsVibrateCommand, kHigh));
   CHECK(storedVibrateIntensity() == 10);
@@ -1831,6 +2023,8 @@ static void configWritesAreGated()
   CHECK(!KillConfigChangeAllowed(on, KillConfig {true, 2}, 15, 13, false));
   CHECK(!KillConfigChangeAllowed(on, KillConfig {true, OPENSHOCK_RF_TX_GPIO}, 14, 13, false));
   CHECK(!KillConfigChangeAllowed(on, KillConfig {true, 36}, 12, 13, false));
+  CHECK(!KillConfigChangeAllowed(on, KillConfig {true, 0}, 14, 13, false));
+  CHECK(!KillConfigChangeAllowed(on, KillConfig {true, 5}, 14, 13, false));
   CHECK(KillConfigChangeAllowed(KillConfig {false, -1}, KillConfig {false, -1}, 12, -1, false));
   // The transmitter side: the LED, and the pin the checker reads now while the stored pin moves away from it.
   CHECK(!KillConfigChangeAllowed(on, on, 2, 13, false));
@@ -1946,7 +2140,7 @@ static void estopEndsAPulseInFlight()
   armedHub();
   engageByButton();
   CHECK(SafetyCaps::Set(ShockerCommandType::Vibrate, highCaps()) == SetResult::Stored);
-  holdToClear();
+  twistToClear();
 
   Rmt::Sequence expected(kModel, 7, 0);
   CHECK(expected.fill(ShockerCommandType::Vibrate, 20));
@@ -1965,7 +2159,7 @@ static void estopEndsAPulseInFlight()
   // The pulse has 1800 milliseconds left when the button goes down.
   s_air.clear();
   const int64_t pressedAt = g_nowMs;
-  pressButton();
+  pushDown();
   advance(10);
   CHECK(EStopManager::IsEStopped());
   CHECK(!CommandHandler::HandleCommand(kModel, 7, ShockerCommandType::Vibrate, 20, 2000));
@@ -1996,7 +2190,7 @@ static void gatewayTriggerEndsAPulseInFlightWithNoTask()
   armedHub();
   engageByButton();
   CHECK(SafetyCaps::Set(ShockerCommandType::Vibrate, highCaps()) == SetResult::Stored);
-  holdToClear();
+  twistToClear();
   CHECK(CommandHandler::HandleCommand(kModel, 7, ShockerCommandType::Vibrate, 20, 2000));
   advance(100);
 
@@ -2037,16 +2231,16 @@ static void engagementAfterAPopEndsTheSequence()
   armedHub();
   engageByButton();
   CHECK(SafetyCaps::Set(ShockerCommandType::Vibrate, highCaps()) == SetResult::Stored);
-  holdToClear();
+  twistToClear();
 
   // The transmit task sees an engagement, ends this pulse, and goes to sleep.
   CHECK(CommandHandler::HandleCommand(kModel, 7, ShockerCommandType::Vibrate, 20, 2000));
   advance(100);
-  pressButton();
+  pushDown();
   advance(500);
-  releaseButton();
+  twistUp();
   advance(100);
-  holdToClear();
+  twistToClear();
   CHECK(!EStopManager::IsEStopped());
 
   Rmt::Sequence expected(kModel, 7, 0);
@@ -2091,7 +2285,7 @@ static void stateIsReadable()
   g_serialOut.clear();
   _handleEStopStateCommand(""sv, false);
   CHECK(g_serialOut.find("EStopState|armed=true,engaged=true,pin=13,source=button") != std::string::npos);
-  holdToClear();
+  twistToClear();
   sendTrigger(GatewaySchema::TriggerType::EmergencyStop);
   advance(20);
   g_serialOut.clear();
@@ -2128,7 +2322,8 @@ int main()
   SCENARIO(armedHubAdmitsWithinCaps);
   SCENARIO(gatewayTriggerLatchesWithNoTask);
   SCENARIO(gatewayTriggerLatchesWithTask);
-  SCENARIO(holdToClearNeedsTheFullHold);
+  SCENARIO(twistToClearNeedsTheFullTime);
+  SCENARIO(aPushDuringTheClearStopsIt);
   SCENARIO(latchSurvivesWarmRestart);
   SCENARIO(coldBootStartsEngaged);
   SCENARIO(coldBootLatchLeavesSettingsOpen);
@@ -2137,12 +2332,16 @@ int main()
   SCENARIO(emergencyStopInterruptsAClear);
   SCENARIO(sourceSurvivesWarmRestart);
   SCENARIO(onlyAnAllowedResetKeepsTheLatch);
+  SCENARIO(crashLoopNeverForcesAStop);
   SCENARIO(buttonLatchWithADeadCheckerAllowsNoRise);
-  SCENARIO(oneLowSampleProvesNoPress);
+  SCENARIO(oneHighSampleProvesNoPress);
   SCENARIO(pulseTrainClearsNothing);
   SCENARIO(bounceCountsAsOnePress);
   SCENARIO(noiseProvesNothing);
-  SCENARIO(aLowPinProvesNoPress);
+  SCENARIO(anOpenPinProvesNoPress);
+  SCENARIO(cableCutStops);
+  SCENARIO(unwiredPinAtBootStops);
+  SCENARIO(bounceOnCloseDoesNotClear);
   SCENARIO(keepAliveFollowsTheStoredSetting);
   SCENARIO(corruptLatchReadsAsColdBoot);
   SCENARIO(heldButtonAcrossRestartStaysEngaged);

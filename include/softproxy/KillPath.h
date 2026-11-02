@@ -1,6 +1,7 @@
 #pragma once
 
-// Decisions for the hub E-Stop as a Softproxy kill path (TIN-7125 SP-47, SP-113, SP-136, SP-156 and SP-158).
+// Decisions for the hub E-Stop as a Softproxy kill path (TIN-7125 SP-47, SP-113, SP-136, SP-156, SP-158 and SP-174, and
+// R-SOFTPROXY-ESTOP-NC).
 // src/EStopManager.cpp, src/CommandHandler.cpp, src/softproxy/SafetyCaps.cpp and src/config/Config.cpp apply them. No
 // Arduino or ESP-IDF dependency, so a host compiler can test them (test/native/test_kill_path.cpp).
 
@@ -26,16 +27,30 @@ namespace OpenShock::Softproxy {
   constexpr int kBoardRfTxPin = -1;
 #endif
 #ifdef OPENSHOCK_FW_CHIP_ESP32
-  constexpr bool kChipHasInputOnlyPins = true;
+  constexpr bool kChipIsEsp32 = true;
 #else
-  constexpr bool kChipHasInputOnlyPins = false;
+  constexpr bool kChipIsEsp32 = false;
 #endif
+  constexpr bool kChipHasInputOnlyPins = kChipIsEsp32;
 
-  /// The E-Stop input needs a pull-up, because the button pulls the pin low. GPIO 34 to 39 of a plain ESP32 have no
-  /// internal pull-up, so with nothing external they float. The fork has no way to declare an external one.
+  /// The E-Stop input needs a pull-up, because an open contact must read high, which is stop. GPIO 34 to 39 of a plain
+  /// ESP32 have no internal pull-up, so with nothing external an open contact floats and can read low, which is run.
+  /// The fork has no way to declare an external one.
   constexpr bool HasInternalPullUp(int pin)
   {
     return !(kChipHasInputOnlyPins && pin >= 34 && pin <= 39);
+  }
+
+  /// Plain ESP32 pins the E-Stop refuses, whatever the board bypasses. The chip reads its strapping pins at reset: GPIO 0
+  /// and 2 pick the boot mode, GPIO 12 the flash voltage, and GPIO 15 the boot log and, with GPIO 5, the SDIO timing. A
+  /// normally closed contact holds its pin low, and an open one leaves it pulled high, so the button would decide how the
+  /// hub boots. GPIO 12 is also the RF line on `Pishock-2023`. GPIO 6 to 11 connect the SPI flash.
+  constexpr bool IsEStopReservedPin(int pin)
+  {
+    if (!kChipIsEsp32) {
+      return false;
+    }
+    return pin == 0 || pin == 2 || pin == 5 || pin == 12 || pin == 15 || (pin >= 6 && pin <= 11);
   }
 
   /// What set the E-Stop latch (SP-156, SP-158). Only a press read on the E-Stop pin shows that the kill path works.
@@ -43,8 +58,8 @@ namespace OpenShock::Softproxy {
     Released,     // Not engaged.
     ColdBoot,     // Every cold boot starts engaged. Nothing was pressed.
     Gateway,      // The gateway `Trigger`. It says nothing about the pin.
-    Button,       // After a measured release, the checker task read a full window of low samples: a solid press.
-    Unconfirmed,  // A low sample engaged it with no solid press after a measured release: noise, or a pin already low.
+    Button,       // After a full window of low samples, the checker task read a full window of high samples: a solid press.
+    Unconfirmed,  // A high sample engaged it with no solid press after a measured run: noise, or a pin already open.
   };
 
   constexpr const char* EStopLatchName(EStopLatchSource source)
@@ -73,13 +88,14 @@ namespace OpenShock::Softproxy {
   }
 
   /// Whether a set E-Stop pin is unusable: it is the RF transmitter, the transmitter's board default (the hub falls
-  /// back to it), a board LED, or has no pull-up. An unset pin (below 0) never conflicts. It leaves the E-Stop off.
+  /// back to it), a board LED, a reserved strapping or flash pin, or has no pull-up. An unset pin (below 0) never
+  /// conflicts. It leaves the E-Stop off.
   constexpr bool EStopPinConflicts(int estopPin, int txPin)
   {
     if (estopPin < 0) {
       return false;
     }
-    return estopPin == txPin || estopPin == kBoardRfTxPin || estopPin == kBoardLedPin || estopPin == kBoardRgbLedPin || !HasInternalPullUp(estopPin);
+    return estopPin == txPin || estopPin == kBoardRfTxPin || estopPin == kBoardLedPin || estopPin == kBoardRgbLedPin || IsEStopReservedPin(estopPin) || !HasInternalPullUp(estopPin);
   }
 
   /// Whether moving the RF transmitter to `txPin` would land on the E-Stop or a board LED. `configuredEStopPin` is
@@ -123,7 +139,7 @@ namespace OpenShock::Softproxy {
 
   /// SP-113 rule 2 with SP-156: a cap can rise only while a button press holds the E-Stop engaged, with a live checker
   /// task behind it. A gateway `Trigger` or a cold boot can engage a hub whose button was never wired, so neither counts.
-  /// `Unconfirmed` does not count either: one low sample can be noise.
+  /// `Unconfirmed` does not count either: one high sample can be noise or an open pin.
   constexpr bool CapRiseAllowed(bool estopArmed, EStopLatchSource source)
   {
     return estopArmed && source == EStopLatchSource::Button;

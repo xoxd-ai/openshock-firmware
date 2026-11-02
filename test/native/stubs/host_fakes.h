@@ -497,7 +497,8 @@ enum gpio_mode_t {
   GPIO_MODE_INPUT,
 };
 enum gpio_pullup_t {
-  GPIO_PULLUP_ENABLE,
+  GPIO_PULLUP_DISABLE = 0,
+  GPIO_PULLUP_ENABLE  = 1,
 };
 enum gpio_pulldown_t {
   GPIO_PULLDOWN_DISABLE,

@@ -26,13 +26,15 @@ const char* const TAG = "EStopManager";
 
 using namespace OpenShock;
 
-const uint32_t k_estopHoldToClearTime = 5000;
-const uint32_t k_estopUpdateRate      = 5;   // 200 Hz
-const uint32_t k_estopCheckCount      = 13;  // 65 ms at 200 Hz
-const uint16_t k_estopCheckMask       = 0xFFFF >> ((sizeof(uint16_t) * 8) - k_estopCheckCount);
-
-// Grace period after deactivation (prevents immediate re-trigger on release bounce/EMI)
-const uint32_t k_estopRearmGraceTime = 250;  // tune as needed
+// The E-Stop is a latching mushroom with a normally closed contact to ground, and the input is pulled up
+// (R-SOFTPROXY-ESTOP-NC, SP-174). Closed reads low and means run. Open reads high and means stop: a pressed mushroom, a cut
+// or unplugged cable and an unwired pin all read high. The task reads it as a level. A high sample engages at any time,
+// and only the mushroom measured down, then twisted up and left up, closed and low, for the clear time releases.
+const int k_estopRunLevel        = 0;
+const uint32_t k_estopClearTime  = 5000;
+const uint32_t k_estopUpdateRate = 5;   // 200 Hz
+const uint32_t k_estopCheckCount = 13;  // 65 ms at 200 Hz
+const uint16_t k_estopCheckMask  = 0xFFFF >> ((sizeof(uint16_t) * 8) - k_estopCheckCount);
 
 // The checker counts as dead when it has not sampled for this long, so a stalled task cannot read as armed.
 const uint32_t k_estopSampleStaleTime = 1000;
@@ -72,7 +74,7 @@ static void estopmanager_engage(Softproxy::EStopLatchSource source)
   portEXIT_CRITICAL(&s_latchMux);
 }
 
-// Records that the press which engaged the E-Stop was a full window of low samples. It changes only the latch that
+// Records that the press which engaged the E-Stop was a full window of high samples. It changes only the latch that
 // press set, so a press during a held latch restates nothing.
 static void estopmanager_confirmpress()
 {
@@ -137,40 +139,35 @@ static void estopmanager_updateexternals(EStopState state)
   ESP_ERROR_CHECK(esp_event_post(OPENSHOCK_EVENTS, OPENSHOCK_EVENT_ESTOP_STATE_CHANGED, &state, sizeof(state), portMAX_DELAY));
 }
 
-// Samples the estop at a fixed rate and updates internal state + events
+// Samples the mushroom at a fixed rate and updates internal state and events.
 static void estopmgr_checkertask(void* pvParameters)
 {
   (void)pvParameters;
 
   // The latch outlives this task. Starting the task reads it and never writes it, so a restart of the task cannot
-  // clear an engaged E-Stop. Only the hold-to-clear below releases it.
+  // clear an engaged E-Stop. Only the clear below releases it.
   const bool startedEngaged = EStopManager::IsEStopped();
 
-  uint16_t history = 0xFFFF;  // Bit history of samples, 0 is pressed
+  // Bit history of samples, 1 is stop (open, high). It starts with no stop bit, so a released latch restored by a warm
+  // restart stays released on a closed contact. Nothing in it is measured until this task has read a full window.
+  uint16_t history = 0;
 
-  EStopState state      = startedEngaged ? EStopState::Active : EStopState::Idle;
-  int64_t deactivatesAt = 0;
+  EStopState state = startedEngaged ? EStopState::Active : EStopState::Idle;
+  int64_t clearsAt = 0;
 
-  // Rearm grace state
-  int64_t rearmAt   = 0;
-  bool rearmBlocked = false;
-
-  // Debounced button state: true == pressed, false == released
-  // Started engaged, a button held across the restart is not a new press, so it cannot start the hold-to-clear.
-  bool lastBtnState = startedEngaged;
-
-  // `history` starts all high, which nothing measured. Only a full window of high samples read by this task shows a
-  // released button, so a press is an edge only after one. A pin already low when the task starts, as after `estop pin`
-  // onto a low pin, still engages, but it proves no press and cannot reach `Button` (SP-156).
+  // Only a full window of low samples read by this task shows the contact closed, so an engagement is a real one only
+  // after one (SP-156). A cold boot, an unwired pin or `estop pin` onto an open pin reads high from the start. It
+  // engages or stays engaged, but it proves no press and cannot reach `Button`.
   uint32_t samplesRead = 0;
-  bool sawRelease      = false;
+  bool sawRun          = false;
 
-  // Whether the press now down began after a release while engaged, so the hold-to-clear may use it. A press that
-  // engaged the E-Stop or that a gateway stop interrupted does not count.
-  bool clearPress = false;
-
-  // Whether the press that engaged the E-Stop is still down, so a full window of low samples can confirm it.
+  // Whether the press that engaged the E-Stop is still down, so a full window of high samples can confirm it.
   bool confirming = false;
+
+  // Whether this task measured the mushroom down, a full window of high samples, while engaged and since the last
+  // gateway stop. The clear starts only when the contact closes after that, so a cold boot, a warm restart or a gateway
+  // stop with the mushroom already up stays engaged until it goes down and up again.
+  bool sawDown = false;
 
   for (;;) {
     // Sleep for the update rate
@@ -185,99 +182,75 @@ static void estopmgr_checkertask(void* pvParameters)
       s_externallyTriggered = false;
 
       estopmanager_engage(Softproxy::EStopLatchSource::Gateway);
-      state        = EStopState::Active;
-      rearmBlocked = false;
-      clearPress   = false;  // Stops a hold-to-clear in progress. The next one needs a new press.
+      state   = EStopState::Active;
+      sawDown = false;  // Stops a clear in progress. The next clear needs the mushroom measured down again.
 
       estopmanager_updateexternals(state);
 
-      // Do not modify history/lastBtnState here; allow hardware to take over
-      // on subsequent iterations.
+      // Do not modify history here; allow hardware to take over on subsequent iterations.
       continue;
     }
 
-    // Sample the EStop input
-    history = static_cast<uint16_t>((history << 1) | gpio_get_level(s_estopPin));
+    // Sample the E-Stop input. Any level but the run level reads as stop.
+    const uint16_t stopBit = gpio_get_level(s_estopPin) == k_estopRunLevel ? 0 : 1;
+    history                = static_cast<uint16_t>((history << 1) | stopBit);
     if (samplesRead < k_estopCheckCount) {
       ++samplesRead;
     }
 
-    // Debounce:
-    // If all recent bits are 1 -> fully released.
-    // If any bit is 0 -> pressed (or bouncing toward pressed).
-    // If all recent bits are 0 -> a solid press. One low sample is enough to engage, but only a solid press shows that
-    // a hand is on the button, so only a solid press confirms an engagement or counts toward the hold-to-clear.
-    bool btnState    = (history & k_estopCheckMask) != k_estopCheckMask;  // true == pressed
-    bool btnSolid    = (history & k_estopCheckMask) == 0;
-    sawRelease       = sawRelease || (!btnState && samplesRead == k_estopCheckCount);
-    bool pressedEdge = (btnState && !lastBtnState && sawRelease);
-    lastBtnState     = btnState;
+    // Debounce. Any high sample in the window reads as stop, so one high sample engages. A full window of high samples
+    // is the mushroom measured down. A full window of low samples that this task read is the contact measured closed.
+    const uint16_t window = history & k_estopCheckMask;
+    bool stopSeen         = window != 0;
+    bool solidStop        = window == k_estopCheckMask;
+    bool solidRun         = window == 0 && samplesRead == k_estopCheckCount;
+    sawRun                = sawRun || solidRun;
 
-    if (!btnState) {
-      clearPress = false;
+    if (!stopSeen) {
       confirming = false;
-    } else if (pressedEdge) {
-      clearPress = true;
     }
 
-    if (confirming && btnSolid) {
+    if (confirming && solidStop) {
       confirming = false;
       estopmanager_confirmpress();
     }
 
     switch (state) {
       case EStopState::Idle:
-        // Rearm grace: after clearing, ignore presses for a short window.
-        // After the window ends, require a released state before re-arming.
-        if (rearmBlocked) {
-          if (now < rearmAt) {
-            // Still in grace window: ignore any press. Track input to avoid phantom edges later.
-            break;
-          }
-
-          // Grace window ended: only re-arm once we see released.
-          rearmBlocked = false;
-        }
-
-        if (btnState) {
+        // A high level at any time engages. There is no rearm window.
+        if (stopSeen) {
           state              = EStopState::Active;
           s_estopActivatedAt = now;
           estopmanager_engage(Softproxy::EStopLatchSource::Unconfirmed);
-          clearPress = false;
-          confirming = sawRelease;
+          confirming = sawRun;
         }
         break;
 
       case EStopState::Active:
-        // Once active, if a new press turns solid, start hold-to-clear timing.
-        if (clearPress && btnSolid) {
-          state         = EStopState::ActiveClearing;
-          deactivatesAt = now + k_estopHoldToClearTime;
+        // The mushroom measured down allows a clear. Twisting it up from there starts the clear once the contact reads
+        // closed for a full window.
+        if (solidStop) {
+          sawDown = true;
+        } else if (sawDown && solidRun) {
+          state    = EStopState::ActiveClearing;
+          clearsAt = now + k_estopClearTime;
         }
         break;
 
       case EStopState::ActiveClearing:
-        if (!btnSolid) {  // released or noisy before hold time -> go back to Active
+        // Any high sample, a push, a bounce or a cable fault, stops the clear. It starts again from the next full window
+        // of low samples.
+        if (stopSeen) {
           state = EStopState::Active;
-        } else if (now >= deactivatesAt) {
-          // Hold complete -> now wait for release edge to fully clear
-          state = EStopState::AwaitingRelease;
-        }
-        break;
-
-      case EStopState::AwaitingRelease:
-        if (!btnState) {  // fully released -> clear E-Stop
-          state = EStopState::Idle;
+        } else if (now >= clearsAt) {
+          state   = EStopState::Idle;
+          sawDown = false;
           estopmanager_release();
-
-          // Start grace period to prevent immediate re-trigger.
-          rearmBlocked = true;
-          rearmAt      = now + k_estopRearmGraceTime;
         }
         break;
 
       default:
-        // Should never happen
+        // `AwaitingRelease` belonged to the momentary hold-to-clear (SP-167), which SP-174 replaced. Nothing enters it.
         break;
     }
 
@@ -309,8 +282,8 @@ static bool estopmgr_setestopenabled(bool enabled)
   return true;
 }
 
-// Whether the E-Stop settings are locked: they stay put while a press or the gateway holds it engaged, or while any
-// cap can let a command through.
+// Whether the E-Stop settings are locked: they stay put while a press, an open contact or the gateway holds it engaged,
+// or while any cap can let a command through.
 static bool estopmgr_settingslocked()
 {
   return Softproxy::EStopSettingsLocked(s_latch.load(), Softproxy::SafetyCaps::AnySet());
@@ -325,7 +298,7 @@ static bool estopmgr_pinallowed(gpio_num_t pin)
     return false;
   }
   if (Softproxy::EStopPinConflicts(pin, txPin)) {
-    OS_LOGE(TAG, "EStop pin %hhi conflicts with the RF TX pin, a board LED or has no pull-up", static_cast<int8_t>(pin));
+    OS_LOGE(TAG, "EStop pin %hhi conflicts with the RF TX pin, a board LED, a strapping or flash pin or has no pull-up", static_cast<int8_t>(pin));
     return false;
   }
   return true;
@@ -352,7 +325,7 @@ static bool estopmgr_set_pin_impl(gpio_num_t pin)
     }
   }
 
-  // Configure the new pin
+  // Configure the new pin. The pull-up makes an open contact, a cut cable or an unwired pin read high, which is stop.
   gpio_config_t io_conf = {
     .pin_bit_mask = 1ULL << pin,
     .mode         = GPIO_MODE_INPUT,
@@ -398,9 +371,10 @@ bool EStopManager::Init()
   }
   s_estopInitialized = true;
 
-  // Restore the latch before anything can send a command. An allow-listed reset with a valid seal comes back as it was.
-  // Anything else counts as a cold boot, which starts engaged, so the hub refuses every command until the hold-to-clear
-  // (SP-158).
+  // Restore the latch before anything can send a command. An allow-listed reset with a valid seal comes back as it was,
+  // engaged or released, so a crash loop never forces a stop (SP-172). Anything else counts as a cold boot, which starts
+  // engaged, so the hub refuses every command until the mushroom is pushed down and twisted up to clear it (SP-158,
+  // SP-174).
   auto source = Softproxy::EStopLatchSource::ColdBoot;
   if (!estopmanager_warmrestart() || !Softproxy::RestoreEStop(s_retainedLatch, source)) {
     OS_LOGW(TAG, "Cold boot, the EStop starts engaged");
