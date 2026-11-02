@@ -36,6 +36,10 @@ const uint32_t k_estopUpdateRate = 5;   // 200 Hz
 const uint32_t k_estopCheckCount = 13;  // 65 ms at 200 Hz
 const uint16_t k_estopCheckMask  = 0xFFFF >> ((sizeof(uint16_t) * 8) - k_estopCheckCount);
 
+// The clear counts low samples, not wall time, so a checker that stalls during the clear cannot skip it: the contact
+// still has to read closed on this many samples in a row.
+const uint32_t k_estopClearSamples = k_estopClearTime / k_estopUpdateRate;
+
 // The checker counts as dead when it has not sampled for this long, so a stalled task cannot read as armed.
 const uint32_t k_estopSampleStaleTime = 1000;
 
@@ -57,6 +61,10 @@ static bool s_estopInitialized = false;
 static std::atomic<Softproxy::EStopLatchSource> s_latch = {Softproxy::EStopLatchSource::ColdBoot};
 static RTC_NOINIT_ATTR Softproxy::RetainedEStop s_retainedLatch;
 static portMUX_TYPE s_latchMux = portMUX_INITIALIZER_UNLOCKED;
+
+// Gateway stops since boot, read and written only under `s_latchMux`. `Trigger` counts a stop before it engages, and the
+// checker task records the count when it takes the stop, so a clear can tell that a stop came in that it has not taken.
+static uint32_t s_gatewayStops = 0;
 
 static void estopmanager_writelatch(Softproxy::EStopLatchSource source)
 {
@@ -85,11 +93,33 @@ static void estopmanager_confirmpress()
   portEXIT_CRITICAL(&s_latchMux);
 }
 
-static void estopmanager_release()
+static void estopmanager_countgatewaystop()
 {
   portENTER_CRITICAL(&s_latchMux);
-  estopmanager_writelatch(Softproxy::EStopLatchSource::Released);
+  ++s_gatewayStops;
   portEXIT_CRITICAL(&s_latchMux);
+}
+
+static uint32_t estopmanager_gatewaystops()
+{
+  portENTER_CRITICAL(&s_latchMux);
+  const uint32_t stops = s_gatewayStops;
+  portEXIT_CRITICAL(&s_latchMux);
+  return stops;
+}
+
+// Releases the latch unless a gateway stop came in that the checker task has not taken. `Trigger` counts the stop before
+// it engages. A stop that races the clear therefore either finds the latch released and engages it, or moves the count
+// and this refuses, so `IsEStopped` never reads false while a gateway stop is pending.
+static bool estopmanager_release(uint32_t gatewayStopsTaken)
+{
+  portENTER_CRITICAL(&s_latchMux);
+  const bool released = s_gatewayStops == gatewayStopsTaken;
+  if (released) {
+    estopmanager_writelatch(Softproxy::EStopLatchSource::Released);
+  }
+  portEXIT_CRITICAL(&s_latchMux);
+  return released;
 }
 
 // Whether this boot is one that keeps the latch. A valid seal cannot show that: a brownout, a short supply dropout or
@@ -148,12 +178,16 @@ static void estopmgr_checkertask(void* pvParameters)
   // clear an engaged E-Stop. Only the clear below releases it.
   const bool startedEngaged = EStopManager::IsEStopped();
 
+  // The gateway stops this task has taken. `Trigger` itself engages the latch for a stop counted before the task starts,
+  // so the task has nothing to take for it.
+  uint32_t gatewayStopsTaken = estopmanager_gatewaystops();
+
   // Bit history of samples, 1 is stop (open, high). It starts with no stop bit, so a released latch restored by a warm
   // restart stays released on a closed contact. Nothing in it is measured until this task has read a full window.
   uint16_t history = 0;
 
-  EStopState state = startedEngaged ? EStopState::Active : EStopState::Idle;
-  int64_t clearsAt = 0;
+  EStopState state          = startedEngaged ? EStopState::Active : EStopState::Idle;
+  uint32_t clearSamplesLeft = 0;
 
   // Only a full window of low samples read by this task shows the contact closed, so an engagement is a real one only
   // after one (SP-156). A cold boot, an unwired pin or `estop pin` onto an open pin reads high from the start. It
@@ -179,7 +213,10 @@ static void estopmgr_checkertask(void* pvParameters)
 
     // Handle external trigger: forcibly set the E-Stop active.
     if (s_externallyTriggered) {
+      // Clear the flag before reading the count. `Trigger` counts first and sets the flag last, so a stop that comes
+      // in between sets the flag again and the next pass takes it.
       s_externallyTriggered = false;
+      gatewayStopsTaken     = estopmanager_gatewaystops();
 
       estopmanager_engage(Softproxy::EStopLatchSource::Gateway);
       state   = EStopState::Active;
@@ -232,20 +269,20 @@ static void estopmgr_checkertask(void* pvParameters)
         if (solidStop) {
           sawDown = true;
         } else if (sawDown && solidRun) {
-          state    = EStopState::ActiveClearing;
-          clearsAt = now + k_estopClearTime;
+          state            = EStopState::ActiveClearing;
+          clearSamplesLeft = k_estopClearSamples;
         }
         break;
 
       case EStopState::ActiveClearing:
         // Any high sample, a push, a bounce or a cable fault, stops the clear. It starts again from the next full window
-        // of low samples.
+        // of low samples. A gateway stop that has not reached this task yet refuses the release and stops the clear as
+        // well, so the next clear needs the mushroom down and up again.
         if (stopSeen) {
           state = EStopState::Active;
-        } else if (now >= clearsAt) {
-          state   = EStopState::Idle;
+        } else if (--clearSamplesLeft == 0) {
+          state   = estopmanager_release(gatewayStopsTaken) ? EStopState::Idle : EStopState::Active;
           sawDown = false;
-          estopmanager_release();
         }
         break;
 
@@ -485,6 +522,8 @@ int64_t EStopManager::LastEStopped()
 void EStopManager::Trigger()
 {
   // Engage here, not in the checker task, because a hub with no pin has no task. The latch must hold from this call.
+  // Count the stop first, so a clear that has not taken it refuses to release (see `estopmanager_release`).
+  estopmanager_countgatewaystop();
   if (!IsEStopped()) {
     s_estopActivatedAt = OpenShock::millis();
   }

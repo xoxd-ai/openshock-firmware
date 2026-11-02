@@ -298,8 +298,14 @@ esp_err_t gpio_reset_pin(gpio_num_t pin)
   s_gpioPullUp.erase(pin);
   return ESP_OK;
 }
+// Runs on each E-Stop sample until it returns true. The checker task reads the pin after its trigger check and before
+// its state update, so this is where a `Trigger` from another core can land inside a pass.
+static std::function<bool()> s_onEStopSample;
 int gpio_get_level(gpio_num_t pin)
 {
+  if (s_onEStopSample && s_onEStopSample()) {
+    s_onEStopSample = nullptr;
+  }
   auto it = s_gpioLevel.find(pin);
   if (it != s_gpioLevel.end()) {
     return it->second;
@@ -466,6 +472,7 @@ static void bootEStopManager(esp_reset_reason_t reason, bool loseRetained)
   s_estopActivatedAt    = 0;
   s_lastSampleMs        = 0;
   s_externallyTriggered = false;
+  s_gatewayStops        = 0;
   s_estopInitialized    = false;
   g_resetReason         = reason;
   if (loseRetained) {
@@ -493,6 +500,7 @@ static void freshHub(bool enabled = false, gpio_num_t pin = GPIO_NUM_NC)
   s_cfgTx        = static_cast<gpio_num_t>(OPENSHOCK_RF_TX_GPIO);
   s_cfgKeepAlive = false;
   (void)SafetyCaps::Clear();
+  s_onEStopSample = nullptr;
   restartEStopManager(true);
   CHECK(CommandHandler::Init());
   // A stored E-Stop pin on the transmitter is a scenario of its own, and the rule refuses this call.
@@ -940,6 +948,72 @@ static void latchKeepsItsFirstSource()
   advance(10);
   CHECK(EStopManager::IsEStopped());
   CHECK(EStopManager::GetLatchSource() == EStopLatchSource::Gateway);
+}
+
+// Review finding: no mutant covered the guard in `estopmanager_confirmpress`. A gateway stop that lands in a released
+// checker's pass, after its trigger check, latches as the gateway. The same pass then reads the mushroom down from Idle
+// and starts to confirm a press. The full window of high samples that follows must leave the gateway latch in place.
+static void gatewayLatchThenPressStaysGateway()
+{
+  armedHub();
+  pushDown();
+  s_onEStopSample = [] {
+    EStopManager::Trigger();
+    return true;
+  };
+  advance(5);
+  CHECK(!s_onEStopSample);
+  CHECK(EStopManager::IsEStopped());
+  CHECK(EStopManager::GetLatchSource() == EStopLatchSource::Gateway);
+  advance(200);
+  CHECK(EStopManager::GetLatchSource() == EStopLatchSource::Gateway);
+  CHECK(SafetyCaps::Set(ShockerCommandType::Vibrate, lowCaps()) == SetResult::NeedsEngagedEStop);
+  CHECK(!SafetyCaps::AnySet());
+  twistToClear();
+  CHECK(!EStopManager::IsEStopped());
+
+  // With no stop in the pass, the same press reads as a button.
+  engageByButton();
+  CHECK(EStopManager::GetLatchSource() == EStopLatchSource::Button);
+  twistToClear();
+  CHECK(!EStopManager::IsEStopped());
+}
+
+// Review finding: a gateway stop that landed in the checker's last clear pass, after its trigger check and before the
+// release, found the latch still engaged and engaged nothing. The release then cleared the latch, and `IsEStopped` read
+// false until the next pass took the stop. The release now refuses a stop the task has not taken, so the hub stays
+// engaged on every pass, the source stays the press, and the next clear needs the mushroom down and up again.
+static void gatewayStopRacingTheReleaseHolds()
+{
+  armedHub();
+  engageByButton();
+  twistUp();
+  uint32_t clearPasses = 0;
+  bool fired           = false;
+  s_onEStopSample      = [&clearPasses, &fired] {
+    if (s_published.empty() || s_published.back() != EStopState::ActiveClearing || ++clearPasses < k_estopClearSamples) {
+      return false;
+    }
+    EStopManager::Trigger();
+    fired = true;
+    return true;
+  };
+  for (int pass = 0; pass < 1200; ++pass) {
+    advance(5);
+    CHECK(EStopManager::IsEStopped());
+  }
+  CHECK(fired);
+  s_onEStopSample = nullptr;
+  CHECK(EStopManager::GetLatchSource() == EStopLatchSource::Button);
+  CHECK(std::find(s_published.begin(), s_published.end(), EStopState::Idle) == s_published.end());
+  CHECK(s_published.back() == EStopState::Active);
+
+  // The mushroom stayed up through the stop, so time alone clears nothing.
+  advance(6000);
+  CHECK(EStopManager::IsEStopped());
+  twistToClear();
+  CHECK(!EStopManager::IsEStopped());
+  CHECK(s_published.back() == EStopState::Idle);
 }
 
 // A gateway stop reaches a clear in progress, so the hub does not release after it. The mushroom measured down before the
@@ -1707,6 +1781,31 @@ static void stalledCheckerIsNotArmed()
   (void)SafetyCaps::Clear();
 }
 
+// Review finding: the clear ran on wall time, so a checker that stalled past the clear time released on its first low
+// sample after the stall. The clear now counts samples, and every one of them must read the contact closed.
+static void stalledCheckerCannotSkipTheClear()
+{
+  armedHub();
+  engageByButton();
+  twistUp();
+  advance(1000);
+  CHECK(s_published.back() == EStopState::ActiveClearing);
+  s_stallChecker = true;
+  advance(k_estopClearTime + 1000);
+  s_stallChecker = false;
+  advance(5);
+  CHECK(EStopManager::IsEStopped());
+  CHECK(s_published.back() == EStopState::ActiveClearing);
+
+  // The clear started 65 milliseconds after the twist, so 187 of its 1000 samples ran before the stall. The other 813
+  // take 4065 milliseconds.
+  advance(4000);
+  CHECK(EStopManager::IsEStopped());
+  advance(100);
+  CHECK(!EStopManager::IsEStopped());
+  CHECK(s_published.back() == EStopState::Idle);
+}
+
 // SP-113 rule 2.
 static void capRiseNeedsAnEngagedEStop()
 {
@@ -2329,6 +2428,8 @@ int main()
   SCENARIO(coldBootLatchLeavesSettingsOpen);
   SCENARIO(armedTriggerDoesNotAllowARise);
   SCENARIO(latchKeepsItsFirstSource);
+  SCENARIO(gatewayLatchThenPressStaysGateway);
+  SCENARIO(gatewayStopRacingTheReleaseHolds);
   SCENARIO(emergencyStopInterruptsAClear);
   SCENARIO(sourceSurvivesWarmRestart);
   SCENARIO(onlyAnAllowedResetKeepsTheLatch);
@@ -2350,6 +2451,7 @@ int main()
   SCENARIO(capsLockTheEStopSettings);
   SCENARIO(enableNeedsAValidPin);
   SCENARIO(stalledCheckerIsNotArmed);
+  SCENARIO(stalledCheckerCannotSkipTheClear);
   SCENARIO(capRiseNeedsAnEngagedEStop);
   SCENARIO(capsRiseCoversEveryField);
   SCENARIO(pinsStaySeparate);

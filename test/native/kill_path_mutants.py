@@ -47,6 +47,10 @@ WARM = '    case ESP_RST_SW:\n'
 RESERVED = 'return pin == 0 || pin == 2 || pin == 5 || pin == 12 || pin == 15 || (pin >= 6 && pin <= 11);'
 GATE = 'if (EStopManager::IsEStopped() && triggerType != TriggerType::EmergencyStop) {'
 
+# The clear before the sample count: it ends at the wall time 5 seconds after it started, however few samples ran.
+CLEAR_ON_WALL_TIME = ('} else if ([&] { static int64_t endsAt; if (clearSamplesLeft == k_estopClearSamples) endsAt = now + k_estopClearTime'
+                      ' - k_estopUpdateRate; --clearSamplesLeft; return now >= endsAt; }()) {')
+
 # Equivalent mutants, left out of the run. K29 drops `estopPin == kBoardRfTxPin` from `EStopPinConflicts`. On both
 # PiShock builds the board RF TX pin is 12 or 15, and `IsEStopReservedPin` refuses both, so no input tells the two apart.
 # pinsStaySeparate checks that both pins are reserved. A build whose board RF TX pin is not reserved needs K29 back.
@@ -58,7 +62,7 @@ EQUIVALENT = [
 MUTANTS = [
   ('K1 HandleCommand ignores not armed', CH, '!EStopManager::IsArmed())', 'false)', [CH]),
   ('K2 HandleCommand ignores engaged', CH, 'if (EStopManager::IsEStopped()) {\n    Softproxy::SafetyCaps::RecordRefusal', 'if (false) {\n    Softproxy::SafetyCaps::RecordRefusal', [CH]),
-  ('K3 task start clears the latch', ES, 'const bool startedEngaged = EStopManager::IsEStopped();', 'estopmanager_release(); const bool startedEngaged = false;', [TEST]),
+  ('K3 task start clears the latch', ES, 'const bool startedEngaged = EStopManager::IsEStopped();', '(void)estopmanager_release(s_gatewayStops); const bool startedEngaged = false;', [TEST]),
   ('K4 Init ignores the retained latch', ES, 'if (!estopmanager_warmrestart() || !Softproxy::RestoreEStop(s_retainedLatch, source)) {', 'if (true) {', [TEST]),
   ('K5 Trigger only sets the flag', ES, '  if (!IsEStopped()) {\n    s_estopActivatedAt = OpenShock::millis();\n  }\n  estopmanager_engage(Softproxy::EStopLatchSource::Gateway);\n\n  OpenShock::ScopedLock', '  s_externallyTriggered = true;\n  return;\n  OpenShock::ScopedLock', [TEST]),
   ('K6 estop pin ignores the lock', ES, '  if (estopmgr_settingslocked()) {\n    OS_LOGW(TAG, "Refusing to move', '  if (false) {\n    OS_LOGW(TAG, "Refusing to move', [TEST]),
@@ -99,7 +103,7 @@ MUTANTS = [
   ('K42 lock skips the gateway latch', KP, LOCK, 'return anyCapSet || source == EStopLatchSource::Button || source == EStopLatchSource::Unconfirmed;', HEADER),
   ('K43 lock skips the button latch', KP, LOCK, 'return anyCapSet || source == EStopLatchSource::Gateway || source == EStopLatchSource::Unconfirmed;', HEADER),
   ('K44 lock takes the cold boot latch, so a fresh hub gets no pin', KP, LOCK, 'return anyCapSet || source != EStopLatchSource::Released;', HEADER),
-  ('K45 a clear under way records a button', ES, '          state    = EStopState::ActiveClearing;\n', '          state    = EStopState::ActiveClearing;\n          s_latch.store(Softproxy::EStopLatchSource::Button);\n', [TEST]),
+  ('K45 a clear under way records a button', ES, '          state            = EStopState::ActiveClearing;\n', '          state            = EStopState::ActiveClearing;\n          s_latch.store(Softproxy::EStopLatchSource::Button);\n', [TEST]),
   ('K46 engage restates the source', ES, '  if (s_latch.load() == Softproxy::EStopLatchSource::Released) {\n    estopmanager_writelatch(source);\n  }', '  estopmanager_writelatch(source);', [TEST]),
   ('K47 latch not sealed on engage', ES, '  s_latch.store(source);\n  Softproxy::SealEStop(s_retainedLatch, source);', '  s_latch.store(source);\n  if (source == Softproxy::EStopLatchSource::Released) Softproxy::SealEStop(s_retainedLatch, source);', [TEST]),
   ('K48 shorter join window is no rise', KP, 'to.stageJoinMs != from.stageJoinMs', 'to.stageJoinMs > from.stageJoinMs', HEADER),
@@ -114,10 +118,10 @@ MUTANTS = [
   ('K57 one high sample records a button', ES, 'estopmanager_engage(Softproxy::EStopLatchSource::Unconfirmed);', 'estopmanager_engage(Softproxy::EStopLatchSource::Button);', [TEST]),
   ('K58 confirm needs no full window', ES, 'if (confirming && solidStop) {', 'if (confirming) {', [TEST]),
   ('K59 a later press confirms a glitch', ES, '    if (!stopSeen) {\n      confirming = false;\n    }\n', '', [TEST]),
-  ('K61 one high sample keeps the clear running', ES, '        if (stopSeen) {\n          state = EStopState::Active;\n        } else if (now >= clearsAt) {', '        if (solidStop) {\n          state = EStopState::Active;\n        } else if (now >= clearsAt) {', [TEST]),
-  ('K62 a push never stops the clear', ES, '        if (stopSeen) {\n          state = EStopState::Active;\n        } else if (now >= clearsAt) {', '        if (false) {\n          state = EStopState::Active;\n        } else if (now >= clearsAt) {', [TEST]),
+  ('K61 one high sample keeps the clear running', ES, '        if (stopSeen) {\n          state = EStopState::Active;\n        } else if (--clearSamplesLeft == 0) {', '        if (solidStop) {\n          state = EStopState::Active;\n        } else if (--clearSamplesLeft == 0) {', [TEST]),
+  ('K62 a push never stops the clear', ES, '        if (stopSeen) {\n          state = EStopState::Active;\n        } else if (--clearSamplesLeft == 0) {', '        if (false) {\n          state = EStopState::Active;\n        } else if (--clearSamplesLeft == 0) {', [TEST]),
   ('K63 clear needs no measured down', ES, '} else if (sawDown && solidRun) {', '} else if (solidRun) {', [TEST]),
-  ('K64 clear skips the clear time', ES, '} else if (now >= clearsAt) {', '} else {', [TEST]),
+  ('K64 clear skips the clear time', ES, '} else if (--clearSamplesLeft == 0) {', '} else {', [TEST]),
   ('K65 engaged hub drops a gateway stop', TR, ' && triggerType != TriggerType::EmergencyStop', '', [TR]),
   ('K67 gateway stop keeps the measured down', ES, '      sawDown = false;  // Stops a clear in progress. The next clear needs the mushroom measured down again.\n', '', [TEST]),
   ('K68 Idle ignores the stored keep-alive', CH, 'if (keepAlive && !Config::GetRFConfigKeepAliveEnabled(keepAlive)) {', 'if (false) {', [CH]),
@@ -133,7 +137,7 @@ MUTANTS = [
   ('K79 the contact reads as normally open', ES, '== k_estopRunLevel ? 0 : 1;', '== k_estopRunLevel ? 1 : 0;', [TEST]),
   ('K80 one high sample engages nothing', ES, '        // A high level at any time engages. There is no rearm window.\n        if (stopSeen) {', '        // A high level at any time engages. There is no rearm window.\n        if (solidStop) {', [TEST]),
   ('K81 one high sample counts as the mushroom down', ES, 'bool solidStop        = window == k_estopCheckMask;', 'bool solidStop        = window != 0;', [TEST]),
-  ('K82 release keeps the measured down', ES, '          sawDown = false;\n          estopmanager_release();', '          estopmanager_release();', [TEST]),
+  ('K82 release keeps the measured down', ES, ' : EStopState::Active;\n          sawDown = false;\n', ' : EStopState::Active;\n', [TEST]),
   ('K84 estop rule skips the reserved pins', KP, ' || IsEStopReservedPin(estopPin)', '', HEADER),
   ('K85 reserved pins only off a plain ESP32', KP, '    if (!kChipIsEsp32) {\n      return false;', '    if (kChipIsEsp32) {\n      return false;', HEADER),
   ('K86 GPIO 0 allowed', KP, RESERVED, RESERVED.replace('pin == 0 || ', ''), HEADER),
@@ -145,6 +149,12 @@ MUTANTS = [
   ('K92 GPIO 6 allowed', KP, RESERVED, RESERVED.replace('pin >= 6 &&', 'pin >= 7 &&'), HEADER),
   ('K93 GPIO 11 allowed', KP, RESERVED, RESERVED.replace('pin <= 11', 'pin <= 10'), HEADER),
   ('K94 the pull-up comes off the E-Stop pin', ES, '.pull_up_en   = GPIO_PULLUP_ENABLE,', '.pull_up_en   = GPIO_PULLUP_DISABLE,', [TEST]),
+  ('K95 confirm skips the unconfirmed guard', ES, '  if (s_latch.load() == Softproxy::EStopLatchSource::Unconfirmed) {', '  if (true) {', [TEST]),
+  ('K96 release ignores an untaken gateway stop', ES, 'const bool released = s_gatewayStops == gatewayStopsTaken;', 'const bool released = true;', [TEST]),
+  ('K97 Trigger does not count the stop', ES, '  estopmanager_countgatewaystop();\n  if (!IsEStopped()) {', '  if (!IsEStopped()) {', [TEST]),
+  ('K98 the task never takes a gateway stop', ES, '      gatewayStopsTaken     = estopmanager_gatewaystops();\n', '', [TEST]),
+  ('K99 a refused release reads as idle', ES, '? EStopState::Idle : EStopState::Active;', '? EStopState::Idle : EStopState::Idle;', [TEST]),
+  ('K100 the clear ends on wall time', ES, '} else if (--clearSamplesLeft == 0) {', CLEAR_ON_WALL_TIME, [TEST]),
   ('K78 boot never starts the keep-alive', CH, 'if (rfConfig.keepAliveEnabled && !EStopManager::IsEStopped()) {', 'if (false) {', [CH]),
   ('R4 RF task stops discarding while engaged', RF, 'if (OpenShock::EStopManager::IsEStopped()) {\n        // Immediately', 'if (false) {\n        // Immediately', [RF]),
   ('R4b RF task adds what it should discard', RF, '        // Discard next item in queue\n        continue;\n', '', [RF]),
