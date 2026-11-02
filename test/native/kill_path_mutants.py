@@ -47,6 +47,13 @@ WARM = '    case ESP_RST_SW:\n'
 RESERVED = 'return pin == 0 || pin == 2 || pin == 5 || pin == 12 || pin == 15 || (pin >= 6 && pin <= 11);'
 GATE = 'if (EStopManager::IsEStopped() && triggerType != TriggerType::EmergencyStop) {'
 
+# Equivalent mutants, left out of the run. K29 drops `estopPin == kBoardRfTxPin` from `EStopPinConflicts`. On both
+# PiShock builds the board RF TX pin is 12 or 15, and `IsEStopReservedPin` refuses both, so no input tells the two apart.
+# pinsStaySeparate checks that both pins are reserved. A build whose board RF TX pin is not reserved needs K29 back.
+EQUIVALENT = [
+  ('K29 estop rule ignores the board tx pin', KP, 'estopPin == txPin || estopPin == kBoardRfTxPin', 'estopPin == txPin', HEADER),
+]
+
 # Name, file, text to replace, replacement, units to rebuild. An empty unit list means the test reads the file itself.
 MUTANTS = [
   ('K1 HandleCommand ignores not armed', CH, '!EStopManager::IsArmed())', 'false)', [CH]),
@@ -77,7 +84,6 @@ MUTANTS = [
   ('K26 unreadable caps count as clear', SC, 'if (!lock__.isLocked() || !ensureLoaded()) {\n    return true;', 'if (!lock__.isLocked() || !ensureLoaded()) {\n    return false;', [SC]),
   ('K27 tx rule ignores the stored pin', KP, 'return txPin == configuredEStopPin || txPin == runningEStopPin', 'return txPin == runningEStopPin', HEADER),
   ('K28 estop rule ignores the stored tx pin', KP, 'return estopPin == txPin || estopPin == kBoardRfTxPin', 'return estopPin == kBoardRfTxPin', HEADER),
-  ('K29 estop rule ignores the board tx pin', KP, 'estopPin == txPin || estopPin == kBoardRfTxPin', 'estopPin == txPin', HEADER),
   ('K30 Set has no rise check', SC, 'if (CapsRise(previous, caps) && !CapRiseAllowed(EStopManager::IsArmed(), EStopManager::GetLatchSource())) {', 'if (false) {', [SC]),
   ('K31 armed with no pin or task', ES, 'if (s_estopTask == nullptr || !OpenShock::IsValidInputPin(s_estopPin)) {\n    return false;\n  }\n\n  // Read the sample', 'if (false) {\n    return false;\n  }\n  return true;\n  // Read the sample', [TEST]),
   ('K32 tx rule keyed on no run-time pin', CH, 'Softproxy::TxPinConflicts(txPin, estopPin, EStopManager::GetRunningPin())', 'Softproxy::TxPinConflicts(txPin, GPIO_NUM_NC, GPIO_NUM_NC)', [CH]),
