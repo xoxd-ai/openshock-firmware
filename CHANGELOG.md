@@ -1,3 +1,14 @@
+# Version 1.6.0-rc.1 Release Notes
+
+Upstream release candidate, tagged at `9c7d347` in OpenShock/Firmware. The tag came to this fork with the upstream history. The fork builds from 1.5.2 and does not ship this release candidate.
+
+This entry lets `.github/scripts/get-vars.js` find every tag in the changelog (Softproxy SP-147, TIN-7545). The script stays unchanged.
+
+**Full Changelog: [1.5.2 -> 1.6.0-rc.1](https://github.com/OpenShock/Firmware/compare/1.5.2...1.6.0-rc.1)**
+
+
+
+
 # Version 1.5.2 Release Notes
 
 Feature release restoring missing WellturnT330 support that was intended for 1.5.0.
