@@ -1,6 +1,7 @@
 #pragma once
 
 #include "estop/EStopState.h"
+#include "softproxy/KillPath.h"
 
 #include <hal/gpio_types.h>
 
@@ -20,7 +21,11 @@ namespace OpenShock::EStopManager {
   /// The pin the checker reads, or GPIO_NUM_NC when none is set. The stored pin can differ until a restart.
   gpio_num_t GetRunningPin();
 
-  /// Engages the E-Stop at once, with or without a checker task. Only the hold-to-clear releases it, so with no task
-  /// it stays engaged until a power cycle.
+  /// What set the latch, or `Released`. The first source holds until the hold-to-clear: a later press or `Trigger` does
+  /// not restate it. A rise needs `Button` (SP-156).
+  Softproxy::EStopLatchSource GetLatchSource();
+
+  /// Engages the E-Stop at once, with or without a checker task. Only the hold-to-clear releases it, so with no task it
+  /// holds until a power cycle swaps it for the cold boot latch, which stays engaged.
   void Trigger();
 }  // namespace OpenShock::EStopManager

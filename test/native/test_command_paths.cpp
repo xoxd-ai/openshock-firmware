@@ -84,6 +84,10 @@ bool EStopManager::IsArmed()
 {
   return true;
 }
+Softproxy::EStopLatchSource EStopManager::GetLatchSource()
+{
+  return s_estopped ? Softproxy::EStopLatchSource::Button : Softproxy::EStopLatchSource::Released;
+}
 gpio_num_t EStopManager::GetRunningPin()
 {
   return GPIO_NUM_NC;

@@ -145,7 +145,7 @@ static bool _killConfigChangeAllowed(const OpenShock::Config::RootConfig& next)
 {
   const OpenShock::Softproxy::KillConfig current {_configData.estop.enabled, static_cast<int>(_configData.estop.gpioPin)};
   const OpenShock::Softproxy::KillConfig candidate {next.estop.enabled, static_cast<int>(next.estop.gpioPin)};
-  const bool killLocked = OpenShock::EStopManager::IsEStopped() || OpenShock::Softproxy::SafetyCaps::AnySet();
+  const bool killLocked = OpenShock::Softproxy::EStopSettingsLocked(OpenShock::EStopManager::GetLatchSource(), OpenShock::Softproxy::SafetyCaps::AnySet());
 
   const int runningPin = static_cast<int>(OpenShock::EStopManager::GetRunningPin());
 

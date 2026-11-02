@@ -28,7 +28,7 @@ namespace OpenShock::Softproxy::SafetyCaps {
     Stored,
     Invalid,            // Not Shock or Vibrate, or the caps fail `CapsSet` or `CapsCoherent`.
     Unreadable,         // The stored record cannot be read. Run `safetycaps clear` first.
-    NeedsEngagedEStop,  // A cap would rise with the E-Stop released or not armed (SP-113 rule 2).
+    NeedsEngagedEStop,  // A cap would rise without an armed E-Stop engaged by its button (SP-113 rule 2, SP-156).
     StoreFailed,
   };
 

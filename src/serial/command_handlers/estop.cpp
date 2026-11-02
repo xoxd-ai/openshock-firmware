@@ -15,7 +15,13 @@ void _handleEStopStateCommand(std::string_view arg, bool isAutomated)
   }
 
   // The running state. `estop enabled` and `estop pin` read the stored config, which can differ until a restart.
-  SERPR_RESPONSE("EStopState|armed=%s,engaged=%s,pin=%hhi", OpenShock::EStopManager::IsArmed() ? "true" : "false", OpenShock::EStopManager::IsEStopped() ? "true" : "false", static_cast<int8_t>(OpenShock::EStopManager::GetRunningPin()));
+  SERPR_RESPONSE(
+    "EStopState|armed=%s,engaged=%s,pin=%hhi,source=%s",
+    OpenShock::EStopManager::IsArmed() ? "true" : "false",
+    OpenShock::EStopManager::IsEStopped() ? "true" : "false",
+    static_cast<int8_t>(OpenShock::EStopManager::GetRunningPin()),
+    OpenShock::Softproxy::EStopLatchName(OpenShock::EStopManager::GetLatchSource())
+  );
 }
 
 void _handleEStopEnabledCommand(std::string_view arg, bool isAutomated)
@@ -38,7 +44,7 @@ void _handleEStopEnabledCommand(std::string_view arg, bool isAutomated)
   }
 
   if (!OpenShock::EStopManager::SetEStopEnabled(enabled)) {
-    SERPR_ERROR("Failed to set EStop enabled (needs a valid pin, and disabling refuses while it is engaged or a cap is set)");
+    SERPR_ERROR("Failed to set EStop enabled (needs a valid pin, and disabling refuses while a press or the gateway holds it engaged or a cap is set)");
     return;
   }
 
@@ -70,7 +76,7 @@ void _handleEStopPinCommand(std::string_view arg, bool isAutomated)
   }
 
   if (!OpenShock::EStopManager::SetEStopPin(estopPin)) {
-    SERPR_ERROR("Failed to set EStop pin (refused while it is engaged or a cap is set, and for the RF TX pin, a board LED or a pin with no pull-up)");
+    SERPR_ERROR("Failed to set EStop pin (refused while a press or the gateway holds it engaged or a cap is set, and for the RF TX pin, a board LED or a pin with no pull-up)");
     return;
   }
 
@@ -86,7 +92,7 @@ OpenShock::Serial::CommandGroup OpenShock::Serial::CommandHandlers::EStopHandler
 {
   auto group = OpenShock::Serial::CommandGroup("estop"sv);
 
-  group.addCommand("state"sv, "Get the running E-Stop state: armed, engaged and pin."sv, _handleEStopStateCommand);
+  group.addCommand("state"sv, "Get the running E-Stop state: armed, engaged, pin and what set the latch."sv, _handleEStopStateCommand);
 
   auto& getEnabledCommand = group.addCommand("enabled"sv, "Get the E-Stop enabled state."sv, _handleEStopEnabledCommand);
   auto& setEnabledCommand = group.addCommand("enabled"sv, "Set the E-Stop enabled state."sv, _handleEStopEnabledCommand);

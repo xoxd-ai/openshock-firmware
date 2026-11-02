@@ -41,7 +41,6 @@ static gpio_num_t s_estopPin               = GPIO_NUM_NC;
 static TaskHandle_t s_estopTask            = nullptr;
 
 static EStopState s_lastPublishedState      = EStopState::Idle;
-static std::atomic<bool> s_estopActive      = {false};
 static int64_t s_estopActivatedAt           = 0;
 static std::atomic<uint32_t> s_lastSampleMs = {0};
 
@@ -49,16 +48,33 @@ static volatile bool s_externallyTriggered = false;
 
 static bool s_estopInitialized = false;
 
-// The latch. Only `estopmanager_setlatch` writes it, so RAM and the retained copy never disagree. Survives a warm
-// restart. Its content is garbage after a cold boot, which the check rejects.
+// The latch and what set it. Only `estopmanager_writelatch` writes it, so RAM and the retained copy never disagree.
+// Survives a warm restart. Its content is garbage after a cold boot, which the check rejects. It starts engaged, so a
+// hub stays refused if anything reads it before `Init`.
+static std::atomic<Softproxy::EStopLatchSource> s_latch = {Softproxy::EStopLatchSource::ColdBoot};
 static RTC_NOINIT_ATTR Softproxy::RetainedEStop s_retainedLatch;
 static portMUX_TYPE s_latchMux = portMUX_INITIALIZER_UNLOCKED;
 
-static void estopmanager_setlatch(bool engaged)
+static void estopmanager_writelatch(Softproxy::EStopLatchSource source)
+{
+  s_latch.store(source);
+  Softproxy::SealEStop(s_retainedLatch, source);
+}
+
+// Engages, keeping the source that already holds the latch.
+static void estopmanager_engage(Softproxy::EStopLatchSource source)
 {
   portENTER_CRITICAL(&s_latchMux);
-  s_estopActive.store(engaged);
-  Softproxy::SealEStop(s_retainedLatch, engaged);
+  if (s_latch.load() == Softproxy::EStopLatchSource::Released) {
+    estopmanager_writelatch(source);
+  }
+  portEXIT_CRITICAL(&s_latchMux);
+}
+
+static void estopmanager_release()
+{
+  portENTER_CRITICAL(&s_latchMux);
+  estopmanager_writelatch(Softproxy::EStopLatchSource::Released);
   portEXIT_CRITICAL(&s_latchMux);
 }
 
@@ -99,7 +115,7 @@ static void estopmgr_checkertask(void* pvParameters)
 
   // The latch outlives this task. Starting the task reads it and never writes it, so a restart of the task cannot
   // clear an engaged E-Stop. Only the hold-to-clear below releases it.
-  const bool startedEngaged = s_estopActive.load();
+  const bool startedEngaged = EStopManager::IsEStopped();
 
   uint16_t history = 0xFFFF;  // Bit history of samples, 0 is pressed
 
@@ -126,7 +142,7 @@ static void estopmgr_checkertask(void* pvParameters)
     if (s_externallyTriggered) {
       s_externallyTriggered = false;
 
-      estopmanager_setlatch(true);
+      estopmanager_engage(Softproxy::EStopLatchSource::Gateway);
       state        = EStopState::Active;
       rearmBlocked = false;
 
@@ -164,7 +180,7 @@ static void estopmgr_checkertask(void* pvParameters)
         if (btnState) {
           state              = EStopState::Active;
           s_estopActivatedAt = now;
-          estopmanager_setlatch(true);
+          estopmanager_engage(Softproxy::EStopLatchSource::Button);
         }
         break;
 
@@ -188,7 +204,7 @@ static void estopmgr_checkertask(void* pvParameters)
       case EStopState::AwaitingRelease:
         if (!btnState) {  // fully released -> clear E-Stop
           state = EStopState::Idle;
-          estopmanager_setlatch(false);
+          estopmanager_release();
 
           // Start grace period to prevent immediate re-trigger.
           rearmBlocked = true;
@@ -229,10 +245,11 @@ static bool estopmgr_setestopenabled(bool enabled)
   return true;
 }
 
-// Whether the E-Stop settings are locked: they stay put while it is engaged or any cap can let a command through.
+// Whether the E-Stop settings are locked: they stay put while a press or the gateway holds it engaged, or while any
+// cap can let a command through.
 static bool estopmgr_settingslocked()
 {
-  return s_estopActive.load() || Softproxy::SafetyCaps::AnySet();
+  return Softproxy::EStopSettingsLocked(s_latch.load(), Softproxy::SafetyCaps::AnySet());
 }
 
 // Whether `pin` may be the E-Stop pin, against the stored RF TX pin. A failed read refuses.
@@ -317,12 +334,17 @@ bool EStopManager::Init()
   }
   s_estopInitialized = true;
 
-  // Restore the latch before anything can send a command. A warm restart comes back engaged.
-  bool engaged = false;
-  if (Softproxy::RestoreEStop(s_retainedLatch, engaged) && engaged) {
-    OS_LOGW(TAG, "Restored an engaged EStop after a warm restart");
+  // Restore the latch before anything can send a command. A warm restart comes back as it was. Anything else counts as
+  // a cold boot, which starts engaged, so the hub refuses every command until the hold-to-clear (SP-158).
+  auto source = Softproxy::EStopLatchSource::ColdBoot;
+  if (!Softproxy::RestoreEStop(s_retainedLatch, source)) {
+    OS_LOGW(TAG, "Cold boot, the EStop starts engaged");
+  } else if (source != Softproxy::EStopLatchSource::Released) {
+    OS_LOGW(TAG, "Restored an engaged EStop after a warm restart, source=%s", Softproxy::EStopLatchName(source));
   }
-  estopmanager_setlatch(engaged);
+  portENTER_CRITICAL(&s_latchMux);
+  estopmanager_writelatch(source);
+  portEXIT_CRITICAL(&s_latchMux);
 
   Config::EStopConfig cfg;
   if (!OpenShock::Config::GetEStop(cfg)) {
@@ -351,7 +373,7 @@ bool EStopManager::SetEStopEnabled(bool enabled)
   OpenShock::ScopedLock lock__(&s_estopMutex);
 
   if (!enabled && estopmgr_settingslocked()) {
-    OS_LOGW(TAG, "Refusing to disable the EStop while it is engaged or a cap is set");
+    OS_LOGW(TAG, "Refusing to disable the EStop while a press or the gateway holds it engaged or a cap is set");
     return false;
   }
 
@@ -379,7 +401,7 @@ bool EStopManager::SetEStopPin(gpio_num_t pin)
   }
 
   if (estopmgr_settingslocked()) {
-    OS_LOGW(TAG, "Refusing to move the EStop pin while it is engaged or a cap is set");
+    OS_LOGW(TAG, "Refusing to move the EStop pin while a press or the gateway holds it engaged or a cap is set");
     return false;
   }
 
@@ -392,7 +414,12 @@ bool EStopManager::SetEStopPin(gpio_num_t pin)
 
 bool EStopManager::IsEStopped()
 {
-  return s_estopActive.load();
+  return s_latch.load() != Softproxy::EStopLatchSource::Released;
+}
+
+Softproxy::EStopLatchSource EStopManager::GetLatchSource()
+{
+  return s_latch.load();
 }
 
 bool EStopManager::IsArmed()
@@ -419,10 +446,10 @@ int64_t EStopManager::LastEStopped()
 void EStopManager::Trigger()
 {
   // Engage here, not in the checker task, because a hub with no pin has no task. The latch must hold from this call.
-  if (!s_estopActive.load()) {
+  if (!IsEStopped()) {
     s_estopActivatedAt = OpenShock::millis();
   }
-  estopmanager_setlatch(true);
+  estopmanager_engage(Softproxy::EStopLatchSource::Gateway);
 
   OpenShock::ScopedLock lock__(&s_estopMutex);
 

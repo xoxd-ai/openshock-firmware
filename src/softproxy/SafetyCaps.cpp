@@ -222,8 +222,8 @@ SafetyCaps::SetResult SafetyCaps::Set(ShockerCommandType type, const ChannelCaps
   ChannelCaps& slot          = type == ShockerCommandType::Shock ? s_shock : s_vibrate;
   const ChannelCaps previous = slot;
 
-  if (CapsRise(previous, caps) && !CapRiseAllowed(EStopManager::IsArmed(), EStopManager::IsEStopped())) {
-    OS_LOGW(TAG, "Refusing to raise a cap, the E-Stop must be armed and engaged (SP-113)");
+  if (CapsRise(previous, caps) && !CapRiseAllowed(EStopManager::IsArmed(), EStopManager::GetLatchSource())) {
+    OS_LOGW(TAG, "Refusing to raise a cap, the E-Stop must be armed and engaged by its button (SP-113, SP-156)");
     return SetResult::NeedsEngagedEStop;
   }
 

@@ -8,6 +8,7 @@
 
 #include "ShockerCommandType.h"
 #include "ShockerModelType.h"
+#include "softproxy/KillPath.h"
 #include "span.h"
 
 #include <algorithm>
@@ -280,6 +281,7 @@ namespace OpenShock {
   namespace EStopManager {
     bool IsEStopped();
     bool IsArmed();
+    Softproxy::EStopLatchSource GetLatchSource();
     gpio_num_t GetRunningPin();
     void Trigger();
   }  // namespace EStopManager

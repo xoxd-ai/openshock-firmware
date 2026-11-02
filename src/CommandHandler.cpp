@@ -224,7 +224,8 @@ bool CommandHandler::Init()
       return false;
     }
 
-    // A warm restart can come back engaged. The Idle state event starts the keep-alive after the clear.
+    // A cold boot starts engaged and a warm restart can come back engaged. The Idle state event starts the keep-alive
+    // after the clear.
     if (rfConfig.keepAliveEnabled && !EStopManager::IsEStopped()) {
       _internalSetKeepAliveEnabled(true);
     }
