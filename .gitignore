@@ -18,3 +18,5 @@ data/www
 packages
 *.sln
 compile_commands.json
+# softproxy flash tool out links (GC roots, local only)
+softproxy/flash/result*
