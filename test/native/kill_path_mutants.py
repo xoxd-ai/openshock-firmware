@@ -8,7 +8,8 @@
 #   python3 test/native/kill_path_mutants.py --only K11 R4    # a few
 #   python3 test/native/kill_path_mutants.py --budget 540     # stop after 540 seconds, a later run resumes
 #
-# Results sit in the work directory with the tree they belong to, so a run after an edit starts over.
+# Results sit in the work directory with the tree they belong to, so a run after an edit starts over. The run has no
+# load stop of its own: a caller that shares a host runs it in a slice that caps it.
 #
 # Exit codes: 0 every mutant red, 1 a mutant survived, 2 the tree or a mutant is broken, 75 stopped early, run it again.
 # A mutant whose text no longer matches the tree counts as broken, so the list cannot drift unseen.
@@ -43,7 +44,7 @@ HEADER = [TEST, CH, SC]
 RISE = 'return estopArmed && source == EStopLatchSource::Button;'
 LOCK = 'return anyCapSet || source == EStopLatchSource::Button || source == EStopLatchSource::Gateway || source == EStopLatchSource::Unconfirmed;'
 WARM = '    case ESP_RST_SW:\n'
-HOLD = 'if (clearPress && btnSolid) {'
+RESERVED = 'return pin == 0 || pin == 2 || pin == 5 || pin == 12 || pin == 15 || (pin >= 6 && pin <= 11);'
 GATE = 'if (EStopManager::IsEStopped() && triggerType != TriggerType::EmergencyStop) {'
 
 # Name, file, text to replace, replacement, units to rebuild. An empty unit list means the test reads the file itself.
@@ -65,7 +66,7 @@ MUTANTS = [
   ('K15 SetRfTxPin skips the rule', CH, 'if (Softproxy::TxPinConflicts(txPin, estopPin, EStopManager::GetRunningPin())) {', 'if (false) {', [CH]),
   ('K16 boot skips the tx rule', CH, 'if (Softproxy::TxPinConflicts(txPin, estopConfig.gpioPin, EStopManager::GetRunningPin())) {', 'if (false) {', [CH]),
   ('K17 estop pin skips the conflict check', ES, 'if (Softproxy::EStopPinConflicts(pin, txPin)) {', 'if (false) {', [TEST]),
-  ('K18 held button counts as a new press', ES, 'bool lastBtnState = startedEngaged;', 'bool lastBtnState = false;', [TEST]),
+  ('K18 history starts as stop, so a warm restart engages', ES, 'uint16_t history = 0;', 'uint16_t history = 0xFFFF;', [TEST]),
   ('K19 stale sample still armed', ES, '<= k_estopSampleStaleTime;', '<= 0xFFFFFFFFu;', [TEST]),
   ('K20 start with no valid pin', ES, 'if (!OpenShock::IsValidInputPin(s_estopPin)) {\n      OS_LOGE(TAG, "Refusing to start', 'if (false) {\n      OS_LOGE(TAG, "Refusing to start', [TEST]),
   ('K21 engaged refusal not recorded', CH, 'Softproxy::SafetyCaps::RecordRefusal(type, Softproxy::Verdict::EStopEngaged);', '', [CH]),
@@ -86,13 +87,13 @@ MUTANTS = [
   ('K36 gateway counts as a press', KP, RISE, 'return estopArmed && (source == EStopLatchSource::Button || source == EStopLatchSource::Gateway);', HEADER),
   ('K37 cold boot counts as a press', KP, RISE, 'return estopArmed && (source == EStopLatchSource::Button || source == EStopLatchSource::ColdBoot);', HEADER),
   ('K38 Trigger records a button', ES, '  estopmanager_engage(Softproxy::EStopLatchSource::Gateway);\n\n  OpenShock::ScopedLock', '  estopmanager_engage(Softproxy::EStopLatchSource::Button);\n\n  OpenShock::ScopedLock', [TEST]),
-  ('K39 raced trigger records a button', ES, '      estopmanager_engage(Softproxy::EStopLatchSource::Gateway);\n      state        = EStopState::Active;', '      estopmanager_engage(Softproxy::EStopLatchSource::Button);\n      state        = EStopState::Active;', [TEST]),
+  ('K39 raced trigger records a button', ES, '      estopmanager_engage(Softproxy::EStopLatchSource::Gateway);\n      state   = EStopState::Active;', '      estopmanager_engage(Softproxy::EStopLatchSource::Button);\n      state   = EStopState::Active;', [TEST]),
   ('K40 cold boot starts released', ES, 'auto source = Softproxy::EStopLatchSource::ColdBoot;', 'auto source = Softproxy::EStopLatchSource::Released;', [TEST]),
   ('K41 restart reads every latch as a press', KP, '        source = candidate;\n', '        source = candidate == EStopLatchSource::Released ? candidate : EStopLatchSource::Button;\n', HEADER),
   ('K42 lock skips the gateway latch', KP, LOCK, 'return anyCapSet || source == EStopLatchSource::Button || source == EStopLatchSource::Unconfirmed;', HEADER),
   ('K43 lock skips the button latch', KP, LOCK, 'return anyCapSet || source == EStopLatchSource::Gateway || source == EStopLatchSource::Unconfirmed;', HEADER),
   ('K44 lock takes the cold boot latch, so a fresh hub gets no pin', KP, LOCK, 'return anyCapSet || source != EStopLatchSource::Released;', HEADER),
-  ('K45 a press during a held latch counts as a button', ES, '          state         = EStopState::ActiveClearing;\n', '          state         = EStopState::ActiveClearing;\n          s_latch.store(Softproxy::EStopLatchSource::Button);\n', [TEST]),
+  ('K45 a clear under way records a button', ES, '          state    = EStopState::ActiveClearing;\n', '          state    = EStopState::ActiveClearing;\n          s_latch.store(Softproxy::EStopLatchSource::Button);\n', [TEST]),
   ('K46 engage restates the source', ES, '  if (s_latch.load() == Softproxy::EStopLatchSource::Released) {\n    estopmanager_writelatch(source);\n  }', '  estopmanager_writelatch(source);', [TEST]),
   ('K47 latch not sealed on engage', ES, '  s_latch.store(source);\n  Softproxy::SealEStop(s_retainedLatch, source);', '  s_latch.store(source);\n  if (source == Softproxy::EStopLatchSource::Released) Softproxy::SealEStop(s_retainedLatch, source);', [TEST]),
   ('K48 shorter join window is no rise', KP, 'to.stageJoinMs != from.stageJoinMs', 'to.stageJoinMs > from.stageJoinMs', HEADER),
@@ -104,25 +105,40 @@ MUTANTS = [
   ('K54 unknown reasons count as warm', ES, '    default:\n      return false;\n  }\n}\n\nstatic const char* estopmanager_statename', '    default:\n      return true;\n  }\n}\n\nstatic const char* estopmanager_statename', [TEST]),
   ('K55 panic drops off the warm list', ES, '    case ESP_RST_PANIC:\n', '', [TEST]),
   ('K56 Set passes armed true at the call site', SC, 'CapRiseAllowed(EStopManager::IsArmed(), EStopManager::GetLatchSource())', 'CapRiseAllowed(true, EStopManager::GetLatchSource())', [SC]),
-  ('K57 one low sample records a button', ES, 'estopmanager_engage(Softproxy::EStopLatchSource::Unconfirmed);', 'estopmanager_engage(Softproxy::EStopLatchSource::Button);', [TEST]),
-  ('K58 confirm needs no full window', ES, 'if (confirming && btnSolid) {', 'if (confirming) {', [TEST]),
-  ('K59 a later press confirms a glitch', ES, '      clearPress = false;\n      confirming = false;\n    } else if', '      clearPress = false;\n    } else if', [TEST]),
-  ('K61 noise keeps the hold running', ES, 'if (!btnSolid) {  // released or noisy', 'if (!btnState) {  // released or noisy', [TEST]),
-  ('K62 hold starts on the edge only', ES, HOLD, 'if (pressedEdge) {', [TEST]),
-  ('K63 hold needs no new press', ES, HOLD, 'if (btnSolid) {', [TEST]),
-  ('K64 engaging press counts toward the clear', ES, '          clearPress = false;\n          confirming = sawRelease;', '          confirming = sawRelease;', [TEST]),
+  ('K57 one high sample records a button', ES, 'estopmanager_engage(Softproxy::EStopLatchSource::Unconfirmed);', 'estopmanager_engage(Softproxy::EStopLatchSource::Button);', [TEST]),
+  ('K58 confirm needs no full window', ES, 'if (confirming && solidStop) {', 'if (confirming) {', [TEST]),
+  ('K59 a later press confirms a glitch', ES, '    if (!stopSeen) {\n      confirming = false;\n    }\n', '', [TEST]),
+  ('K61 one high sample keeps the clear running', ES, '        if (stopSeen) {\n          state = EStopState::Active;\n        } else if (now >= clearsAt) {', '        if (solidStop) {\n          state = EStopState::Active;\n        } else if (now >= clearsAt) {', [TEST]),
+  ('K62 a push never stops the clear', ES, '        if (stopSeen) {\n          state = EStopState::Active;\n        } else if (now >= clearsAt) {', '        if (false) {\n          state = EStopState::Active;\n        } else if (now >= clearsAt) {', [TEST]),
+  ('K63 clear needs no measured down', ES, '} else if (sawDown && solidRun) {', '} else if (solidRun) {', [TEST]),
+  ('K64 clear skips the clear time', ES, '} else if (now >= clearsAt) {', '} else {', [TEST]),
   ('K65 engaged hub drops a gateway stop', TR, ' && triggerType != TriggerType::EmergencyStop', '', [TR]),
-  ('K67 gateway stop keeps the press under way', ES, '      clearPress   = false;  // Stops a hold-to-clear in progress. The next one needs a new press.\n', '', [TEST]),
+  ('K67 gateway stop keeps the measured down', ES, '      sawDown = false;  // Stops a clear in progress. The next clear needs the mushroom measured down again.\n', '', [TEST]),
   ('K68 Idle ignores the stored keep-alive', CH, 'if (keepAlive && !Config::GetRFConfigKeepAliveEnabled(keepAlive)) {', 'if (false) {', [CH]),
   ('K69 lock skips an unconfirmed latch', KP, LOCK, 'return anyCapSet || source == EStopLatchSource::Button || source == EStopLatchSource::Gateway;', HEADER),
   ('K70 unconfirmed allows a rise', KP, RISE, 'return estopArmed && (source == EStopLatchSource::Button || source == EStopLatchSource::Unconfirmed);', HEADER),
   ('K71 restore drops an unconfirmed latch', KP, ', EStopLatchSource::Unconfirmed}) {', '}) {', HEADER),
-  ('K72 a low pin at task start confirms', ES, 'confirming = sawRelease;', 'confirming = true;', [TEST]),
-  ('K73 the unmeasured start counts as a release', ES, 'sawRelease || (!btnState && samplesRead == k_estopCheckCount)', 'sawRelease || !btnState', [TEST]),
-  ('K74 an edge needs no measured release', ES, '(btnState && !lastBtnState && sawRelease)', '(btnState && !lastBtnState)', [TEST]),
+  ('K72 an open pin at task start confirms', ES, 'confirming = sawRun;', 'confirming = true;', [TEST]),
+  ('K73 the unmeasured start counts as a run', ES, 'bool solidRun         = window == 0 && samplesRead == k_estopCheckCount;', 'bool solidRun         = window == 0;', [TEST]),
+  ('K74 a confirmed press needs no measured run', ES, 'sawRun                = sawRun || solidRun;', 'sawRun                = true;', [TEST]),
   ('K75 terminators forced only on the change', RF, '    wasEstopped     = isEstopped;\n\n    if (isEstopped) {', '    const bool changed = isEstopped != wasEstopped;\n    wasEstopped     = isEstopped;\n\n    if (isEstopped && changed) {', [RF]),
   ('K76 a forced end restarts a running terminator', RF, 'if (seq->transmitEnd() > now) {', 'if (true) {', [RF]),
   ('K77 GPIO 10 stays on the safe list', CHIPSET, '(pin) == GPIO_NUM_9 || (pin) == GPIO_NUM_10 \\\n   || (pin) == GPIO_NUM_11', '(pin) == GPIO_NUM_9 \\\n   || (pin) == GPIO_NUM_11', []),
+  ('K79 the contact reads as normally open', ES, '== k_estopRunLevel ? 0 : 1;', '== k_estopRunLevel ? 1 : 0;', [TEST]),
+  ('K80 one high sample engages nothing', ES, '        // A high level at any time engages. There is no rearm window.\n        if (stopSeen) {', '        // A high level at any time engages. There is no rearm window.\n        if (solidStop) {', [TEST]),
+  ('K81 one high sample counts as the mushroom down', ES, 'bool solidStop        = window == k_estopCheckMask;', 'bool solidStop        = window != 0;', [TEST]),
+  ('K82 release keeps the measured down', ES, '          sawDown = false;\n          estopmanager_release();', '          estopmanager_release();', [TEST]),
+  ('K84 estop rule skips the reserved pins', KP, ' || IsEStopReservedPin(estopPin)', '', HEADER),
+  ('K85 reserved pins only off a plain ESP32', KP, '    if (!kChipIsEsp32) {\n      return false;', '    if (kChipIsEsp32) {\n      return false;', HEADER),
+  ('K86 GPIO 0 allowed', KP, RESERVED, RESERVED.replace('pin == 0 || ', ''), HEADER),
+  ('K87 GPIO 2 allowed', KP, RESERVED, RESERVED.replace('pin == 2 || ', ''), HEADER),
+  ('K88 GPIO 5 allowed', KP, RESERVED, RESERVED.replace('pin == 5 || ', ''), HEADER),
+  ('K89 GPIO 12 allowed', KP, RESERVED, RESERVED.replace('pin == 12 || ', ''), HEADER),
+  ('K90 GPIO 15 allowed', KP, RESERVED, RESERVED.replace('pin == 15 || ', ''), HEADER),
+  ('K91 flash pins allowed', KP, RESERVED, RESERVED.replace(' || (pin >= 6 && pin <= 11)', ''), HEADER),
+  ('K92 GPIO 6 allowed', KP, RESERVED, RESERVED.replace('pin >= 6 &&', 'pin >= 7 &&'), HEADER),
+  ('K93 GPIO 11 allowed', KP, RESERVED, RESERVED.replace('pin <= 11', 'pin <= 10'), HEADER),
+  ('K94 the pull-up comes off the E-Stop pin', ES, '.pull_up_en   = GPIO_PULLUP_ENABLE,', '.pull_up_en   = GPIO_PULLUP_DISABLE,', [TEST]),
   ('K78 boot never starts the keep-alive', CH, 'if (rfConfig.keepAliveEnabled && !EStopManager::IsEStopped()) {', 'if (false) {', [CH]),
   ('R4 RF task stops discarding while engaged', RF, 'if (OpenShock::EStopManager::IsEStopped()) {\n        // Immediately', 'if (false) {\n        // Immediately', [RF]),
   ('R4b RF task adds what it should discard', RF, '        // Discard next item in queue\n        continue;\n', '', [RF]),
@@ -141,7 +157,6 @@ def parse_args():
   parser.add_argument('--work', default='.pio/kill-path-mutants', help='work directory, outside the tracked tree')
   parser.add_argument('--flatbuffers', default='.pio/libdeps/Pishock-2023/flatbuffers/include', help='flatbuffers include directory')
   parser.add_argument('--tx', type=int, default=12, help='RF TX pin to build for')
-  parser.add_argument('--max-load5', type=float, default=0, help='stop when the 5 minute load reaches this, 0 for no limit')
   return parser.parse_args()
 
 
@@ -170,11 +185,6 @@ class Run:
     failed = [line.split(': ', 1)[1] for line in result.stdout.splitlines() if line.startswith('scenario failed')]
     return ('green' if result.returncode == 0 else 'red'), (', '.join(failed)[:200] or 'rc=%d' % result.returncode)
 
-  def stop_for_load(self):
-    if self.args.max_load5 and os.getloadavg()[1] >= self.args.max_load5:
-      print('stopped: 5 minute load at or above %s, run it again' % self.args.max_load5)
-      sys.exit(75)
-
   def tree_stamp(self):
     digest = hashlib.sha256()
     for path in sorted({TEST, CONFIG, CHIPSET, KP, ES, SERIAL_CAPS, *UNITS}):
@@ -202,7 +212,6 @@ class Run:
       shutil.copytree(directory, os.path.join(self.work, directory), symlinks=True)
     shutil.copytree(self.args.flatbuffers, os.path.join(self.work, 'flatbuffers'))
     for unit in UNITS:
-      self.stop_for_load()
       result = self.compile(unit)
       if result.returncode:
         print('control does not compile: %s\n%s' % (unit, result.stderr[:1500]))
@@ -264,7 +273,6 @@ def main():
       print('stopped: budget reached, run it again')
       stopped = True
       break
-    run.stop_for_load()
     state, detail = run.mutate(mutant)
     results[name] = [state, detail]
     run.save(results)
