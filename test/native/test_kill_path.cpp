@@ -710,7 +710,7 @@ static void latchSurvivesWarmRestart()
 }
 
 // SP-158: a cold boot refuses every command, Stop included, until the hold-to-clear. Nothing else releases it, so a
-// power cycle with nobody at the hub leaves every wake refused.
+// power cycle with nobody at the hub leaves every command refused until the operator clears it by hand.
 static void coldBootStartsEngaged()
 {
   // No pin stored: nothing can clear it, and no command reaches the radio.
@@ -741,7 +741,7 @@ static void coldBootStartsEngaged()
   CHECK(lastRefusalIs(Verdict::EStopEngaged));
   CHECK(s_air.empty());
 
-  // The caps keep the settings locked through the power cycle. The hold-to-clear is what brings wakes back.
+  // The caps keep the settings locked through the power cycle. The hold-to-clear is what brings commands back.
   CHECK(!EStopManager::SetEStopPin(static_cast<gpio_num_t>(14)));
   CHECK(!EStopManager::SetEStopEnabled(false));
   holdToClear();
