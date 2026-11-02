@@ -297,6 +297,7 @@ namespace OpenShock {
       gpio_num_t gpioPin;
     };
     bool GetRFConfig(RFConfig& out);
+    bool GetRFConfigKeepAliveEnabled(bool& out);
     bool GetRFConfigTxPin(gpio_num_t& out);
     bool SetRFConfigTxPin(gpio_num_t txPin);
     bool SetRFConfigKeepAliveEnabled(bool enabled);
@@ -527,4 +528,22 @@ extern int g_restarts;
 inline void esp_restart()
 {
   ++g_restarts;
+}
+enum esp_reset_reason_t {
+  ESP_RST_UNKNOWN,
+  ESP_RST_POWERON,
+  ESP_RST_EXT,
+  ESP_RST_SW,
+  ESP_RST_PANIC,
+  ESP_RST_INT_WDT,
+  ESP_RST_TASK_WDT,
+  ESP_RST_WDT,
+  ESP_RST_DEEPSLEEP,
+  ESP_RST_BROWNOUT,
+  ESP_RST_SDIO,
+};
+inline esp_reset_reason_t g_resetReason = ESP_RST_POWERON;
+inline esp_reset_reason_t esp_reset_reason()
+{
+  return g_resetReason;
 }

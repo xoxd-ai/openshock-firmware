@@ -112,6 +112,11 @@ bool Config::SetRFConfigTxPin(gpio_num_t txPin)
   ++s_configTxPinWrites;
   return true;
 }
+bool Config::GetRFConfigKeepAliveEnabled(bool& out)
+{
+  out = false;
+  return true;
+}
 bool Config::SetRFConfigKeepAliveEnabled(bool)
 {
   return true;

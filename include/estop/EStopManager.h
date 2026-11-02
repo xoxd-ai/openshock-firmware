@@ -22,10 +22,12 @@ namespace OpenShock::EStopManager {
   gpio_num_t GetRunningPin();
 
   /// What set the latch, or `Released`. The first source holds until the hold-to-clear: a later press or `Trigger` does
-  /// not restate it. A rise needs `Button` (SP-156).
+  /// not restate it. The one change is `Unconfirmed` to `Button`, when a press that follows a measured release turns
+  /// solid. A rise needs `Button` (SP-156).
   Softproxy::EStopLatchSource GetLatchSource();
 
-  /// Engages the E-Stop at once, with or without a checker task. Only the hold-to-clear releases it, so with no task it
-  /// holds until a power cycle swaps it for the cold boot latch, which stays engaged.
+  /// Engages the E-Stop at once, with or without a checker task, and stops a hold-to-clear in progress. Only the
+  /// hold-to-clear releases it. On a hub with no task and no stored pin nothing can run that, so it holds until a power
+  /// cycle swaps it for the cold boot latch, which stays engaged. With a stored pin `estop enabled true` starts the task.
   void Trigger();
 }  // namespace OpenShock::EStopManager

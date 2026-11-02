@@ -2,9 +2,9 @@
 // can wipe that file's RAM state as a restart would and leave the retained latch in place. It links the real
 // `HandleCommand`, `SafetyCaps`, `RFTransmitter` and its encoders, the real serial `estop`, `rftxpin` and `safetycaps`
 // commands, the real gateway `Trigger` and the real `WebSocketDeFragger`. Fakes: GPIO, RMT, the `Config` store, NVS,
-// FreeRTOS, the number parser in `Convert` and `Chipset`, whose pin checks accept 0 to 39 instead of the board's own
-// unsafe and bypassed pins. src/serial/command_handlers/safetycaps.cpp is compiled in here too,
-// because its handlers are static.
+// FreeRTOS, the reset reason, the number parser in `Convert` and `Chipset`, whose pin checks accept 0 to 39 instead of
+// the board's own unsafe and bypassed pins. src/serial/command_handlers/safetycaps.cpp is compiled in here too, because
+// its handlers are static.
 //
 // The FreeRTOS fake runs each task on its own thread with one thread awake at a time, and `advance` steps every task
 // in 5 millisecond ticks, so a run is deterministic. The E-Stop checker runs its real loop with its real local state.
@@ -34,6 +34,7 @@
 
 #include "CommandHandler.h"
 #include "message_handlers/impl/WSGateway.h"
+#include "radio/RFTransmitter.h"
 #include "radio/rmt/Sequence.h"
 #include "softproxy/Lockout.h"
 #include "softproxy/SafetyCaps.h"
@@ -52,7 +53,11 @@
 #include <iterator>
 #include <map>
 #include <mutex>
+#include <random>
+#include <sys/wait.h>
 #include <thread>
+#include <unistd.h>
+#include <utility>
 #include <vector>
 
 namespace GatewaySchema = OpenShock::Serialization::Gateway;
@@ -197,9 +202,16 @@ BaseType_t TaskUtils::TaskCreateUniversal(TaskFunction_t fn, const char*, uint32
   *out = startTask(fn, arg);
   return pdPASS;
 }
-BaseType_t TaskUtils::TaskCreateExpensive(TaskFunction_t fn, const char*, uint32_t, void* arg, UBaseType_t, TaskHandle_t* out)
+// The keep-alive task and each `RFTransmitter` start here.
+static int s_keepAliveStarts        = 0;
+static TaskHandle_t s_keepAliveTask = nullptr;
+BaseType_t TaskUtils::TaskCreateExpensive(TaskFunction_t fn, const char* name, uint32_t, void* arg, UBaseType_t, TaskHandle_t* out)
 {
   *out = startTask(fn, arg);
+  if (std::string_view(name) == "KeepAliveTask") {
+    ++s_keepAliveStarts;
+    s_keepAliveTask = *out;
+  }
   return pdPASS;
 }
 void vTaskDelay(TickType_t)
@@ -224,6 +236,9 @@ eTaskState eTaskGetState(TaskHandle_t handle)
 {
   return std::find(s_tasks.begin(), s_tasks.end(), handle) == s_tasks.end() ? eDeleted : eRunning;
 }
+// Runs once when a task finds its queue empty with no wait: for the transmit task, the point after a pop and before
+// it reads the E-Stop for that pass.
+static std::function<void()> s_onQueueDrained;
 QueueHandle_t xQueueCreate(int, std::size_t itemSize)
 {
   return new HostQueue {itemSize, {}};
@@ -244,6 +259,9 @@ BaseType_t xQueueReceive(QueueHandle_t queue, void* out, TickType_t wait)
   auto* q = static_cast<HostQueue*>(queue);
   while (q->items.empty()) {
     if (wait == 0 || t_self == nullptr) {
+      if (s_onQueueDrained) {
+        std::exchange(s_onQueueDrained, nullptr)();
+      }
       return 0;
     }
     hostYield();
@@ -327,9 +345,15 @@ esp_err_t esp_event_post(esp_event_base_t base, int32_t id, const void* data, st
 static bool s_cfgEnabled   = false;
 static gpio_num_t s_cfgPin = GPIO_NUM_NC;
 static gpio_num_t s_cfgTx  = static_cast<gpio_num_t>(OPENSHOCK_RF_TX_GPIO);
+static bool s_cfgKeepAlive = false;
 bool Config::GetRFConfig(Config::RFConfig& out)
 {
-  out = {.txPin = s_cfgTx, .keepAliveEnabled = false};
+  out = {.txPin = s_cfgTx, .keepAliveEnabled = s_cfgKeepAlive};
+  return true;
+}
+bool Config::GetRFConfigKeepAliveEnabled(bool& out)
+{
+  out = s_cfgKeepAlive;
   return true;
 }
 bool Config::GetRFConfigTxPin(gpio_num_t& out)
@@ -371,8 +395,10 @@ bool Config::SetEStopGpioPin(gpio_num_t pin)
   s_cfgPin = pin;
   return true;
 }
+static int s_portalCalls = 0;
 void CaptivePortal::SetAlwaysEnabled(bool)
 {
+  ++s_portalCalls;
 }
 
 static int s_failures = 0;
@@ -411,8 +437,8 @@ static ChannelCaps highCaps()
   return c;
 }
 
-// Everything a restart wipes: this file's RAM state. `s_retainedLatch` survives it, and a cold boot fills it with noise.
-static void restartEStopManager(bool coldBoot)
+// Everything a boot wipes: this file's RAM state. `s_retainedLatch` stays unless `loseRetained` fills it with noise.
+static void bootEStopManager(esp_reset_reason_t reason, bool loseRetained)
 {
   if (s_estopTask != nullptr) {
     vTaskDelete(s_estopTask);
@@ -425,10 +451,17 @@ static void restartEStopManager(bool coldBoot)
   s_lastSampleMs        = 0;
   s_externallyTriggered = false;
   s_estopInitialized    = false;
-  if (coldBoot) {
+  g_resetReason         = reason;
+  if (loseRetained) {
     std::memset(static_cast<void*>(&s_retainedLatch), 0xA5, sizeof(s_retainedLatch));
   }
   CHECK(EStopManager::Init());
+}
+
+// A software restart, or a power cycle that loses RTC memory.
+static void restartEStopManager(bool coldBoot)
+{
+  bootEStopManager(coldBoot ? ESP_RST_POWERON : ESP_RST_SW, coldBoot);
 }
 
 // A clean hub: cold boot, nothing wired, caps cleared. It starts engaged with source cold-boot (SP-158).
@@ -440,6 +473,7 @@ static void freshHub(bool enabled = false, gpio_num_t pin = GPIO_NUM_NC)
   s_cfgEnabled   = enabled;
   s_cfgPin       = pin;
   s_cfgTx        = static_cast<gpio_num_t>(OPENSHOCK_RF_TX_GPIO);
+  s_cfgKeepAlive = false;
   (void)SafetyCaps::Clear();
   restartEStopManager(true);
   CHECK(CommandHandler::Init());
@@ -465,13 +499,13 @@ static void releaseButton(gpio_num_t pin = kButton)
 // Holds the button until the E-Stop is released, the only way that releases it. The press first needs a release,
 // since a held button is no new press. The last wait outlasts the 65 millisecond debounce and the 250 millisecond
 // rearm window, which starts when the debounced release clears the E-Stop.
-static void holdToClear()
+static void holdToClear(gpio_num_t pin = kButton)
 {
-  releaseButton();
+  releaseButton(pin);
   advance(100);
-  pressButton();
+  pressButton(pin);
   advance(5100);
-  releaseButton();
+  releaseButton(pin);
   advance(350);
 }
 
@@ -499,12 +533,15 @@ static void releasedHubWithNoTask()
   s_published.clear();
 }
 
-static void engageByButton()
+// A real press: one low sample engages, and the press lasts past the 65 millisecond window that confirms it. The task
+// must have read a full window of the released pin first.
+static void engageByButton(gpio_num_t pin = kButton)
 {
-  pressButton();
+  pressButton(pin);
   advance(20);
   CHECK(EStopManager::IsEStopped());
-  releaseButton();
+  advance(80);
+  releaseButton(pin);
   advance(100);
 }
 
@@ -657,7 +694,13 @@ static void gatewayTriggerLatchesWithTask()
 static void holdToClearNeedsTheFullHold()
 {
   armedHub();
-  engageByButton();
+
+  // The press that engaged is no clear, however long it stays down.
+  pressButton();
+  advance(6000);
+  releaseButton();
+  advance(400);
+  CHECK(EStopManager::IsEStopped());
 
   // Staying pressed from the engaging press clears nothing.
   pressButton();
@@ -852,8 +895,54 @@ static void latchKeepsItsFirstSource()
   CHECK(EStopManager::GetLatchSource() == EStopLatchSource::Gateway);
 }
 
+// A gateway stop reaches a hold-to-clear in progress, so the hub does not release after it. A press under way then
+// counts for nothing and the hold needs a new press. The other triggers stay ignored while engaged.
+static void emergencyStopInterruptsAClear()
+{
+  armedHub();
+  engageByButton();
+
+  // During the hold.
+  pressButton();
+  advance(1000);
+  sendTrigger(GatewaySchema::TriggerType::EmergencyStop);
+  advance(5200);
+  releaseButton();
+  advance(400);
+  CHECK(EStopManager::IsEStopped());
+  CHECK(EStopManager::GetLatchSource() == EStopLatchSource::Button);
+
+  // After the hold, waiting for the release.
+  pressButton();
+  advance(5100);
+  sendTrigger(GatewaySchema::TriggerType::EmergencyStop);
+  advance(20);
+  releaseButton();
+  advance(400);
+  CHECK(EStopManager::IsEStopped());
+
+  // The same holds on the cold boot latch.
+  freshHub(true, kButton);
+  pressButton();
+  advance(1000);
+  sendTrigger(GatewaySchema::TriggerType::EmergencyStop);
+  advance(5200);
+  releaseButton();
+  advance(400);
+  CHECK(EStopManager::GetLatchSource() == EStopLatchSource::ColdBoot);
+
+  const int portalCalls = s_portalCalls;
+  sendTrigger(GatewaySchema::TriggerType::CaptivePortalDisable);
+  CHECK(s_portalCalls == portalCalls);
+
+  // A new press still clears.
+  holdToClear();
+  CHECK(!EStopManager::IsEStopped());
+}
+
 // The source survives a warm restart, so a restart neither grants nor loses the rise. The settings stay locked through
 // it, because a retained `Button` latch on a pin moved after the restart would allow a rise on an unproved pin.
+// `factoryreset` is the exception: see buttonLatchWithADeadCheckerAllowsNoRise.
 static void sourceSurvivesWarmRestart()
 {
   armedHub();
@@ -872,9 +961,428 @@ static void sourceSurvivesWarmRestart()
   CHECK(!EStopManager::SetEStopEnabled(false));
 }
 
+// Finding: the seal alone decided a warm restart, so a power loss that kept RTC memory came back released, as a brownout,
+// a short supply dropout or an EN reset can. A valid record counts only after an allow-listed reset.
+static void onlyAnAllowedResetKeepsTheLatch()
+{
+  armedHub();
+  for (esp_reset_reason_t reason : {ESP_RST_POWERON, ESP_RST_BROWNOUT, ESP_RST_EXT, ESP_RST_UNKNOWN, ESP_RST_DEEPSLEEP, ESP_RST_SDIO}) {
+    // A sealed `Released`.
+    CHECK(!EStopManager::IsEStopped());
+    bootEStopManager(reason, false);
+    advance(20);
+    CHECK(EStopManager::GetLatchSource() == EStopLatchSource::ColdBoot);
+    CHECK(!CommandHandler::HandleCommand(kModel, 7, ShockerCommandType::Stop, 0, 50));
+    CHECK(lastRefusalIs(Verdict::EStopEngaged));
+    holdToClear();
+
+    // A sealed `Button`, which must not carry its rise across a power loss.
+    engageByButton();
+    CHECK(EStopManager::GetLatchSource() == EStopLatchSource::Button);
+    bootEStopManager(reason, false);
+    advance(20);
+    CHECK(EStopManager::GetLatchSource() == EStopLatchSource::ColdBoot);
+    CHECK(SafetyCaps::Set(ShockerCommandType::Vibrate, lowCaps()) == SetResult::NeedsEngagedEStop);
+    holdToClear();
+  }
+
+  for (esp_reset_reason_t reason : {ESP_RST_SW, ESP_RST_PANIC, ESP_RST_INT_WDT, ESP_RST_TASK_WDT, ESP_RST_WDT}) {
+    CHECK(!EStopManager::IsEStopped());
+    bootEStopManager(reason, false);
+    advance(100);
+    CHECK(!EStopManager::IsEStopped());
+    engageByButton();
+    bootEStopManager(reason, false);
+    advance(20);
+    CHECK(EStopManager::GetLatchSource() == EStopLatchSource::Button);
+    holdToClear();
+  }
+}
+
+// The armed half of the rise rule through the real `Set`: a button latch with no live checker behind it allows no rise.
+static void buttonLatchWithADeadCheckerAllowsNoRise()
+{
+  // The checker stalls.
+  armedHub();
+  engageByButton();
+  s_stallChecker = true;
+  advance(k_estopSampleStaleTime + 50);
+  CHECK(!EStopManager::IsArmed());
+  CHECK(EStopManager::GetLatchSource() == EStopLatchSource::Button);
+  CHECK(SafetyCaps::Set(ShockerCommandType::Vibrate, lowCaps()) == SetResult::NeedsEngagedEStop);
+  g_serialOut.clear();
+  _handleSafetyCapsVibrateCommand("10 100 1 2 10 20"sv, false);
+  CHECK(g_serialOut.find("Refused (raising a cap needs the E-Stop armed and engaged") != std::string::npos);
+  CHECK(!SafetyCaps::AnySet());
+  s_stallChecker = false;
+  advance(20);
+  CHECK(EStopManager::IsArmed());
+  CHECK(SafetyCaps::Set(ShockerCommandType::Vibrate, lowCaps()) == SetResult::Stored);
+  (void)SafetyCaps::Clear();
+
+  // `factoryreset` writes the default config with no lock check, and a retained latch survives it. The hub comes back
+  // with a button latch and no task, so it fails closed: no rise, the settings stay locked, and a power cycle ends it.
+  s_cfgEnabled = false;
+  s_cfgPin     = GPIO_NUM_NC;
+  restartEStopManager(false);
+  advance(20);
+  CHECK(s_estopTask == nullptr);
+  CHECK(!EStopManager::IsArmed());
+  CHECK(EStopManager::GetLatchSource() == EStopLatchSource::Button);
+  CHECK(SafetyCaps::Set(ShockerCommandType::Vibrate, lowCaps()) == SetResult::NeedsEngagedEStop);
+  CHECK(!SafetyCaps::AnySet());
+  CHECK(!EStopManager::SetEStopPin(kButton));
+  restartEStopManager(true);
+  CHECK(EStopManager::GetLatchSource() == EStopLatchSource::ColdBoot);
+  CHECK(EStopManager::SetEStopPin(kButton));
+}
+
+// One low sample engages, which is the safe side, but it can be noise on the line. It proves no press (SP-156).
+static void oneLowSampleProvesNoPress()
+{
+  armedHub();
+  pressButton();
+  advance(5);
+  releaseButton();
+  advance(200);
+  CHECK(EStopManager::IsEStopped());
+  CHECK(EStopManager::GetLatchSource() == EStopLatchSource::Unconfirmed);
+  CHECK(SafetyCaps::Set(ShockerCommandType::Vibrate, lowCaps()) == SetResult::NeedsEngagedEStop);
+  CHECK(!EStopManager::SetEStopPin(static_cast<gpio_num_t>(14)));
+  CHECK(!EStopManager::SetEStopEnabled(false));
+  CHECK(!CommandHandler::HandleCommand(kModel, 7, ShockerCommandType::Stop, 0, 50));
+
+  // A warm restart keeps it, and a press during the held latch restates nothing.
+  restartEStopManager(false);
+  advance(20);
+  CHECK(EStopManager::GetLatchSource() == EStopLatchSource::Unconfirmed);
+  engageByButton();
+  CHECK(EStopManager::GetLatchSource() == EStopLatchSource::Unconfirmed);
+  CHECK(SafetyCaps::Set(ShockerCommandType::Vibrate, lowCaps()) == SetResult::NeedsEngagedEStop);
+  holdToClear();
+  CHECK(!EStopManager::IsEStopped());
+
+  // A real press reads as a button at the 13th low sample, and a press that bounces first does too.
+  pressButton();
+  advance(60);
+  CHECK(EStopManager::GetLatchSource() == EStopLatchSource::Unconfirmed);
+  advance(10);
+  CHECK(EStopManager::GetLatchSource() == EStopLatchSource::Button);
+  holdToClear();
+  pressButton();
+  advance(5);
+  releaseButton();
+  advance(5);
+  pressButton();
+  advance(100);
+  CHECK(EStopManager::GetLatchSource() == EStopLatchSource::Button);
+  holdToClear();
+}
+
+// A noisy line can hold the debounced state down for the whole hold. Only a solid press may run the hold-to-clear.
+static void pulseTrainClearsNothing()
+{
+  armedHub();
+  engageByButton();
+  CHECK(SafetyCaps::Set(ShockerCommandType::Vibrate, lowCaps()) == SetResult::Stored);
+
+  // A low sample in every window, for longer than the hold. The caps are set, so a release here would admit the next
+  // command with nobody at the button.
+  for (int i = 0; i < 100; ++i) {
+    pressButton();
+    advance(5);
+    releaseButton();
+    advance(55);
+  }
+  advance(400);
+  CHECK(EStopManager::IsEStopped());
+  CHECK(EStopManager::GetLatchSource() == EStopLatchSource::Button);
+  CHECK(!CommandHandler::HandleCommand(kModel, 7, ShockerCommandType::Vibrate, 1, 50));
+  CHECK(lastRefusalIs(Verdict::EStopEngaged));
+  (void)SafetyCaps::Clear();
+
+  // A solid start that turns noisy ends the hold, so the hub does not release on the end of the noise.
+  pressButton();
+  advance(100);
+  for (int i = 0; i < 100; ++i) {
+    releaseButton();
+    advance(5);
+    pressButton();
+    advance(55);
+  }
+  releaseButton();
+  advance(400);
+  CHECK(EStopManager::IsEStopped());
+
+  // A high sample in every window: mostly low, and still never a full window.
+  for (int i = 0; i < 100; ++i) {
+    pressButton();
+    advance(55);
+    releaseButton();
+    advance(5);
+  }
+  advance(400);
+  CHECK(EStopManager::IsEStopped());
+  holdToClear();
+  CHECK(!EStopManager::IsEStopped());
+
+  // The same train on a released hub engages, and it never reads as a button.
+  for (int i = 0; i < 100; ++i) {
+    pressButton();
+    advance(5);
+    releaseButton();
+    advance(55);
+  }
+  advance(400);
+  CHECK(EStopManager::GetLatchSource() == EStopLatchSource::Unconfirmed);
+  CHECK(SafetyCaps::Set(ShockerCommandType::Vibrate, lowCaps()) == SetResult::NeedsEngagedEStop);
+}
+
+// Contact bounce is not noise: a press that bounces still counts once, as a button, and a hold is timed from the solid
+// press. One high sample in the hold restarts it.
+static void bounceCountsAsOnePress()
+{
+  const auto bounce = [] {
+    for (int i = 0; i < 6; ++i) {
+      s_gpioLevel[kButton] = i % 2;
+      advance(5);
+    }
+  };
+
+  armedHub();
+  bounce();
+  pressButton();
+  advance(70);
+  CHECK(EStopManager::GetLatchSource() == EStopLatchSource::Button);
+  CHECK(s_published.size() == 1 && s_published.back() == EStopState::Active);
+  bounce();
+  releaseButton();
+  advance(100);
+  CHECK(EStopManager::GetLatchSource() == EStopLatchSource::Button);
+
+  // One high sample late in a hold costs the time already held.
+  pressButton();
+  advance(4900);
+  releaseButton();
+  advance(5);
+  pressButton();
+  advance(4900);
+  releaseButton();
+  advance(400);
+  CHECK(EStopManager::IsEStopped());
+
+  // Bounce at both ends of a full hold clears it once and starts no new engagement.
+  bounce();
+  pressButton();
+  advance(5200);
+  CHECK(EStopManager::IsEStopped());
+  bounce();
+  releaseButton();
+  advance(100);
+  CHECK(!EStopManager::IsEStopped());
+  bounce();
+  releaseButton();
+  advance(300);
+  CHECK(!EStopManager::IsEStopped());
+  CHECK(s_published.back() == EStopState::Idle);
+}
+
+// Random samples at each density, with a fixed seed. Nothing here is a held level, so a latch never releases, and a
+// released hub engages but never reads a press. A burst of 13 low samples would read as a press, which is why the
+// released part stops at 20 percent.
+static void noiseProvesNothing()
+{
+  std::mt19937 rng(7545);
+  const auto noise = [&](uint32_t lowPercent) {
+    for (int i = 0; i < 1200; ++i) {
+      s_gpioLevel[kButton] = rng() % 100 < lowPercent ? 0 : 1;
+      advance(5);
+    }
+    releaseButton();
+    advance(400);
+  };
+
+  armedHub();
+  engageByButton();
+  CHECK(SafetyCaps::Set(ShockerCommandType::Vibrate, lowCaps()) == SetResult::Stored);
+  for (uint32_t lowPercent : {1u, 5u, 20u, 50u, 80u, 95u}) {
+    noise(lowPercent);
+    CHECK(EStopManager::IsEStopped());
+    CHECK(EStopManager::GetLatchSource() == EStopLatchSource::Button);
+    CHECK(!CommandHandler::HandleCommand(kModel, 7, ShockerCommandType::Vibrate, 1, 50));
+  }
+  CHECK(SafetyCaps::Clear());
+
+  holdToClear();
+  for (uint32_t lowPercent : {5u, 20u}) {
+    CHECK(!EStopManager::IsEStopped());
+    noise(lowPercent);
+    CHECK(EStopManager::GetLatchSource() == EStopLatchSource::Unconfirmed);
+    CHECK(SafetyCaps::Set(ShockerCommandType::Vibrate, lowCaps()) == SetResult::NeedsEngagedEStop);
+    holdToClear();
+  }
+}
+
+// SP-156 with the E-Stop settings open, at released with every cap 0. A pin already low when the task starts shows no
+// edge, however long it stays low, so it engages and proves nothing.
+static void aLowPinProvesNoPress()
+{
+  const auto other = static_cast<gpio_num_t>(14);
+
+  // `estop pin` onto a low pin.
+  armedHub();
+  pressButton(other);
+  g_serialOut.clear();
+  _handleEStopPinCommand("14"sv, false);
+  CHECK(g_serialOut.find("Error|") == std::string::npos);
+  advance(200);
+  CHECK(EStopManager::IsEStopped());
+  CHECK(EStopManager::GetLatchSource() == EStopLatchSource::Unconfirmed);
+  CHECK(SafetyCaps::Set(ShockerCommandType::Vibrate, lowCaps()) == SetResult::NeedsEngagedEStop);
+  advance(6000);
+  CHECK(EStopManager::GetLatchSource() == EStopLatchSource::Unconfirmed);
+  CHECK(SafetyCaps::Set(ShockerCommandType::Vibrate, lowCaps()) == SetResult::NeedsEngagedEStop);
+
+  // The latch locks the settings. A pin strapped low never gives a clear, so a power cycle is the way out: the cold
+  // boot latch opens them again.
+  CHECK(!EStopManager::SetEStopPin(kButton));
+  restartEStopManager(true);
+  advance(200);
+  CHECK(EStopManager::GetLatchSource() == EStopLatchSource::ColdBoot);
+  CHECK(EStopManager::SetEStopPin(kButton));
+  releaseButton(other);
+
+  // `estop enabled true` onto a low pin. Letting go and pressing again restates nothing, and a rise then needs a clear
+  // and a new press.
+  armedHub();
+  CHECK(EStopManager::SetEStopEnabled(false));
+  pressButton();
+  CHECK(EStopManager::SetEStopEnabled(true));
+  advance(200);
+  CHECK(EStopManager::GetLatchSource() == EStopLatchSource::Unconfirmed);
+  releaseButton();
+  advance(100);
+  engageByButton();
+  CHECK(EStopManager::GetLatchSource() == EStopLatchSource::Unconfirmed);
+  holdToClear();
+  CHECK(!EStopManager::IsEStopped());
+  engageByButton();
+  CHECK(EStopManager::GetLatchSource() == EStopLatchSource::Button);
+  holdToClear();
+
+  // A warm restart of a released hub onto a pin held low.
+  pressButton();
+  restartEStopManager(false);
+  advance(200);
+  CHECK(EStopManager::GetLatchSource() == EStopLatchSource::Unconfirmed);
+  releaseButton();
+  advance(100);
+  holdToClear();
+
+  // A press before the task has read a full released window proves nothing. After one it does.
+  CHECK(EStopManager::SetEStopEnabled(false));
+  CHECK(EStopManager::SetEStopEnabled(true));
+  advance(30);
+  engageByButton();
+  CHECK(EStopManager::GetLatchSource() == EStopLatchSource::Unconfirmed);
+  holdToClear();
+  CHECK(EStopManager::SetEStopEnabled(false));
+  CHECK(EStopManager::SetEStopEnabled(true));
+  advance(100);
+  engageByButton();
+  CHECK(EStopManager::GetLatchSource() == EStopLatchSource::Button);
+  holdToClear();
+
+  // On a fresh hub the same rule guards the clear: a held level with no measured release before it releases nothing.
+  freshHub();
+  _handleEStopPinCommand("13"sv, false);
+  _handleEStopEnabledCommand("true"sv, false);
+  advance(30);
+  pressButton();
+  advance(5200);
+  releaseButton();
+  advance(400);
+  CHECK(EStopManager::GetLatchSource() == EStopLatchSource::ColdBoot);
+  CHECK(EStopManager::IsEStopped());
+}
+
+// Upstream enabled keep-alive on every Idle state, so a stored `false` came back after each clear.
+static void keepAliveFollowsTheStoredSetting()
+{
+  armedHub();
+  const int starts = s_keepAliveStarts;
+  engageByButton();
+  holdToClear();
+  CHECK(s_keepAliveStarts == starts);
+
+  s_cfgKeepAlive = true;
+  engageByButton();
+  CHECK(s_keepAliveStarts == starts);
+  holdToClear();
+  CHECK(s_keepAliveStarts == starts + 1);
+  CHECK(eTaskGetState(s_keepAliveTask) != eDeleted);
+
+  // An engaged E-Stop stops the task, whatever the setting.
+  engageByButton();
+  CHECK(eTaskGetState(s_keepAliveTask) == eDeleted);
+  s_cfgKeepAlive = false;
+  holdToClear();
+  CHECK(s_keepAliveStarts == starts + 1);
+}
+
+// `CommandHandler::Init` runs once in a process, so a boot scenario runs in a child forked before any task exists.
+static void inChildProcess(void (*scenario)())
+{
+  const pid_t child = fork();
+  if (child == 0) {
+    scenario();
+    std::_Exit(s_failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE);
+  }
+  int status = 0;
+  CHECK(child > 0 && waitpid(child, &status, 0) == child);
+  CHECK(WIFEXITED(status) && WEXITSTATUS(status) == EXIT_SUCCESS);
+}
+
+// A boot on an engaged latch starts no keep-alive, whatever the stored setting. The clear starts it.
+static void bootKeepAliveWaitsForTheClear()
+{
+  inChildProcess([] {
+    s_cfgEnabled   = true;
+    s_cfgPin       = kButton;
+    s_cfgKeepAlive = true;
+    restartEStopManager(true);
+    CHECK(EStopManager::IsEStopped());
+    CHECK(CommandHandler::Init());
+    CHECK(CommandHandler::Ok());
+    advance(50);
+    CHECK(s_keepAliveStarts == 0);
+    holdToClear();
+    CHECK(!EStopManager::IsEStopped());
+    CHECK(s_keepAliveStarts == 1);
+  });
+}
+
+// A warm restart that comes back released keeps the stored setting at boot.
+static void bootKeepAliveStartsWhenReleased()
+{
+  inChildProcess([] {
+    s_cfgEnabled   = true;
+    s_cfgPin       = kButton;
+    s_cfgKeepAlive = true;
+    restartEStopManager(true);
+    advance(50);
+    holdToClear();
+    CHECK(!EStopManager::IsEStopped());
+    restartEStopManager(false);
+    CHECK(!EStopManager::IsEStopped());
+    CHECK(CommandHandler::Init());
+    CHECK(s_keepAliveStarts == 1);
+  });
+}
+
 static void corruptLatchReadsAsColdBoot()
 {
-  const EStopLatchSource all[] = {EStopLatchSource::Released, EStopLatchSource::ColdBoot, EStopLatchSource::Gateway, EStopLatchSource::Button};
+  const EStopLatchSource all[] = {EStopLatchSource::Released, EStopLatchSource::ColdBoot, EStopLatchSource::Gateway, EStopLatchSource::Button, EStopLatchSource::Unconfirmed};
   RetainedEStop r {};
   EStopLatchSource source = EStopLatchSource::Released;
   for (EStopLatchSource value : all) {
@@ -893,6 +1401,14 @@ static void corruptLatchReadsAsColdBoot()
       r.check ^= 1u << bit;
       CHECK(!RestoreEStop(r, source));
     }
+  }
+
+  // A record of an older image is well formed under its own magic. Only the magic rejects it.
+  for (EStopLatchSource value : all) {
+    SealEStop(r, value);
+    r.magic = kRetainedEStopMagic - 1;
+    r.check = RetainedEStopCheck(r.magic, r.latch);
+    CHECK(!RestoreEStop(r, source));
   }
 
   // Corruption on a real boot reads as the cold boot case, which stays engaged, whatever the latch held before.
@@ -1011,6 +1527,14 @@ static void stalledCheckerIsNotArmed()
   s_stallChecker = false;
   advance(20);
   CHECK(EStopManager::IsArmed());
+
+  // A live task on a pin that is no valid input is not armed. No public path reaches this state, so the file's own
+  // variable sets it up.
+  const gpio_num_t pin = s_estopPin;
+  s_estopPin           = GPIO_NUM_NC;
+  CHECK(!EStopManager::IsArmed());
+  s_estopPin = pin;
+  CHECK(EStopManager::IsArmed());
   (void)SafetyCaps::Clear();
 }
 
@@ -1082,11 +1606,11 @@ static void capsRiseCoversEveryField()
   ChannelCaps joined = base;
   joined.stageJoinMs = 500;
   CHECK(CapsRise(joined, base));
-  for (EStopLatchSource source : {EStopLatchSource::Released, EStopLatchSource::ColdBoot, EStopLatchSource::Gateway, EStopLatchSource::Button}) {
+  for (EStopLatchSource source : {EStopLatchSource::Released, EStopLatchSource::ColdBoot, EStopLatchSource::Gateway, EStopLatchSource::Button, EStopLatchSource::Unconfirmed}) {
     CHECK(!CapRiseAllowed(false, source));
     CHECK(CapRiseAllowed(true, source) == (source == EStopLatchSource::Button));
     CHECK(EStopSettingsLocked(source, true));
-    CHECK(EStopSettingsLocked(source, false) == (source == EStopLatchSource::Button || source == EStopLatchSource::Gateway));
+    CHECK(EStopSettingsLocked(source, false) == (source == EStopLatchSource::Button || source == EStopLatchSource::Gateway || source == EStopLatchSource::Unconfirmed));
   }
 }
 
@@ -1279,6 +1803,17 @@ static void serialCapRiseNeedsTheEStop()
   _handleSafetyCapsClearCommand(""sv, false);
   CHECK(g_serialOut.find("Cleared caps") != std::string::npos);
   CHECK(!SafetyCaps::AnySet());
+}
+
+// The fake `Chipset` accepts 0 to 39, so a scan pins the real ESP32 list, which the PiShock envs compile.
+static void flashPinIsUnsafe()
+{
+  std::ifstream in("include/Chipset.h");
+  const std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+  const std::size_t begin = text.find("#ifdef OPENSHOCK_FW_CHIP_ESP32\n");
+  CHECK(begin != std::string::npos);
+  const std::string list = text.substr(begin, text.find("#endif", begin) - begin);
+  CHECK(list.find("(pin) == GPIO_NUM_10 ") != std::string::npos);
 }
 
 // `Config::SaveFromJSON`, `SetRaw` and `SaveFromFlatBuffer` are read here, not linked: src/config/Config.cpp needs the
@@ -1476,6 +2011,66 @@ static void gatewayTriggerEndsAPulseInFlightWithNoTask()
   (void)SafetyCaps::Clear();
 }
 
+// The last gate. `HandleCommand` refuses first, so only a command that got past it can reach this one. The queue has
+// no check of its own, and a transmitter of the test's own stands in for that race.
+static void radioDropsACommandQueuedWhileEngaged()
+{
+  armedHub();
+  engageByButton();
+  {
+    OpenShock::RFTransmitter radio(static_cast<gpio_num_t>(27));
+    CHECK(radio.ok());
+    s_air.clear();
+    for (int i = 0; i < 3; ++i) {
+      CHECK(radio.SendCommand(kModel, 7, ShockerCommandType::Vibrate, 20, 2000, false));
+      advance(50);
+    }
+    CHECK(s_air.empty());
+  }
+}
+
+// Review finding: the task forced terminators only when it saw the state change. A sequence added after a release,
+// with `wasEstopped` still true from the engagement before, kept its full length if a new engagement landed before
+// the compare. The transmit task sleeps with nothing to send, so it can hold that old value across a whole clear.
+static void engagementAfterAPopEndsTheSequence()
+{
+  armedHub();
+  engageByButton();
+  CHECK(SafetyCaps::Set(ShockerCommandType::Vibrate, highCaps()) == SetResult::Stored);
+  holdToClear();
+
+  // The transmit task sees an engagement, ends this pulse, and goes to sleep.
+  CHECK(CommandHandler::HandleCommand(kModel, 7, ShockerCommandType::Vibrate, 20, 2000));
+  advance(100);
+  pressButton();
+  advance(500);
+  releaseButton();
+  advance(100);
+  holdToClear();
+  CHECK(!EStopManager::IsEStopped());
+
+  Rmt::Sequence expected(kModel, 7, 0);
+  CHECK(expected.fill(ShockerCommandType::Vibrate, 20));
+  const std::vector<uint32_t> payload(reinterpret_cast<const uint32_t*>(expected.payload()), reinterpret_cast<const uint32_t*>(expected.payload()) + expected.size());
+
+  s_air.clear();
+  s_onQueueDrained = [] {
+    EStopManager::Trigger();
+  };
+  CHECK(CommandHandler::HandleCommand(kModel, 7, ShockerCommandType::Vibrate, 20, 2000));
+  advance(1000);
+  CHECK(!s_onQueueDrained);
+  CHECK(EStopManager::IsEStopped());
+  CHECK(!s_air.empty());
+  for (const auto& frame : s_air) {
+    CHECK(frame.words != payload);
+  }
+  const std::size_t frames = s_air.size();
+  advance(500);
+  CHECK(s_air.size() == frames);
+  (void)SafetyCaps::Clear();
+}
+
 static void stateIsReadable()
 {
   CHECK(EStopWireCode(false, false) == 0);
@@ -1523,6 +2118,10 @@ int main()
   // `_Exit` below skips the stdio flush, because the task threads never join. A buffered failure line would be lost.
   std::setvbuf(stdout, nullptr, _IONBF, 0);
 
+  // These fork, so they run before any task thread exists.
+  SCENARIO(bootKeepAliveWaitsForTheClear);
+  SCENARIO(bootKeepAliveStartsWhenReleased);
+
   SCENARIO(unreadableCapsLockTheEStop);
   SCENARIO(bootWithTxOnEStopLeavesRadioOff);
   SCENARIO(noEStopRefuses);
@@ -1535,7 +2134,16 @@ int main()
   SCENARIO(coldBootLatchLeavesSettingsOpen);
   SCENARIO(armedTriggerDoesNotAllowARise);
   SCENARIO(latchKeepsItsFirstSource);
+  SCENARIO(emergencyStopInterruptsAClear);
   SCENARIO(sourceSurvivesWarmRestart);
+  SCENARIO(onlyAnAllowedResetKeepsTheLatch);
+  SCENARIO(buttonLatchWithADeadCheckerAllowsNoRise);
+  SCENARIO(oneLowSampleProvesNoPress);
+  SCENARIO(pulseTrainClearsNothing);
+  SCENARIO(bounceCountsAsOnePress);
+  SCENARIO(noiseProvesNothing);
+  SCENARIO(aLowPinProvesNoPress);
+  SCENARIO(keepAliveFollowsTheStoredSetting);
   SCENARIO(corruptLatchReadsAsColdBoot);
   SCENARIO(heldButtonAcrossRestartStaysEngaged);
   SCENARIO(serialCannotClearTheLatch);
@@ -1548,12 +2156,15 @@ int main()
   SCENARIO(pinsStaySeparate);
   SCENARIO(pinRuleKeysOnTheRunTimePin);
   SCENARIO(serialCapRiseNeedsTheEStop);
+  SCENARIO(flashPinIsUnsafe);
   SCENARIO(configWritesAreGated);
   SCENARIO(fragmentStreamIsBounded);
   SCENARIO(fragmentBoundIsExact);
   SCENARIO(allocationFailureDropsTheMessage);
   SCENARIO(estopEndsAPulseInFlight);
   SCENARIO(gatewayTriggerEndsAPulseInFlightWithNoTask);
+  SCENARIO(radioDropsACommandQueuedWhileEngaged);
+  SCENARIO(engagementAfterAPopEndsTheSequence);
   SCENARIO(stateIsReadable);
 
   if (s_failures != 0) {

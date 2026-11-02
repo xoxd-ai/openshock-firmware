@@ -16,6 +16,7 @@ const char* const TAG = "EStopManager";
 
 #include <driver/gpio.h>
 #include <esp_attr.h>
+#include <esp_system.h>
 #include <freertos/queue.h>
 #include <freertos/task.h>
 #include <freertos/timers.h>
@@ -49,8 +50,8 @@ static volatile bool s_externallyTriggered = false;
 static bool s_estopInitialized = false;
 
 // The latch and what set it. Only `estopmanager_writelatch` writes it, so RAM and the retained copy never disagree.
-// Survives a warm restart. Its content is garbage after a cold boot, which the check rejects. It starts engaged, so a
-// hub stays refused if anything reads it before `Init`.
+// Survives a warm restart. `Init` trusts it only after an allow-listed reset. It starts engaged, so a hub stays refused
+// if anything reads it before `Init`.
 static std::atomic<Softproxy::EStopLatchSource> s_latch = {Softproxy::EStopLatchSource::ColdBoot};
 static RTC_NOINIT_ATTR Softproxy::RetainedEStop s_retainedLatch;
 static portMUX_TYPE s_latchMux = portMUX_INITIALIZER_UNLOCKED;
@@ -71,11 +72,39 @@ static void estopmanager_engage(Softproxy::EStopLatchSource source)
   portEXIT_CRITICAL(&s_latchMux);
 }
 
+// Records that the press which engaged the E-Stop was a full window of low samples. It changes only the latch that
+// press set, so a press during a held latch restates nothing.
+static void estopmanager_confirmpress()
+{
+  portENTER_CRITICAL(&s_latchMux);
+  if (s_latch.load() == Softproxy::EStopLatchSource::Unconfirmed) {
+    estopmanager_writelatch(Softproxy::EStopLatchSource::Button);
+  }
+  portEXIT_CRITICAL(&s_latchMux);
+}
+
 static void estopmanager_release()
 {
   portENTER_CRITICAL(&s_latchMux);
   estopmanager_writelatch(Softproxy::EStopLatchSource::Released);
   portEXIT_CRITICAL(&s_latchMux);
+}
+
+// Whether this boot is one that keeps the latch. A valid seal cannot show that: a brownout, a short supply dropout or
+// an EN reset can keep RTC memory too, and a retained `Released` record would then bring the hub back released. Every
+// reason off this list counts as a cold boot (SP-158).
+static bool estopmanager_warmrestart()
+{
+  switch (esp_reset_reason()) {
+    case ESP_RST_SW:
+    case ESP_RST_PANIC:
+    case ESP_RST_INT_WDT:
+    case ESP_RST_TASK_WDT:
+    case ESP_RST_WDT:
+      return true;
+    default:
+      return false;
+  }
 }
 
 static const char* estopmanager_statename(EStopState state)
@@ -130,6 +159,19 @@ static void estopmgr_checkertask(void* pvParameters)
   // Started engaged, a button held across the restart is not a new press, so it cannot start the hold-to-clear.
   bool lastBtnState = startedEngaged;
 
+  // `history` starts all high, which nothing measured. Only a full window of high samples read by this task shows a
+  // released button, so a press is an edge only after one. A pin already low when the task starts, as after `estop pin`
+  // onto a low pin, still engages, but it proves no press and cannot reach `Button` (SP-156).
+  uint32_t samplesRead = 0;
+  bool sawRelease      = false;
+
+  // Whether the press now down began after a release while engaged, so the hold-to-clear may use it. A press that
+  // engaged the E-Stop or that a gateway stop interrupted does not count.
+  bool clearPress = false;
+
+  // Whether the press that engaged the E-Stop is still down, so a full window of low samples can confirm it.
+  bool confirming = false;
+
   for (;;) {
     // Sleep for the update rate
     vTaskDelay(pdMS_TO_TICKS(k_estopUpdateRate));
@@ -145,6 +187,7 @@ static void estopmgr_checkertask(void* pvParameters)
       estopmanager_engage(Softproxy::EStopLatchSource::Gateway);
       state        = EStopState::Active;
       rearmBlocked = false;
+      clearPress   = false;  // Stops a hold-to-clear in progress. The next one needs a new press.
 
       estopmanager_updateexternals(state);
 
@@ -155,13 +198,32 @@ static void estopmgr_checkertask(void* pvParameters)
 
     // Sample the EStop input
     history = static_cast<uint16_t>((history << 1) | gpio_get_level(s_estopPin));
+    if (samplesRead < k_estopCheckCount) {
+      ++samplesRead;
+    }
 
     // Debounce:
     // If all recent bits are 1 -> fully released.
     // If any bit is 0 -> pressed (or bouncing toward pressed).
+    // If all recent bits are 0 -> a solid press. One low sample is enough to engage, but only a solid press shows that
+    // a hand is on the button, so only a solid press confirms an engagement or counts toward the hold-to-clear.
     bool btnState    = (history & k_estopCheckMask) != k_estopCheckMask;  // true == pressed
-    bool pressedEdge = (btnState && !lastBtnState);
+    bool btnSolid    = (history & k_estopCheckMask) == 0;
+    sawRelease       = sawRelease || (!btnState && samplesRead == k_estopCheckCount);
+    bool pressedEdge = (btnState && !lastBtnState && sawRelease);
     lastBtnState     = btnState;
+
+    if (!btnState) {
+      clearPress = false;
+      confirming = false;
+    } else if (pressedEdge) {
+      clearPress = true;
+    }
+
+    if (confirming && btnSolid) {
+      confirming = false;
+      estopmanager_confirmpress();
+    }
 
     switch (state) {
       case EStopState::Idle:
@@ -180,20 +242,22 @@ static void estopmgr_checkertask(void* pvParameters)
         if (btnState) {
           state              = EStopState::Active;
           s_estopActivatedAt = now;
-          estopmanager_engage(Softproxy::EStopLatchSource::Button);
+          estopmanager_engage(Softproxy::EStopLatchSource::Unconfirmed);
+          clearPress = false;
+          confirming = sawRelease;
         }
         break;
 
       case EStopState::Active:
-        // Once active, if the input gets pressed, start hold-to-clear timing.
-        if (pressedEdge) {
+        // Once active, if a new press turns solid, start hold-to-clear timing.
+        if (clearPress && btnSolid) {
           state         = EStopState::ActiveClearing;
           deactivatesAt = now + k_estopHoldToClearTime;
         }
         break;
 
       case EStopState::ActiveClearing:
-        if (!btnState) {  // released before hold time -> go back to Active
+        if (!btnSolid) {  // released or noisy before hold time -> go back to Active
           state = EStopState::Active;
         } else if (now >= deactivatesAt) {
           // Hold complete -> now wait for release edge to fully clear
@@ -334,10 +398,11 @@ bool EStopManager::Init()
   }
   s_estopInitialized = true;
 
-  // Restore the latch before anything can send a command. A warm restart comes back as it was. Anything else counts as
-  // a cold boot, which starts engaged, so the hub refuses every command until the hold-to-clear (SP-158).
+  // Restore the latch before anything can send a command. An allow-listed reset with a valid seal comes back as it was.
+  // Anything else counts as a cold boot, which starts engaged, so the hub refuses every command until the hold-to-clear
+  // (SP-158).
   auto source = Softproxy::EStopLatchSource::ColdBoot;
-  if (!Softproxy::RestoreEStop(s_retainedLatch, source)) {
+  if (!estopmanager_warmrestart() || !Softproxy::RestoreEStop(s_retainedLatch, source)) {
     OS_LOGW(TAG, "Cold boot, the EStop starts engaged");
   } else if (source != Softproxy::EStopLatchSource::Released) {
     OS_LOGW(TAG, "Restored an engaged EStop after a warm restart, source=%s", Softproxy::EStopLatchName(source));

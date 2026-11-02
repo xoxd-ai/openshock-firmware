@@ -40,10 +40,11 @@ namespace OpenShock::Softproxy {
 
   /// What set the E-Stop latch (SP-156, SP-158). Only a press read on the E-Stop pin shows that the kill path works.
   enum class EStopLatchSource : uint8_t {
-    Released,  // Not engaged.
-    ColdBoot,  // Every cold boot starts engaged. Nothing was pressed.
-    Gateway,   // The gateway `Trigger`. It says nothing about the pin.
-    Button,    // The checker task read a press.
+    Released,     // Not engaged.
+    ColdBoot,     // Every cold boot starts engaged. Nothing was pressed.
+    Gateway,      // The gateway `Trigger`. It says nothing about the pin.
+    Button,       // After a measured release, the checker task read a full window of low samples: a solid press.
+    Unconfirmed,  // A low sample engaged it with no solid press after a measured release: noise, or a pin already low.
   };
 
   constexpr const char* EStopLatchName(EStopLatchSource source)
@@ -57,6 +58,8 @@ namespace OpenShock::Softproxy {
         return "gateway";
       case EStopLatchSource::Button:
         return "button";
+      case EStopLatchSource::Unconfirmed:
+        return "unconfirmed";
       default:
         return "unknown";
     }
@@ -66,7 +69,7 @@ namespace OpenShock::Softproxy {
   /// the first `estop pin` has to work. That is safe: no setting clears the latch, and this latch never allows a rise.
   constexpr bool EStopSettingsLocked(EStopLatchSource source, bool anyCapSet)
   {
-    return anyCapSet || source == EStopLatchSource::Button || source == EStopLatchSource::Gateway;
+    return anyCapSet || source == EStopLatchSource::Button || source == EStopLatchSource::Gateway || source == EStopLatchSource::Unconfirmed;
   }
 
   /// Whether a set E-Stop pin is unusable: it is the RF transmitter, the transmitter's board default (the hub falls
@@ -120,6 +123,7 @@ namespace OpenShock::Softproxy {
 
   /// SP-113 rule 2 with SP-156: a cap can rise only while a button press holds the E-Stop engaged, with a live checker
   /// task behind it. A gateway `Trigger` or a cold boot can engage a hub whose button was never wired, so neither counts.
+  /// `Unconfirmed` does not count either: one low sample can be noise.
   constexpr bool CapRiseAllowed(bool estopArmed, EStopLatchSource source)
   {
     return estopArmed && source == EStopLatchSource::Button;
@@ -132,8 +136,9 @@ namespace OpenShock::Softproxy {
   }
 
   /// Latched E-Stop state in memory that a warm restart (software reset, panic or watchdog) does not clear, as
-  /// `RetainedLimiters` is. A warm restart comes back as it was, with the same source. A cold boot fails the check and
-  /// starts engaged (SP-158).
+  /// `RetainedLimiters` is. A warm restart comes back as it was, with the same source. A cold boot starts engaged
+  /// (SP-158). The check rejects lost memory, but a power loss can keep this record, so `EStopManager::Init` also reads
+  /// the reset reason.
   struct RetainedEStop {
     uint32_t magic;
     uint32_t latch;
@@ -142,11 +147,12 @@ namespace OpenShock::Softproxy {
 
   static_assert(std::is_trivial_v<RetainedEStop> && std::is_standard_layout_v<RetainedEStop>, "retained state must need no construction");
 
-  constexpr uint32_t kRetainedEStopMagic    = 0x53504532;  // "SPE2"
-  constexpr uint32_t kRetainedEStopReleased = 0x1A5E0000u;
-  constexpr uint32_t kRetainedEStopColdBoot = 0xC01DB007u;
-  constexpr uint32_t kRetainedEStopGateway  = 0x6A7E3A11u;
-  constexpr uint32_t kRetainedEStopButton   = 0xB0770411u;
+  constexpr uint32_t kRetainedEStopMagic       = 0x53504532;  // "SPE2"
+  constexpr uint32_t kRetainedEStopReleased    = 0x1A5E0000u;
+  constexpr uint32_t kRetainedEStopColdBoot    = 0xC01DB007u;
+  constexpr uint32_t kRetainedEStopGateway     = 0x6A7E3A11u;
+  constexpr uint32_t kRetainedEStopButton      = 0xB0770411u;
+  constexpr uint32_t kRetainedEStopUnconfirmed = 0x55C0FF1Du;
 
   constexpr uint32_t RetainedEStopCode(EStopLatchSource source)
   {
@@ -157,6 +163,8 @@ namespace OpenShock::Softproxy {
         return kRetainedEStopGateway;
       case EStopLatchSource::Button:
         return kRetainedEStopButton;
+      case EStopLatchSource::Unconfirmed:
+        return kRetainedEStopUnconfirmed;
       case EStopLatchSource::ColdBoot:
       default:
         return kRetainedEStopColdBoot;
@@ -181,7 +189,7 @@ namespace OpenShock::Softproxy {
     if (in.magic != kRetainedEStopMagic || in.check != RetainedEStopCheck(in.magic, in.latch)) {
       return false;
     }
-    for (EStopLatchSource candidate : {EStopLatchSource::Released, EStopLatchSource::ColdBoot, EStopLatchSource::Gateway, EStopLatchSource::Button}) {
+    for (EStopLatchSource candidate : {EStopLatchSource::Released, EStopLatchSource::ColdBoot, EStopLatchSource::Gateway, EStopLatchSource::Button, EStopLatchSource::Unconfirmed}) {
       if (in.latch == RetainedEStopCode(candidate)) {
         source = candidate;
         return true;

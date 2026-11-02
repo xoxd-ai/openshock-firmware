@@ -164,7 +164,14 @@ static void commandhandler_handleestopstatechange(void* event_handler_arg, esp_e
 
   EStopState state = *reinterpret_cast<EStopState*>(event_data);
 
-  _internalSetKeepAliveEnabled(state == EStopState::Idle);
+  // Leaving the E-Stop restores the stored setting, as `Init` reads it at boot. A failed read leaves it off.
+  bool keepAlive = state == EStopState::Idle;
+  if (keepAlive && !Config::GetRFConfigKeepAliveEnabled(keepAlive)) {
+    OS_LOGE(TAG, "Failed to get keep-alive enabled from config");
+    keepAlive = false;
+  }
+
+  _internalSetKeepAliveEnabled(keepAlive);
 }
 
 bool CommandHandler::Init()
