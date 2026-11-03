@@ -76,8 +76,17 @@ enum nvs_open_mode_t {
   TypeName(TypeName&&)       = delete; \
   void operator=(TypeName&&) = delete
 #define portMUX_INITIALIZER_UNLOCKED 0
-#define portENTER_CRITICAL(mux)      (void)(mux)
-#define portEXIT_CRITICAL(mux)       (void)(mux)
+#ifndef SOFTPROXY_KILL_TEST
+#define portENTER_CRITICAL(mux) (void)(mux)
+#define portEXIT_CRITICAL(mux)  (void)(mux)
+#else
+// One thread is awake at a time, so a critical section excludes nothing on the host. test_kill_path.cpp hooks the edges
+// of each outermost section instead: there another core's code can run, just before the section or just after it.
+void hostEnterCritical(portMUX_TYPE* mux);
+void hostExitCritical(portMUX_TYPE* mux);
+#define portENTER_CRITICAL(mux) hostEnterCritical(mux)
+#define portEXIT_CRITICAL(mux)  hostExitCritical(mux)
+#endif
 
 inline const char* esp_err_to_name(esp_err_t)
 {

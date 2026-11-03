@@ -237,6 +237,40 @@ eTaskState eTaskGetState(TaskHandle_t handle)
 {
   return std::find(s_tasks.begin(), s_tasks.end(), handle) == s_tasks.end() ? eDeleted : eRunning;
 }
+// Runs at an edge of an outermost critical section on the thread `s_criticalThread` names, nullptr for the test thread,
+// until it returns true. At `Enter` the code it runs takes the lock first. At `Exit` it waited for the lock and runs
+// just after the section. Those are the two orders a contended `s_latchMux` allows. Nothing runs inside a section.
+enum class CriticalEdge {
+  Enter,
+  Exit,
+};
+static std::function<bool(CriticalEdge)> s_onCritical;
+static TaskHandle_t s_criticalThread = nullptr;
+static int s_criticalDepth           = 0;
+static void runCriticalHook(CriticalEdge edge)
+{
+  if (!s_onCritical || static_cast<TaskHandle_t>(t_self) != s_criticalThread) {
+    return;
+  }
+  auto hook    = std::move(s_onCritical);
+  s_onCritical = nullptr;
+  if (!hook(edge) && !s_onCritical) {
+    s_onCritical = std::move(hook);
+  }
+}
+void hostEnterCritical(portMUX_TYPE*)
+{
+  if (s_criticalDepth == 0) {
+    runCriticalHook(CriticalEdge::Enter);
+  }
+  ++s_criticalDepth;
+}
+void hostExitCritical(portMUX_TYPE*)
+{
+  if (--s_criticalDepth == 0) {
+    runCriticalHook(CriticalEdge::Exit);
+  }
+}
 // Runs once when a task finds its queue empty with no wait: for the transmit task, the point after a pop and before
 // it reads the E-Stop for that pass.
 static std::function<void()> s_onQueueDrained;
@@ -500,7 +534,9 @@ static void freshHub(bool enabled = false, gpio_num_t pin = GPIO_NUM_NC)
   s_cfgTx        = static_cast<gpio_num_t>(OPENSHOCK_RF_TX_GPIO);
   s_cfgKeepAlive = false;
   (void)SafetyCaps::Clear();
-  s_onEStopSample = nullptr;
+  s_onEStopSample  = nullptr;
+  s_onCritical     = nullptr;
+  s_criticalThread = nullptr;
   restartEStopManager(true);
   CHECK(CommandHandler::Init());
   // A stored E-Stop pin on the transmitter is a scenario of its own, and the rule refuses this call.
@@ -1014,6 +1050,119 @@ static void gatewayStopRacingTheReleaseHolds()
   twistToClear();
   CHECK(!EStopManager::IsEStopped());
   CHECK(s_published.back() == EStopState::Idle);
+}
+
+// An engaged hub with the mushroom twisted up, stepped until the checker's next pass is the last clear pass, the one
+// that calls `estopmanager_release`. It counts passes as gatewayStopRacingTheReleaseHolds does, and leaves the count
+// running in `clearPasses`.
+static void stepToTheLastClearPass(uint32_t& clearPasses)
+{
+  armedHub();
+  engageByButton();
+  twistUp();
+  clearPasses     = 0;
+  s_onEStopSample = [&clearPasses] {
+    if (!s_published.empty() && s_published.back() == EStopState::ActiveClearing) {
+      ++clearPasses;
+    }
+    return false;
+  };
+  for (int pass = 0; pass < 1200 && clearPasses < k_estopClearSamples - 1; ++pass) {
+    advance(5);
+  }
+  CHECK(clearPasses == k_estopClearSamples - 1);
+  CHECK(EStopManager::IsEStopped());
+}
+
+// Review survivors X1, X8, X2 and X6. A gateway stop contends with the checker task for `s_latchMux`, and the critical
+// section hook runs it at an edge of a latch section, in each order the lock allows. The hub must read engaged after
+// every pass, and a clear after the stop must still release.
+static void gatewayStopContendingForTheLatchHolds()
+{
+  uint32_t clearPasses = 0;
+
+  // X1: the release pass runs between `Trigger`'s first latch section and the rest of `Trigger`. The count comes first,
+  // so the release refuses.
+  stepToTheLastClearPass(clearPasses);
+  s_criticalThread = nullptr;
+  s_onCritical     = [](CriticalEdge edge) {
+    if (edge != CriticalEdge::Exit) {
+      return false;
+    }
+    OpenShock::g_nowMs += 5;
+    resume(static_cast<HostTask*>(s_estopTask));
+    return true;
+  };
+  EStopManager::Trigger();
+  CHECK(!s_onCritical);
+  CHECK(clearPasses == k_estopClearSamples);
+  CHECK(EStopManager::IsEStopped());
+  CHECK(std::find(s_published.begin(), s_published.end(), EStopState::Idle) == s_published.end());
+  s_onEStopSample = nullptr;
+  advance(5);
+  CHECK(EStopManager::IsEStopped());
+  CHECK(EStopManager::GetLatchSource() == EStopLatchSource::Button);
+  twistToClear();
+  CHECK(!EStopManager::IsEStopped());
+
+  // X8: a `Trigger` lands at each edge of the checker's first latch section in the last clear pass. Before it, the
+  // release sees the count moved and refuses. After it, the release has written the latch, so `Trigger` engages it again.
+  for (CriticalEdge at : {CriticalEdge::Enter, CriticalEdge::Exit}) {
+    stepToTheLastClearPass(clearPasses);
+    s_criticalThread = s_estopTask;
+    s_onCritical     = [at](CriticalEdge edge) {
+      if (edge != at) {
+        return false;
+      }
+      EStopManager::Trigger();
+      return true;
+    };
+    advance(5);
+    CHECK(!s_onCritical);
+    CHECK(clearPasses == k_estopClearSamples);
+    CHECK(EStopManager::IsEStopped());
+    CHECK(EStopManager::GetLatchSource() == (at == CriticalEdge::Enter ? EStopLatchSource::Button : EStopLatchSource::Gateway));
+    s_onEStopSample = nullptr;
+    advance(5);
+    CHECK(EStopManager::IsEStopped());
+    twistToClear();
+    CHECK(!EStopManager::IsEStopped());
+  }
+
+  // X2: a second `Trigger` lands just after the checker reads the count for the first. The flag is already clear, so the
+  // next pass takes the second stop, and a clear after it releases.
+  armedHub();
+  engageByButton();
+  EStopManager::Trigger();
+  s_criticalThread = s_estopTask;
+  s_onCritical     = [](CriticalEdge edge) {
+    if (edge != CriticalEdge::Exit) {
+      return false;
+    }
+    EStopManager::Trigger();
+    return true;
+  };
+  advance(5);
+  CHECK(!s_onCritical);
+  advance(5);
+  CHECK(EStopManager::IsEStopped());
+  twistToClear();
+  CHECK(!EStopManager::IsEStopped());
+
+  // X6: a new checker task takes the stops counted before it started, so its first clear releases.
+  armedHub();
+  sendTrigger(GatewaySchema::TriggerType::EmergencyStop);
+  advance(20);
+  CHECK(EStopManager::GetLatchSource() == EStopLatchSource::Gateway);
+  twistToClear();
+  CHECK(!EStopManager::IsEStopped());
+  CHECK(estopmgr_setestopenabled(false));
+  CHECK(estopmgr_setestopenabled(true));
+  advance(100);
+  engageByButton();
+  CHECK(EStopManager::GetLatchSource() == EStopLatchSource::Button);
+  twistToClear();
+  CHECK(!EStopManager::IsEStopped());
 }
 
 // A gateway stop reaches a clear in progress, so the hub does not release after it. The mushroom measured down before the
@@ -2430,6 +2579,7 @@ int main()
   SCENARIO(latchKeepsItsFirstSource);
   SCENARIO(gatewayLatchThenPressStaysGateway);
   SCENARIO(gatewayStopRacingTheReleaseHolds);
+  SCENARIO(gatewayStopContendingForTheLatchHolds);
   SCENARIO(emergencyStopInterruptsAClear);
   SCENARIO(sourceSurvivesWarmRestart);
   SCENARIO(onlyAnAllowedResetKeepsTheLatch);

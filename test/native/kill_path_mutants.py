@@ -54,8 +54,15 @@ CLEAR_ON_WALL_TIME = ('} else if ([&] { static int64_t endsAt; if (clearSamplesL
 # Equivalent mutants, left out of the run. K29 drops `estopPin == kBoardRfTxPin` from `EStopPinConflicts`. On both
 # PiShock builds the board RF TX pin is 12 or 15, and `IsEStopReservedPin` refuses both, so no input tells the two apart.
 # pinsStaySeparate checks that both pins are reserved. A build whose board RF TX pin is not reserved needs K29 back.
+# X7, X9 and X11 came from the review of `ee79e67`. Each changes no latch value and no `IsEStopped` reading:
+# X7: a refused release means a counted stop, and the pass that takes its flag clears the measured down anyway.
+# X9: the pass that takes the flag sets Active, so only the state published for one pass differs, never the latch.
+# X11: with no task nothing compares the count, and a task that starts takes the count as it then stands.
 EQUIVALENT = [
   ('K29 estop rule ignores the board tx pin', KP, 'estopPin == txPin || estopPin == kBoardRfTxPin', 'estopPin == txPin', HEADER),
+  ('X7 refused release keeps the measured down', ES, '          state   = estopmanager_release(gatewayStopsTaken) ? EStopState::Idle : EStopState::Active;\n          sawDown = false;\n', '          if (estopmanager_release(gatewayStopsTaken)) { state = EStopState::Idle; sawDown = false; } else { state = EStopState::Active; }\n', [TEST]),
+  ('X9 refused release keeps clearing', ES, '? EStopState::Idle : EStopState::Active;', '? EStopState::Idle : EStopState::ActiveClearing;', [TEST]),
+  ('X11 Trigger skips the count when no task', ES, '  estopmanager_countgatewaystop();\n  if (!IsEStopped()) {', '  if (s_estopTask != nullptr) estopmanager_countgatewaystop();\n  if (!IsEStopped()) {', [TEST]),
 ]
 
 # Name, file, text to replace, replacement, units to rebuild. An empty unit list means the test reads the file itself.
@@ -155,6 +162,10 @@ MUTANTS = [
   ('K98 the task never takes a gateway stop', ES, '      gatewayStopsTaken     = estopmanager_gatewaystops();\n', '', [TEST]),
   ('K99 a refused release reads as idle', ES, '? EStopState::Idle : EStopState::Active;', '? EStopState::Idle : EStopState::Idle;', [TEST]),
   ('K100 the clear ends on wall time', ES, '} else if (--clearSamplesLeft == 0) {', CLEAR_ON_WALL_TIME, [TEST]),
+  ('X1 Trigger counts after it engages', ES, '  estopmanager_countgatewaystop();\n  if (!IsEStopped()) {\n    s_estopActivatedAt = OpenShock::millis();\n  }\n  estopmanager_engage(Softproxy::EStopLatchSource::Gateway);\n', '  if (!IsEStopped()) {\n    s_estopActivatedAt = OpenShock::millis();\n  }\n  estopmanager_engage(Softproxy::EStopLatchSource::Gateway);\n  estopmanager_countgatewaystop();\n', [TEST]),
+  ('X2 task reads the count before it clears the flag', ES, '      s_externallyTriggered = false;\n      gatewayStopsTaken     = estopmanager_gatewaystops();\n', '      gatewayStopsTaken     = estopmanager_gatewaystops();\n      s_externallyTriggered = false;\n', [TEST]),
+  ('X6 task start takes no stop', ES, '  uint32_t gatewayStopsTaken = estopmanager_gatewaystops();', '  uint32_t gatewayStopsTaken = 0;', [TEST]),
+  ('X8 release reads the count outside the lock', ES, '  portENTER_CRITICAL(&s_latchMux);\n  const bool released = s_gatewayStops == gatewayStopsTaken;', '  const bool released = estopmanager_gatewaystops() == gatewayStopsTaken;\n  portENTER_CRITICAL(&s_latchMux);', [TEST]),
   ('K78 boot never starts the keep-alive', CH, 'if (rfConfig.keepAliveEnabled && !EStopManager::IsEStopped()) {', 'if (false) {', [CH]),
   ('R4 RF task stops discarding while engaged', RF, 'if (OpenShock::EStopManager::IsEStopped()) {\n        // Immediately', 'if (false) {\n        // Immediately', [RF]),
   ('R4b RF task adds what it should discard', RF, '        // Discard next item in queue\n        continue;\n', '', [RF]),
