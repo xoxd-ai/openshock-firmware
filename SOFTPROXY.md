@@ -112,6 +112,8 @@ Stated residuals from the softproxy review of `ee79e67` (TIN-7428 `ac97d9af` sco
 
 The host test now runs code at the edges of each outermost latch section, before it or after it, which are the two orders a contended lock allows. One thread is awake at a time, so real-core interleavings and their timing stay unmeasured. The review's X7, X9 and X11 sit in the harness `EQUIVALENT` list, each with its reason.
 
+The review's X10 also survived. It ends the confirm of a press in progress when the checker takes a gateway stop. That fails safe, but it is observable: a press that engaged before the stop then stays `unconfirmed` and refuses a cap rise, where the code confirms it as `button`. `pressThenGatewayStopStillConfirms` pins the code's result, and X10 is a harness mutant that goes red in it.
+
 ## Refusal report
 
 Before this change a refused step left one log line and nothing else, so Softproxy logged an actuation that never reached the shocker (softproxy #27 review, finding 4). `SafetyCaps::Admit` now counts every cap refusal in `include/softproxy/RefusalReport.h` and writes one log line, and `HandleCommand` does the same for the E-Stop refusals through `SafetyCaps::RecordRefusal`. Gateway and serial `rftransmit` commands both pass there. A Stop, Sound or Light refused by an engaged E-Stop logs `channel=other`.

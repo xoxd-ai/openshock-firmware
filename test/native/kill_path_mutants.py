@@ -166,6 +166,7 @@ MUTANTS = [
   ('X2 task reads the count before it clears the flag', ES, '      s_externallyTriggered = false;\n      gatewayStopsTaken     = estopmanager_gatewaystops();\n', '      gatewayStopsTaken     = estopmanager_gatewaystops();\n      s_externallyTriggered = false;\n', [TEST]),
   ('X6 task start takes no stop', ES, '  uint32_t gatewayStopsTaken = estopmanager_gatewaystops();', '  uint32_t gatewayStopsTaken = 0;', [TEST]),
   ('X8 release reads the count outside the lock', ES, '  portENTER_CRITICAL(&s_latchMux);\n  const bool released = s_gatewayStops == gatewayStopsTaken;', '  const bool released = estopmanager_gatewaystops() == gatewayStopsTaken;\n  portENTER_CRITICAL(&s_latchMux);', [TEST]),
+  ('X10 taking a stop keeps confirming', ES, '      sawDown = false;  // Stops a clear in progress.', '      sawDown = false; confirming = false;  // Stops a clear in progress.', [TEST]),
   ('K78 boot never starts the keep-alive', CH, 'if (rfConfig.keepAliveEnabled && !EStopManager::IsEStopped()) {', 'if (false) {', [CH]),
   ('R4 RF task stops discarding while engaged', RF, 'if (OpenShock::EStopManager::IsEStopped()) {\n        // Immediately', 'if (false) {\n        // Immediately', [RF]),
   ('R4b RF task adds what it should discard', RF, '        // Discard next item in queue\n        continue;\n', '', [RF]),

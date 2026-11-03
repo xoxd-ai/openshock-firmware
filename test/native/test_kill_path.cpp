@@ -1015,6 +1015,28 @@ static void gatewayLatchThenPressStaysGateway()
   CHECK(!EStopManager::IsEStopped());
 }
 
+// Review mutant X10: the pass that takes a gateway stop leaves the press it found in progress confirming. The press
+// engaged first, so the latch keeps its source, and the full window of high samples that follows confirms it as a
+// button. The stop is taken, so the clear after it releases.
+static void pressThenGatewayStopStillConfirms()
+{
+  armedHub();
+  pushDown();
+  advance(5);
+  CHECK(EStopManager::IsEStopped());
+  CHECK(EStopManager::GetLatchSource() == EStopLatchSource::Unconfirmed);
+  sendTrigger(GatewaySchema::TriggerType::EmergencyStop);
+  advance(5);
+  CHECK(!s_externallyTriggered);
+  CHECK(EStopManager::GetLatchSource() == EStopLatchSource::Unconfirmed);
+  advance(100);
+  CHECK(EStopManager::GetLatchSource() == EStopLatchSource::Button);
+  CHECK(SafetyCaps::Set(ShockerCommandType::Vibrate, lowCaps()) == SetResult::Stored);
+  (void)SafetyCaps::Clear();
+  twistToClear();
+  CHECK(!EStopManager::IsEStopped());
+}
+
 // Review finding: a gateway stop that landed in the checker's last clear pass, after its trigger check and before the
 // release, found the latch still engaged and engaged nothing. The release then cleared the latch, and `IsEStopped` read
 // false until the next pass took the stop. The release now refuses a stop the task has not taken, so the hub stays
@@ -2578,6 +2600,7 @@ int main()
   SCENARIO(armedTriggerDoesNotAllowARise);
   SCENARIO(latchKeepsItsFirstSource);
   SCENARIO(gatewayLatchThenPressStaysGateway);
+  SCENARIO(pressThenGatewayStopStillConfirms);
   SCENARIO(gatewayStopRacingTheReleaseHolds);
   SCENARIO(gatewayStopContendingForTheLatchHolds);
   SCENARIO(emergencyStopInterruptsAClear);
