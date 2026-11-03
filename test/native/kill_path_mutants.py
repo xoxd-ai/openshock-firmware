@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
-# Mutation run for test/native/test_kill_path.cpp (TIN-7545). Each mutant breaks one line of the kill path in a copy of
-# the tree. The test must then go red. A mutant that stays green is a gap in the test, and the run fails.
+# Mutation run for test/native/test_kill_path.cpp and test/native/test_config_writers.cpp (TIN-7545). Each mutant breaks
+# one line of the kill path in a copy of the tree. The tests must then go red: a mutant is red when either test fails.
+# A mutant that stays green is a gap in the tests, and the run fails.
 #
 # From the repository root, after `pio pkg install -e Pishock-2023`:
 #
@@ -35,6 +36,8 @@ RFTXPIN = 'src/serial/command_handlers/rftxpin.cpp'
 SERIAL_CAPS = 'src/serial/command_handlers/safetycaps.cpp'
 CONFIG = 'src/config/Config.cpp'
 CHIPSET = 'include/Chipset.h'
+CONFIG_TEST = 'test/native/test_config_writers.cpp'
+CONFIG_UNITS = [CONFIG_TEST, CONFIG, 'src/config/RootConfig.cpp']
 ENCODERS = ['src/radio/rmt/%sEncoder.cpp' % name for name in ('CaiXianlin', 'D80', 'Petrainer998DR', 'Petrainer', 'T330')]
 UNITS = [TEST, CH, SC, DF, RF, 'src/radio/rmt/Sequence.cpp'] + ENCODERS + ['src/serial/command_handlers/estop.cpp', RFTXPIN, TR, 'src/util/StringUtils.cpp']
 
@@ -53,16 +56,25 @@ CLEAR_ON_WALL_TIME = ('} else if ([&] { static int64_t endsAt; if (clearSamplesL
 
 # Equivalent mutants, left out of the run. K29 drops `estopPin == kBoardRfTxPin` from `EStopPinConflicts`. On both
 # PiShock builds the board RF TX pin is 12 or 15, and `IsEStopReservedPin` refuses both, so no input tells the two apart.
-# pinsStaySeparate checks that both pins are reserved. A build whose board RF TX pin is not reserved needs K29 back.
+# pinsStaySeparate checks that both pins are reserved, and a static_assert in KillPath.h fails every build that defines
+# SOFTPROXY_PISHOCK_BUILD on an RF TX pin that is not reserved. Such a build needs K29 back in the run.
 # X7, X9 and X11 came from the review of `ee79e67`. Each changes no latch value and no `IsEStopped` reading:
 # X7: a refused release means a counted stop, and the pass that takes its flag clears the measured down anyway.
-# X9: the pass that takes the flag sets Active, so only the state published for one pass differs, never the latch.
+# X9: a refused release means `Trigger` counted a stop, and it sets the flag right after the count. Until the pass that
+# takes the flag, the task reads and publishes `active-clearing` where the code has `active`. On the host that is the
+# next pass. On the hub it lasts as long as `Trigger` takes from its count to its flag, which nothing bounds. The clear
+# count has run out, so the next pass wraps it and the clear needs 2^32 more samples: the latch cannot release first.
 # X11: with no task nothing compares the count, and a task that starts takes the count as it then stands.
+# X15 came from the review of `25f1449`. The pass that takes a gateway stop also samples the pin. That pass has already
+# set Active and cleared the measured down, so its sample is the one the next pass would take 5 milliseconds later. It
+# moves every later window one sample earlier and changes no rule, so it is equivalent up to a one-sample shift. Only a
+# contact that changes on that one sample could end with another source, which no test can place apart from bounce.
 EQUIVALENT = [
   ('K29 estop rule ignores the board tx pin', KP, 'estopPin == txPin || estopPin == kBoardRfTxPin', 'estopPin == txPin', HEADER),
   ('X7 refused release keeps the measured down', ES, '          state   = estopmanager_release(gatewayStopsTaken) ? EStopState::Idle : EStopState::Active;\n          sawDown = false;\n', '          if (estopmanager_release(gatewayStopsTaken)) { state = EStopState::Idle; sawDown = false; } else { state = EStopState::Active; }\n', [TEST]),
   ('X9 refused release keeps clearing', ES, '? EStopState::Idle : EStopState::Active;', '? EStopState::Idle : EStopState::ActiveClearing;', [TEST]),
   ('X11 Trigger skips the count when no task', ES, '  estopmanager_countgatewaystop();\n  if (!IsEStopped()) {', '  if (s_estopTask != nullptr) estopmanager_countgatewaystop();\n  if (!IsEStopped()) {', [TEST]),
+  ('X15 the trigger pass samples the pin', ES, '      // Do not modify history here; allow hardware to take over on subsequent iterations.\n      continue;\n', '      // Do not modify history here; allow hardware to take over on subsequent iterations.\n', [TEST]),
 ]
 
 # Name, file, text to replace, replacement, units to rebuild. An empty unit list means the test reads the file itself.
@@ -114,7 +126,7 @@ MUTANTS = [
   ('K46 engage restates the source', ES, '  if (s_latch.load() == Softproxy::EStopLatchSource::Released) {\n    estopmanager_writelatch(source);\n  }', '  estopmanager_writelatch(source);', [TEST]),
   ('K47 latch not sealed on engage', ES, '  s_latch.store(source);\n  Softproxy::SealEStop(s_retainedLatch, source);', '  s_latch.store(source);\n  if (source == Softproxy::EStopLatchSource::Released) Softproxy::SealEStop(s_retainedLatch, source);', [TEST]),
   ('K48 shorter join window is no rise', KP, 'to.stageJoinMs != from.stageJoinMs', 'to.stageJoinMs > from.stageJoinMs', HEADER),
-  ('K49 Config lock reads engaged only', CONFIG, 'OpenShock::Softproxy::EStopSettingsLocked(OpenShock::EStopManager::GetLatchSource(), OpenShock::Softproxy::SafetyCaps::AnySet())', 'OpenShock::EStopManager::IsEStopped() || OpenShock::Softproxy::SafetyCaps::AnySet()', []),
+  ('K49 Config lock reads engaged only', CONFIG, 'OpenShock::Softproxy::EStopSettingsLocked(OpenShock::EStopManager::GetLatchSource(), OpenShock::Softproxy::SafetyCaps::AnySet())', 'OpenShock::EStopManager::IsEStopped() || OpenShock::Softproxy::SafetyCaps::AnySet()', [CONFIG]),
   ('K50 Init drops the reset reason check', ES, '!estopmanager_warmrestart() || ', '', [TEST]),
   ('K51 brownout counts as warm', ES, WARM, '    case ESP_RST_BROWNOUT:\n' + WARM, [TEST]),
   ('K52 power-on counts as warm', ES, WARM, '    case ESP_RST_POWERON:\n' + WARM, [TEST]),
@@ -167,6 +179,12 @@ MUTANTS = [
   ('X6 task start takes no stop', ES, '  uint32_t gatewayStopsTaken = estopmanager_gatewaystops();', '  uint32_t gatewayStopsTaken = 0;', [TEST]),
   ('X8 release reads the count outside the lock', ES, '  portENTER_CRITICAL(&s_latchMux);\n  const bool released = s_gatewayStops == gatewayStopsTaken;', '  const bool released = estopmanager_gatewaystops() == gatewayStopsTaken;\n  portENTER_CRITICAL(&s_latchMux);', [TEST]),
   ('X10 taking a stop keeps confirming', ES, '      sawDown = false;  // Stops a clear in progress.', '      sawDown = false; confirming = false;  // Stops a clear in progress.', [TEST]),
+  ('X12 estop enabled skips the pin rule', ES, 'if (!estopmgr_pinallowed(pin) || !estopmgr_set_pin_impl(pin)) {', 'if (!estopmgr_set_pin_impl(pin)) {', [TEST]),
+  ('X13 a restarted task starts idle', ES, 'state          = startedEngaged ? EStopState::Active : EStopState::Idle;', 'state          = EStopState::Idle;', [TEST]),
+  ('X14 a failed tx read allows the pin', ES, '    OS_LOGE(TAG, "Failed to get RF TX pin from config");\n    return false;', '    OS_LOGE(TAG, "Failed to get RF TX pin from config");\n    return true;', [TEST]),
+  ('C1 SaveFromJSON skips the kill gate', CONFIG, 'if (!candidate.FromJSON(root) || !_killConfigChangeAllowed(candidate)) {', 'if (!candidate.FromJSON(root)) {', [CONFIG]),
+  ('C2 SaveFromFlatBuffer skips the kill gate', CONFIG, 'if (!candidate.FromFlatbuffers(config) || !_killConfigChangeAllowed(candidate)) {', 'if (!candidate.FromFlatbuffers(config)) {', [CONFIG]),
+  ('C3 SetRaw skips the kill gate', CONFIG, '  if (!_killConfigChangeAllowed(config)) {\n    return false;\n  }\n', '', [CONFIG]),
   ('K78 boot never starts the keep-alive', CH, 'if (rfConfig.keepAliveEnabled && !EStopManager::IsEStopped()) {', 'if (false) {', [CH]),
   ('R4 RF task stops discarding while engaged', RF, 'if (OpenShock::EStopManager::IsEStopped()) {\n        // Immediately', 'if (false) {\n        // Immediately', [RF]),
   ('R4b RF task adds what it should discard', RF, '        // Discard next item in queue\n        continue;\n', '', [RF]),
@@ -193,29 +211,44 @@ class Run:
     self.args = args
     self.work = os.path.abspath(args.work)
     self.results_path = os.path.join(self.work, 'results.json')
-    self.flags = ['-std=c++20', '-O1', '-pthread', '-DSOFTPROXY_KILL_TEST', '-DOPENSHOCK_FW_CHIP_ESP32', '-DOPENSHOCK_LED_GPIO=2', '-DOPENSHOCK_RF_TX_GPIO=%d' % args.tx, '-w']
+    board = ['-DOPENSHOCK_FW_CHIP_ESP32', '-DOPENSHOCK_LED_GPIO=2', '-DSOFTPROXY_PISHOCK_BUILD', '-DOPENSHOCK_RF_TX_GPIO=%d' % args.tx, '-w']
+    self.flags = ['-std=c++20', '-O1', '-pthread', '-DSOFTPROXY_KILL_TEST'] + board
     self.includes = ['-Itest/native/kill_stubs', '-Itest/native/stubs', '-Iinclude', '-Iflatbuffers']
+    self.config_flags = ['-std=c++20', '-O1'] + board
+    self.config_includes = ['-Itest/native/config_stubs', '-Iinclude', '-Iflatbuffers']
 
   def object_path(self, unit):
     return 'obj/%s.o' % unit.replace('/', '_')
 
   def compile(self, unit):
-    return subprocess.run(['g++'] + self.flags + self.includes + ['-c', unit, '-o', self.object_path(unit)], cwd=self.work, capture_output=True, text=True)
+    flags, includes = (self.config_flags, self.config_includes) if unit in CONFIG_UNITS else (self.flags, self.includes)
+    return subprocess.run(['g++'] + flags + includes + ['-c', unit, '-o', self.object_path(unit)], cwd=self.work, capture_output=True, text=True)
 
   def link(self):
-    return subprocess.run(['g++', '-pthread', '-Wl,--wrap=malloc'] + [self.object_path(unit) for unit in UNITS] + ['-o', 'kill_path_test'], cwd=self.work, capture_output=True, text=True)
+    kill = subprocess.run(['g++', '-pthread', '-Wl,--wrap=malloc'] + [self.object_path(unit) for unit in UNITS] + ['-o', 'kill_path_test'], cwd=self.work, capture_output=True, text=True)
+    if kill.returncode:
+      return kill
+    return subprocess.run(['g++'] + [self.object_path(unit) for unit in CONFIG_UNITS] + ['-o', 'config_writers_test'], cwd=self.work, capture_output=True, text=True)
 
   def test(self):
-    try:
-      result = subprocess.run(['./kill_path_test'], cwd=self.work, capture_output=True, text=True, timeout=120)
-    except subprocess.TimeoutExpired:
-      return 'red-hang', ''
-    failed = [line.split(': ', 1)[1] for line in result.stdout.splitlines() if line.startswith('scenario failed')]
-    return ('green' if result.returncode == 0 else 'red'), (', '.join(failed)[:200] or 'rc=%d' % result.returncode)
+    states, details = [], []
+    for binary in ('./kill_path_test', './config_writers_test'):
+      try:
+        result = subprocess.run([binary], cwd=self.work, capture_output=True, text=True, timeout=120)
+      except subprocess.TimeoutExpired:
+        states.append('red-hang')
+        details.append('%s hangs' % binary[2:])
+        continue
+      states.append('green' if result.returncode == 0 else 'red')
+      failed = [line.split(': ', 1)[1] for line in result.stdout.splitlines() if line.startswith('scenario failed')]
+      if result.returncode:
+        details.append(', '.join(failed) or '%s rc=%d' % (binary[2:], result.returncode))
+    state = 'red-hang' if 'red-hang' in states else ('red' if 'red' in states else 'green')
+    return state, ', '.join(details)[:200]
 
   def tree_stamp(self):
     digest = hashlib.sha256()
-    for path in sorted({TEST, CONFIG, CHIPSET, KP, ES, SERIAL_CAPS, *UNITS}):
+    for path in sorted({TEST, CONFIG, CHIPSET, KP, ES, SERIAL_CAPS, *UNITS, *CONFIG_UNITS}):
       with open(path, 'rb') as handle:
         digest.update(handle.read())
     return digest.hexdigest()[:16]
@@ -239,7 +272,7 @@ class Run:
     for directory in ('src', 'include', 'test'):
       shutil.copytree(directory, os.path.join(self.work, directory), symlinks=True)
     shutil.copytree(self.args.flatbuffers, os.path.join(self.work, 'flatbuffers'))
-    for unit in UNITS:
+    for unit in UNITS + CONFIG_UNITS:
       result = self.compile(unit)
       if result.returncode:
         print('control does not compile: %s\n%s' % (unit, result.stderr[:1500]))
@@ -267,9 +300,13 @@ class Run:
     try:
       with open(full, 'w') as handle:
         handle.write(original.replace(old, new, 1))
-      failed = [unit for unit in units if self.compile(unit).returncode]
+      failed = [(unit, result) for unit, result in ((unit, self.compile(unit)) for unit in units) if result.returncode]
+      # A static_assert that refuses the mutant, such as the K29 guard in KillPath.h, refuses it in the firmware build
+      # as well, so that counts as red. Any other compile error means the mutant is broken.
+      if failed and all('static assertion failed' in result.stderr for _, result in failed):
+        return 'red-static-assert', ', '.join(unit for unit, _ in failed)
       if failed:
-        return 'compile-error', ', '.join(failed)
+        return 'compile-error', ', '.join(unit for unit, _ in failed)
       if self.link().returncode:
         return 'link-error', ''
       return self.test()

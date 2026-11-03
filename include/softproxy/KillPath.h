@@ -98,6 +98,13 @@ namespace OpenShock::Softproxy {
     return estopPin == txPin || estopPin == kBoardRfTxPin || estopPin == kBoardLedPin || estopPin == kBoardRgbLedPin || IsEStopReservedPin(estopPin) || !HasInternalPullUp(estopPin);
   }
 
+#ifdef SOFTPROXY_PISHOCK_BUILD
+  // The mutation run lists K29, dropping `estopPin == kBoardRfTxPin` above, as equivalent. That holds only while the
+  // board RF TX pin is reserved, as GPIO 12 and 15 are, so `IsEStopReservedPin` refuses it anyway. A Softproxy build on
+  // another RF TX pin fails here and puts K29 back in the run.
+  static_assert(IsEStopReservedPin(kBoardRfTxPin), "K29 is equivalent only where the board RF TX pin is a reserved E-Stop pin");
+#endif
+
   /// Whether moving the RF transmitter to `txPin` would land on the E-Stop or a board LED. `configuredEStopPin` is
   /// the stored pin and `runningEStopPin` the pin the checker task reads. They differ until a restart.
   constexpr bool TxPinConflicts(int txPin, int configuredEStopPin, int runningEStopPin)

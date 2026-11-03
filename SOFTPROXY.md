@@ -114,6 +114,18 @@ The host test now runs code at the edges of each outermost latch section, before
 
 The review's X10 also survived. It ends the confirm of a press in progress when the checker takes a gateway stop. That fails safe, but it is observable: a press that engaged before the stop then stays `unconfirmed` and refuses a cap rise, where the code confirms it as `button`. `pressThenGatewayStopStillConfirms` pins the code's result, and X10 is a harness mutant that goes red in it.
 
+The CADE-1 review of `25f1449` found these gaps. No run-time product code changed for them. F4 adds a compile-time check and a build define:
+
+| Finding | Gap | Now |
+| --- | --- | --- |
+| F1 | Removing the pin rule from `SetEStopEnabled` survived | `enableRefusesAStoredConflictingPin` boots on a stored pin the rule refuses, then runs `estop enabled true`. Mutant X12 goes red |
+| F2 | The three whole-config writers had only a text scan | `test_config_writers` links the real `Config.cpp` and `RootConfig.cpp`. Each writer is refused under every lock and on each pin clash, and writes nothing then. Mutants C1 to C3 and K49 go red there |
+| F3 | No firmware build ran for this branch | `ci-build.yml` also runs on PRs into the cap branch |
+| F4 | K29 is equivalent only on a reserved RF TX pin | A `static_assert` in `KillPath.h` checks it in every build that defines `SOFTPROXY_PISHOCK_BUILD`: the two `Pishock-*` envs and the host tests. K85 and K89 now fail that assert at compile time, which the harness counts as red |
+| F5 | A restarted task that starts idle survived | `restartedTaskPublishesEngaged`. The code starts the task in `Active` and publishes no `Idle` while engaged. Mutant X13 goes red |
+| F6 | A failed RF TX read in the pin rule was untested | `failedTxReadRefusesThePin`. The code already refuses the pin when the read fails. Mutant X14 goes red |
+| F7 | Sampling on the trigger pass | X15 joins the equivalent list with its reason, and X9's reason is corrected |
+
 ## Refusal report
 
 Before this change a refused step left one log line and nothing else, so Softproxy logged an actuation that never reached the shocker (softproxy #27 review, finding 4). `SafetyCaps::Admit` now counts every cap refusal in `include/softproxy/RefusalReport.h` and writes one log line, and `HandleCommand` does the same for the E-Stop refusals through `SafetyCaps::RecordRefusal`. Gateway and serial `rftransmit` commands both pass there. A Stop, Sound or Light refused by an engaged E-Stop logs `channel=other`.
@@ -163,8 +175,9 @@ Raising a cap needs the E-Stop armed and engaged by its button (see Kill path). 
 | `test/native/test_local_lockdown.cpp` | host test of the local socket allow list, the portal lockout, the refusal count, the wire codes and the log line |
 | `test/native/test_command_paths.cpp`, `test/native/stubs/` | host test that links the real `HandleCommand`, `SafetyCaps`, gateway and local dispatchers, `Trigger`, `SetRfTxPinCommand`, serial `rftransmit` and `rftxpin` and the five encoders. Fakes: the hardware edge, and the firmware logic in `EStopManager` (one boolean), `RFTransmitter`, `Config` and `CaptivePortal`. Its header gives the command |
 | `test/native/test_kill_path.cpp`, `test/native/kill_stubs/` | host test of the real `EStopManager` task and latch, `HandleCommand`, `SafetyCaps`, `RFTransmitter` and its task, `Sequence`, serial `estop`, `rftxpin` and `safetycaps`, gateway `Trigger` and `WebSocketDeFragger`, built once for each `Pishock-*` RF TX default. Fakes: GPIO, RMT, FreeRTOS, NVS, `Config`, the reset reason, the number parser in `Convert` and `Chipset`. Its header gives the command |
-| `test/native/kill_path_mutants.py` | mutation run for `test_kill_path`. Each mutant breaks one line of the kill path, and a surviving mutant fails the run. CI does not run it. See its header for the command |
-| `.github/workflows/softproxy-host-test.yml` | runs all four host tests on pushes and PRs to `softproxy/**` and on PRs to the cap branch |
+| `test/native/test_config_writers.cpp`, `test/native/config_stubs/` | host test of the whole-config writers `SaveFromJSON`, `SetRaw` and `SaveFromFlatBuffer`, linked from the real `Config.cpp` and `RootConfig.cpp`. Fakes: LittleFS, cJSON, the mutex, `Chipset`, the E-Stop latch, the caps and the leaf configs. Its header gives the command |
+| `test/native/kill_path_mutants.py` | mutation run for `test_kill_path` and `test_config_writers`. Each mutant breaks one line of the kill path, and a surviving mutant fails the run. CI does not run it. See its header for the command |
+| `.github/workflows/softproxy-host-test.yml` | runs all five host tests on pushes and PRs to `softproxy/**` and on PRs to the cap branch |
 
 Run the first two host tests with:
 
@@ -186,7 +199,8 @@ g++ -std=c++20 -Wall -Wextra -Werror -Iinclude test/native/test_local_lockdown.c
 - The E-Stop rules are host-tested with a fake GPIO. It reads an undriven pin high with the pull-up and low without it. A switch, a cable, a cable pull and the board are tests for the attended session.
 - The host test's fake `Chipset` accepts pins 0 to 39, so `CHIP_UNSAFE_GPIO`, the `OPENSHOCK_BYPASSED_GPIO` entries and the `int8_t` signature of the real functions do not run there. A scan pins GPIO 10 in the real ESP32 list. The E-Stop's own refusal of the strapping and flash pins lives in `KillPath.h`, so it runs on the host for both PiShock RF TX builds and holds whatever a board bypasses. GPIO 12 and 15 are refused as E-Stop pins on both envs. `rftxpin` still follows the board's bypass list, and the hub revision read covers which env is right.
 - The cold boot latch publishes no state event while no checker task runs, so the LED shows it only after `estop enabled true`. `estop state`, `safetycaps` and the `Pong` field show it from boot.
-- The keep-alive frames and the `Config.cpp` writers are read, not run. The host test starts and stops the keep-alive task on the E-Stop state event, but sends no keep-alive frame, and it has no filesystem. It tests the decision `KillConfigChangeAllowed` and scans that each writer calls it.
+- The keep-alive frames are read, not run. The host test starts and stops the keep-alive task on the E-Stop state event, but sends no keep-alive frame.
+- The whole-config writers run on a fake LittleFS and a small fake cJSON. Their RF and E-Stop leaf parsers are copies of the real ones, and the other leaves parse nothing, so the real cJSON, the filesystem and the other leaf configs do not run on the host.
 - A serial `rftransmit` command in the host test comes from a fake parser, so `JsonSerial::ParseShockerCommand` is read, not run.
 - Stack margin on `main_app` for the refusal path is not profiled. `SealRetained` and `RestoreRetained` no longer put the 2 kilobyte record on the stack. The path still runs `snprintf` and a log call on each refusal.
 - Caps live in NVS, so a re-flash with no erase keeps them. After a clear they admit commands with no press on that boot, and the cold boot latch cannot show that they are stale. Reading `safetycaps` after a flash is the only guard.

@@ -17,7 +17,7 @@
 // for Pishock-Lite-2021, because the E-Stop pin rule must not depend on either.
 //
 //   FB=.pio/libdeps/Pishock-2023/flatbuffers/include
-//   FLAGS="-std=c++20 -O1 -pthread -DSOFTPROXY_KILL_TEST -DOPENSHOCK_FW_CHIP_ESP32 -DOPENSHOCK_LED_GPIO=2"
+//   FLAGS="-std=c++20 -O1 -pthread -DSOFTPROXY_KILL_TEST -DOPENSHOCK_FW_CHIP_ESP32 -DOPENSHOCK_LED_GPIO=2 -DSOFTPROXY_PISHOCK_BUILD"
 //   FLAGS="$FLAGS -DOPENSHOCK_RF_TX_GPIO=$TX"
 //   INC="-Itest/native/kill_stubs -Itest/native/stubs -Iinclude -I$FB"
 //   SRC="src/CommandHandler.cpp src/softproxy/SafetyCaps.cpp src/WebSocketDeFragger.cpp src/radio/RFTransmitter.cpp"
@@ -400,6 +400,9 @@ static bool s_cfgEnabled   = false;
 static gpio_num_t s_cfgPin = GPIO_NUM_NC;
 static gpio_num_t s_cfgTx  = static_cast<gpio_num_t>(OPENSHOCK_RF_TX_GPIO);
 static bool s_cfgKeepAlive = false;
+
+// `GetRFConfigTxPin` fails, as a store that cannot be read would.
+static bool s_cfgTxReadFails = false;
 bool Config::GetRFConfig(Config::RFConfig& out)
 {
   out = {.txPin = s_cfgTx, .keepAliveEnabled = s_cfgKeepAlive};
@@ -412,6 +415,9 @@ bool Config::GetRFConfigKeepAliveEnabled(bool& out)
 }
 bool Config::GetRFConfigTxPin(gpio_num_t& out)
 {
+  if (s_cfgTxReadFails) {
+    return false;
+  }
   out = s_cfgTx;
   return true;
 }
@@ -534,6 +540,7 @@ static void freshHub(bool enabled = false, gpio_num_t pin = GPIO_NUM_NC)
   s_cfgTx        = static_cast<gpio_num_t>(OPENSHOCK_RF_TX_GPIO);
   s_cfgKeepAlive = false;
   (void)SafetyCaps::Clear();
+  s_cfgTxReadFails = false;
   s_onEStopSample  = nullptr;
   s_onCritical     = nullptr;
   s_criticalThread = nullptr;
@@ -1878,6 +1885,34 @@ static void taskRestartKeepsTheLatch()
   CHECK(EStopManager::IsArmed());
 }
 
+// Review finding F5: a checker task that starts on an engaged latch starts in `Active`, so it never publishes `Idle`
+// while the hub is engaged. First a gateway stop with the mushroom up and a task restart, then a cold boot latch that a
+// task starts on later.
+static void restartedTaskPublishesEngaged()
+{
+  armedHub();
+  sendTrigger(GatewaySchema::TriggerType::EmergencyStop);
+  advance(20);
+  CHECK(EStopManager::IsEStopped());
+  CHECK(!s_published.empty() && s_published.back() == EStopState::Active);
+  CHECK(estopmgr_setestopenabled(false));
+  CHECK(estopmgr_setestopenabled(true));
+  s_published.clear();
+  advance(200);
+  CHECK(EStopManager::IsEStopped());
+  CHECK(std::find(s_published.begin(), s_published.end(), EStopState::Idle) == s_published.end());
+
+  // With no task the cold boot latch has published nothing. The task that starts on it publishes `Active` once.
+  freshHub();
+  CHECK(s_estopTask == nullptr);
+  _handleEStopPinCommand("13"sv, false);
+  _handleEStopEnabledCommand("true"sv, false);
+  advance(50);
+  CHECK(EStopManager::IsArmed());
+  CHECK(EStopManager::IsEStopped());
+  CHECK(s_published.size() == 1 && s_published.front() == EStopState::Active);
+}
+
 static void capsLockTheEStopSettings()
 {
   armedHub();
@@ -1924,6 +1959,63 @@ static void enableNeedsAValidPin()
   CHECK(g_serialOut.find("Error|") == std::string::npos);
   advance(20);
   CHECK(EStopManager::IsArmed());
+}
+
+// Review finding F1: `estop enabled true` applies the pin rule to the stored pin, as `Init` does. A stored pin that the
+// rule refuses leaves the E-Stop off at boot, and enabling it afterwards refuses too: the transmitter, the board LED, a
+// pin with no pull-up and a strapping pin.
+static void enableRefusesAStoredConflictingPin()
+{
+  const auto tx = static_cast<gpio_num_t>(OPENSHOCK_RF_TX_GPIO);
+  for (gpio_num_t pin : {tx, static_cast<gpio_num_t>(kBoardLedPin), static_cast<gpio_num_t>(36), static_cast<gpio_num_t>(0)}) {
+    freshHub(true, pin);
+    CHECK(s_estopTask == nullptr);
+    CHECK(EStopManager::GetRunningPin() == GPIO_NUM_NC);
+
+    g_serialOut.clear();
+    _handleEStopEnabledCommand("true"sv, false);
+    CHECK(g_serialOut.find("Error|") != std::string::npos);
+    CHECK(s_estopTask == nullptr);
+    CHECK(EStopManager::GetRunningPin() == GPIO_NUM_NC);
+    CHECK(std::find(s_gpioConfigured.begin(), s_gpioConfigured.end(), static_cast<int>(pin)) == s_gpioConfigured.end());
+    advance(20);
+    CHECK(!EStopManager::IsArmed());
+    CHECK(EStopManager::IsEStopped());
+  }
+}
+
+// Review finding F6: the pin rule reads the stored RF TX pin, and a failed read refuses the pin on every route, serial
+// `estop pin`, the stored pin at boot and `estop enabled true`. It passes again once the read works.
+static void failedTxReadRefusesThePin()
+{
+  freshHub();
+  s_cfgTxReadFails = true;
+  CHECK(!EStopManager::SetEStopPin(kButton));
+  g_serialOut.clear();
+  _handleEStopPinCommand("13"sv, false);
+  CHECK(g_serialOut.find("Error|") != std::string::npos);
+  CHECK(EStopManager::GetRunningPin() == GPIO_NUM_NC);
+  CHECK(s_cfgPin == GPIO_NUM_NC);
+
+  s_cfgEnabled = true;
+  s_cfgPin     = kButton;
+  restartEStopManager(true);
+  CHECK(s_estopTask == nullptr);
+  CHECK(EStopManager::GetRunningPin() == GPIO_NUM_NC);
+  g_serialOut.clear();
+  _handleEStopEnabledCommand("true"sv, false);
+  CHECK(g_serialOut.find("Error|") != std::string::npos);
+  CHECK(s_estopTask == nullptr);
+  advance(20);
+  CHECK(!EStopManager::IsArmed());
+
+  s_cfgTxReadFails = false;
+  g_serialOut.clear();
+  _handleEStopEnabledCommand("true"sv, false);
+  CHECK(g_serialOut.find("Error|") == std::string::npos);
+  advance(20);
+  CHECK(EStopManager::IsArmed());
+  CHECK(EStopManager::GetRunningPin() == kButton);
 }
 
 // A stalled or dead checker reads as not armed, and it recovers when it samples again.
@@ -2278,8 +2370,8 @@ static void flashPinIsUnsafe()
   CHECK(list.find("(pin) == GPIO_NUM_10 ") != std::string::npos);
 }
 
-// `Config::SaveFromJSON`, `SetRaw` and `SaveFromFlatBuffer` are read here, not linked: src/config/Config.cpp needs the
-// real filesystem. The decision they share is tested, and a scan pins that each one calls it.
+// The decision that `Config::SaveFromJSON`, `SetRaw` and `SaveFromFlatBuffer` share. Those writers need the real
+// filesystem, so test/native/test_config_writers.cpp links them on a fake one and runs each against this rule.
 static void configWritesAreGated()
 {
   const KillConfig on {true, 13};
@@ -2299,20 +2391,6 @@ static void configWritesAreGated()
   // The transmitter side: the LED, and the pin the checker reads now while the stored pin moves away from it.
   CHECK(!KillConfigChangeAllowed(on, on, 2, 13, false));
   CHECK(!KillConfigChangeAllowed(on, KillConfig {true, 14}, 13, 13, false));
-
-  std::ifstream in("src/config/Config.cpp");
-  const std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
-  for (const char* writer : {"bool Config::SaveFromJSON(", "bool Config::SaveFromFlatBuffer(", "bool Config::SetRaw("}) {
-    const std::size_t begin = text.find(writer);
-    CHECK(begin != std::string::npos);
-    const std::size_t end = text.find("\n}\n", begin);
-    CHECK(text.substr(begin, end - begin).find("_killConfigChangeAllowed(") != std::string::npos);
-  }
-
-  // The writers obey the same lock as serial `estop`.
-  const std::size_t rule = text.find("static bool _killConfigChangeAllowed(");
-  CHECK(rule != std::string::npos);
-  CHECK(text.substr(rule, text.find("\n}\n", rule) - rule).find("EStopSettingsLocked(OpenShock::EStopManager::GetLatchSource(), ") != std::string::npos);
 }
 
 // Port 81: an endless fragment stream from the open access point.
@@ -2621,8 +2699,11 @@ int main()
   SCENARIO(heldButtonAcrossRestartStaysEngaged);
   SCENARIO(serialCannotClearTheLatch);
   SCENARIO(taskRestartKeepsTheLatch);
+  SCENARIO(restartedTaskPublishesEngaged);
   SCENARIO(capsLockTheEStopSettings);
   SCENARIO(enableNeedsAValidPin);
+  SCENARIO(enableRefusesAStoredConflictingPin);
+  SCENARIO(failedTxReadRefusesThePin);
   SCENARIO(stalledCheckerIsNotArmed);
   SCENARIO(stalledCheckerCannotSkipTheClear);
   SCENARIO(capRiseNeedsAnEngagedEStop);
