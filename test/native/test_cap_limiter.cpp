@@ -84,6 +84,27 @@ static void zeroCapsRefuse()
   }
 }
 
+// SP-9: a channel with every cap at 0 refuses every command the wire can carry. uint8 intensity by uint16 duration
+// is all of them. A refusal leaves no count, so nothing reaches the radio or the window counters.
+static void zeroCapsRefuseEveryCommand()
+{
+  ChannelCaps zero = {};
+  ChannelLimiter l;
+  uint64_t admitted = 0;
+  for (int64_t now : {int64_t {0}, kHour, kWarm}) {
+    for (int intensity = 0; intensity <= 255; ++intensity) {
+      for (int durationMs = 0; durationMs <= 65'535; ++durationMs) {
+        if (l.Admit(zero, static_cast<uint8_t>(intensity), static_cast<uint16_t>(durationMs), now) != Verdict::CapsNotSet) {
+          ++admitted;
+        }
+      }
+    }
+  }
+  CHECK(admitted == 0);
+  CHECK(l.StagesLastHour(kWarm) == 0);
+  CHECK(l.StagesLastDay(kWarm) == 0);
+}
+
 static void incoherentCapsRefuse()
 {
   ChannelCaps over     = fixture();
@@ -333,6 +354,7 @@ static void verdictHelpers()
 int main()
 {
   zeroCapsRefuse();
+  zeroCapsRefuseEveryCommand();
   incoherentCapsRefuse();
   requestCaps();
   coldBootHoldSpacing();

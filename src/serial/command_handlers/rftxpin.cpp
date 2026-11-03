@@ -22,13 +22,14 @@ void _handleRfTxPinCommand(std::string_view arg, bool isAutomated)
 
   if (!OpenShock::Convert::ToGpioNum(arg, txPin)) {
     SERPR_ERROR("Invalid argument (number invalid or out of range)");
+    return;
   }
 
   OpenShock::SetGPIOResultCode result = OpenShock::CommandHandler::SetRfTxPin(txPin);
 
   switch (result) {
     case OpenShock::SetGPIOResultCode::InvalidPin:
-      SERPR_ERROR("Invalid argument (invalid pin)");
+      SERPR_ERROR("Invalid argument (invalid pin, or it is the E-Stop pin or a board LED)");
       break;
 
     case OpenShock::SetGPIOResultCode::InternalError:

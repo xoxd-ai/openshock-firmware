@@ -3,8 +3,10 @@
 const char* const TAG = "SafetyCaps";
 
 #include "Core.h"
+#include "estop/EStopManager.h"
 #include "Logging.h"
 #include "SimpleMutex.h"
+#include "softproxy/KillPath.h"
 
 #include <esp_attr.h>
 #include <nvs.h>
@@ -48,6 +50,7 @@ static ChannelCaps s_shock     = {};
 static ChannelCaps s_vibrate   = {};
 static ChannelLimiter s_shockLimiter;
 static ChannelLimiter s_vibrateLimiter;
+static RefusalReport s_refusals;
 
 // Survives a warm restart. Its content is garbage after a cold boot, which the checksum rejects.
 static RTC_NOINIT_ATTR RetainedLimiters s_retained;
@@ -200,44 +203,47 @@ bool SafetyCaps::GetCounts(ShockerCommandType type, uint32_t& lastHour, uint32_t
   }
 }
 
-bool SafetyCaps::Set(ShockerCommandType type, const ChannelCaps& caps)
+SafetyCaps::SetResult SafetyCaps::Set(ShockerCommandType type, const ChannelCaps& caps)
 {
   if (!CapsSet(caps) || !CapsCoherent(caps)) {
-    return false;
+    return SetResult::Invalid;
+  }
+  if (type != ShockerCommandType::Shock && type != ShockerCommandType::Vibrate) {
+    return SetResult::Invalid;
   }
 
   ScopedLock lock__(&s_capsMutex);
   if (!ensureLoaded()) {
     // An unreadable record must not be overwritten with one channel set and the other silently 0.
     OS_LOGE(TAG, "Caps storage is unreadable, run `safetycaps clear` before setting caps");
-    return false;
+    return SetResult::Unreadable;
   }
 
-  ChannelCaps previous = {};
-  switch (type) {
-    case ShockerCommandType::Shock:
-      previous = s_shock;
-      s_shock  = caps;
-      break;
-    case ShockerCommandType::Vibrate:
-      previous  = s_vibrate;
-      s_vibrate = caps;
-      break;
-    default:
-      return false;
+  ChannelCaps& slot          = type == ShockerCommandType::Shock ? s_shock : s_vibrate;
+  const ChannelCaps previous = slot;
+
+  if (CapsRise(previous, caps) && !CapRiseAllowed(EStopManager::IsArmed(), EStopManager::GetLatchSource())) {
+    OS_LOGW(TAG, "Refusing to raise a cap, the E-Stop must be armed and engaged by its button (SP-113, SP-156)");
+    return SetResult::NeedsEngagedEStop;
   }
 
+  slot = caps;
   if (!saveRecord()) {
-    if (type == ShockerCommandType::Shock) {
-      s_shock = previous;
-    } else {
-      s_vibrate = previous;
-    }
-    return false;
+    slot = previous;
+    return SetResult::StoreFailed;
   }
 
   OS_LOGI(TAG, "Stored %s caps", type == ShockerCommandType::Shock ? "shock" : "vibrate");
-  return true;
+  return SetResult::Stored;
+}
+
+bool SafetyCaps::AnySet()
+{
+  ScopedLock lock__(&s_capsMutex);
+  if (!lock__.isLocked() || !ensureLoaded()) {
+    return true;
+  }
+  return !CapsCleared(s_shock) || !CapsCleared(s_vibrate);
 }
 
 bool SafetyCaps::Clear()
@@ -274,12 +280,9 @@ bool SafetyCaps::Clear()
   return true;
 }
 
-Verdict SafetyCaps::Admit(ShockerCommandType type, uint8_t intensity, uint16_t durationMs)
+// Checks a shock or vibrate command under the caps mutex.
+static Verdict admitCapped(ShockerCommandType type, uint8_t intensity, uint16_t durationMs)
 {
-  if (type != ShockerCommandType::Shock && type != ShockerCommandType::Vibrate) {
-    return Verdict::NotCapped;
-  }
-
   ScopedLock lock__(&s_capsMutex);
   if (!lock__.isLocked()) {
     return Verdict::CapsNotSet;
@@ -293,4 +296,32 @@ Verdict SafetyCaps::Admit(ShockerCommandType type, uint8_t intensity, uint16_t d
   Verdict verdict   = type == ShockerCommandType::Shock ? s_shockLimiter.Admit(s_shock, intensity, durationMs, now) : s_vibrateLimiter.Admit(s_vibrate, intensity, durationMs, now);
   sealRetained(now);
   return verdict;
+}
+
+void SafetyCaps::RecordRefusal(ShockerCommandType type, Verdict verdict)
+{
+  // Count and log every refusal with no lock held, so the log never holds the cap lock.
+  uint32_t seq = s_refusals.Record(verdict);
+  if (seq != 0) {
+    const char* channel = type == ShockerCommandType::Shock ? "shock" : type == ShockerCommandType::Vibrate ? "vibrate" : "other";
+    char line[kRefusalLineSize];
+    FormatRefusalLine(line, sizeof(line), seq, channel, verdict);
+    OS_LOGW(TAG, "%s", line);
+  }
+}
+
+Verdict SafetyCaps::Admit(ShockerCommandType type, uint8_t intensity, uint16_t durationMs)
+{
+  if (type != ShockerCommandType::Shock && type != ShockerCommandType::Vibrate) {
+    return Verdict::NotCapped;
+  }
+
+  Verdict verdict = admitCapped(type, intensity, durationMs);
+  RecordRefusal(type, verdict);
+  return verdict;
+}
+
+RefusalSnapshot SafetyCaps::GetRefusals()
+{
+  return s_refusals.Snapshot();
 }

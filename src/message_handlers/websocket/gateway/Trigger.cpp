@@ -23,12 +23,13 @@ void _Private::HandleTrigger(const OpenShock::Serialization::Gateway::GatewayToH
     return;
   }
 
-  if (EStopManager::IsEStopped()) {
+  auto triggerType = msg->type();
+
+  // An EmergencyStop passes while engaged, because a clear in progress would otherwise release the hub after it.
+  if (EStopManager::IsEStopped() && triggerType != TriggerType::EmergencyStop) {
     OS_LOGD(TAG, "Ignoring trigger command due to EmergencyStop being activated");
     return;
   }
-
-  auto triggerType = msg->type();
 
   switch (triggerType) {
     case TriggerType::Restart:
@@ -43,6 +44,11 @@ void _Private::HandleTrigger(const OpenShock::Serialization::Gateway::GatewayToH
       EStopManager::Trigger();
       break;
     case TriggerType::CaptivePortalEnable:
+      // Softproxy fork (SP-46): the gateway may not hold the portal open (softproxy/Lockout.h).
+      if (!OpenShock::Softproxy::kAllowGatewayCaptivePortalEnable) {
+        OS_LOGW(TAG, "Ignoring gateway captive portal enable trigger, disabled in this fork");
+        break;
+      }
       OpenShock::CaptivePortal::SetAlwaysEnabled(true);
       break;
     case TriggerType::CaptivePortalDisable:

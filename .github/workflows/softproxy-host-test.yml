@@ -1,10 +1,11 @@
-# Softproxy fork: runs the host test of the cap decision logic (SOFTPROXY.md). Linear: TIN-7545.
+# Softproxy fork: runs the host tests of the cap decision logic, the SP-46 local lockdown, the refusal report, the command paths, the kill path and the whole-config writers (SOFTPROXY.md). Linear: TIN-7545.
 name: softproxy-host-test
 
 on:
   pull_request:
     branches:
       - 'softproxy/**'
+      - 'feat/tin-7545-softproxy-caps'
     types: [opened, reopened, synchronize]
   push:
     branches:
@@ -18,12 +19,60 @@ jobs:
   cap-limiter:
     name: cap limiter host test
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 10
 
     steps:
       - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      # The commit platformio.ini pins. The command path and kill path tests need its headers.
+      - uses: actions/checkout@v6
+        with:
+          repository: google/flatbuffers
+          ref: 8b02fe6178427b96aea25396b53ea4ae8cadd7d8
+          path: .deps/flatbuffers
+          persist-credentials: false
 
       - name: Build and run the host test
         run: |
           g++ -std=c++20 -Wall -Wextra -Werror -Iinclude test/native/test_cap_limiter.cpp -o cap_limiter_test
           ./cap_limiter_test
+
+      - name: Build and run the local lockdown and refusal report test
+        run: |
+          g++ -std=c++20 -Wall -Wextra -Werror -Iinclude test/native/test_local_lockdown.cpp -o local_lockdown_test
+          ./local_lockdown_test
+
+      - name: Build and run the command path test
+        run: |
+          WS=src/message_handlers/websocket
+          SRC="src/CommandHandler.cpp src/softproxy/SafetyCaps.cpp $WS/Local.cpp $WS/Gateway.cpp"
+          SRC="$SRC $WS/gateway/ShockerCommandList.cpp $WS/gateway/Trigger.cpp $WS/local/SetRfTxPinCommand.cpp"
+          SRC="$SRC src/serial/command_handlers/rftransmit.cpp src/serial/command_handlers/rftxpin.cpp src/radio/rmt/*Encoder.cpp"
+          g++ -std=c++20 -O1 -Itest/native/stubs -Iinclude -I.deps/flatbuffers/include test/native/test_command_paths.cpp $SRC -o command_paths_test
+          ./command_paths_test
+
+      - name: Build and run the kill path test
+        run: |
+          # Once per PiShock RF TX default: 12 for Pishock-2023, 15 for Pishock-Lite-2021.
+          FLAGS="-std=c++20 -O1 -pthread -DSOFTPROXY_KILL_TEST -DOPENSHOCK_FW_CHIP_ESP32 -DOPENSHOCK_LED_GPIO=2 -DSOFTPROXY_PISHOCK_BUILD"
+          INC="-Itest/native/kill_stubs -Itest/native/stubs -Iinclude -I.deps/flatbuffers/include"
+          SRC="src/CommandHandler.cpp src/softproxy/SafetyCaps.cpp src/WebSocketDeFragger.cpp src/radio/RFTransmitter.cpp"
+          SRC="$SRC src/radio/rmt/Sequence.cpp src/radio/rmt/*Encoder.cpp src/serial/command_handlers/estop.cpp"
+          SRC="$SRC src/serial/command_handlers/rftxpin.cpp src/message_handlers/websocket/gateway/Trigger.cpp"
+          SRC="$SRC src/util/StringUtils.cpp"
+          for TX in 12 15; do
+            g++ $FLAGS -DOPENSHOCK_RF_TX_GPIO=$TX $INC -Wl,--wrap=malloc test/native/test_kill_path.cpp $SRC -o kill_path_test
+            ./kill_path_test
+          done
+
+      - name: Build and run the config writer test
+        run: |
+          # Links the real src/config/Config.cpp and RootConfig.cpp, once per PiShock RF TX default.
+          FLAGS="-std=c++20 -O1 -DOPENSHOCK_FW_CHIP_ESP32 -DOPENSHOCK_LED_GPIO=2 -DSOFTPROXY_PISHOCK_BUILD"
+          INC="-Itest/native/config_stubs -Iinclude -I.deps/flatbuffers/include"
+          for TX in 12 15; do
+            g++ $FLAGS -DOPENSHOCK_RF_TX_GPIO=$TX $INC test/native/test_config_writers.cpp src/config/Config.cpp src/config/RootConfig.cpp -o config_writers_test
+            ./config_writers_test
+          done
