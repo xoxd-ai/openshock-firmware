@@ -69,10 +69,12 @@ jobs:
 
       - name: Build and run the config writer test
         run: |
-          # Links the real src/config/Config.cpp and RootConfig.cpp, once per PiShock RF TX default.
-          FLAGS="-std=c++20 -O1 -DOPENSHOCK_FW_CHIP_ESP32 -DOPENSHOCK_LED_GPIO=2 -DSOFTPROXY_PISHOCK_BUILD"
+          # Links the real Config.cpp, RootConfig.cpp and the RF and E-Stop parsers, once per PiShock RF TX default.
+          # The shift sanitizer fails the run if a negative pin reaches GPIO_IS_VALID_GPIO.
+          FLAGS="-std=c++20 -O1 -fsanitize=shift -fsanitize-undefined-trap-on-error -DOPENSHOCK_FW_CHIP_ESP32 -DOPENSHOCK_LED_GPIO=2 -DSOFTPROXY_PISHOCK_BUILD"
           INC="-Itest/native/config_stubs -Iinclude -I.deps/flatbuffers/include"
+          SRC="src/config/Config.cpp src/config/RootConfig.cpp src/config/RFConfig.cpp src/config/EStopConfig.cpp src/config/internal/utils.cpp"
           for TX in 12 15; do
-            g++ $FLAGS -DOPENSHOCK_RF_TX_GPIO=$TX $INC test/native/test_config_writers.cpp src/config/Config.cpp src/config/RootConfig.cpp -o config_writers_test
+            g++ $FLAGS -DOPENSHOCK_RF_TX_GPIO=$TX $INC test/native/test_config_writers.cpp $SRC -o config_writers_test
             ./config_writers_test
           done
