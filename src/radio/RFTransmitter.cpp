@@ -244,13 +244,14 @@ void RFTransmitter::TransmitTask()
 
     // Terminate all remaining sequences
     bool isEstopped = OpenShock::EStopManager::IsEStopped();
-    if (isEstopped != wasEstopped) {
-      wasEstopped = isEstopped;
+    wasEstopped     = isEstopped;
 
-      if (isEstopped) {
-        // Set all sequences to transmit their terminators
-        int64_t now = OpenShock::millis();
-        for (auto seq = sequences.begin(); seq != sequences.end(); ++seq) {
+    if (isEstopped) {
+      // On every pass, not only on the change: a sequence added after a release can meet a new engagement before this
+      // line, with `wasEstopped` still true. Only a later end moves, so a terminator already running still finishes.
+      int64_t now = OpenShock::millis();
+      for (auto seq = sequences.begin(); seq != sequences.end(); ++seq) {
+        if (seq->transmitEnd() > now) {
           seq->setTransmitEnd(now);
         }
       }

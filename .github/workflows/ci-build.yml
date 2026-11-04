@@ -12,6 +12,8 @@ on:
       - master
       - beta
       - develop
+      # Softproxy fork: the firmware build also runs on PRs into the cap branch (TIN-7545).
+      - 'feat/tin-7545-softproxy-caps'
     types: [opened, reopened, synchronize]
   workflow_dispatch: # Manually invoked by user.
 
