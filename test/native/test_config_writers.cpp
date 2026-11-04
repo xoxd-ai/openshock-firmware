@@ -1,15 +1,17 @@
 // Host test of the whole-config writers (TIN-7545). It links the real src/config/Config.cpp and
 // src/config/RootConfig.cpp, so `SaveFromJSON` (serial `jsonconfig`), `SetRaw` (serial `rawconfig`) and
 // `SaveFromFlatBuffer` run their real bodies, with the real `_killConfigChangeAllowed` gate and the real
-// `KillConfigChangeAllowed` rule behind it. Fakes, in test/native/config_stubs/ and below: the LittleFS file, cJSON, the
-// mutex, logging, `Chipset`, the E-Stop latch and running pin, `SafetyCaps::AnySet` and the leaf configs. The leaf fakes
-// copy what the real RFConfig.cpp and EStopConfig.cpp read and write. The other leaves read and write nothing.
+// `KillConfigChangeAllowed` rule behind it. The RF and E-Stop parsers are the real RFConfig.cpp, EStopConfig.cpp and
+// internal/utils.cpp, on the real Chipset.h. Fakes, in test/native/config_stubs/ and below: the LittleFS file, cJSON, the
+// mutex, logging, the GPIO driver header, the E-Stop latch and running pin, `SafetyCaps::AnySet` and the other leaf
+// configs, which read and write nothing.
 //
 // Run from the repository root, once per PiShock RF TX default (TX=12 for Pishock-2023, TX=15 for Pishock-Lite-2021):
 //
 //   FB=.pio/libdeps/Pishock-2023/flatbuffers/include
-//   FLAGS="-std=c++20 -O1 -DOPENSHOCK_FW_CHIP_ESP32 -DOPENSHOCK_LED_GPIO=2 -DSOFTPROXY_PISHOCK_BUILD -DOPENSHOCK_RF_TX_GPIO=$TX"
-//   SRC="test/native/test_config_writers.cpp src/config/Config.cpp src/config/RootConfig.cpp"
+//   FLAGS="-std=c++20 -O1 -fsanitize=shift -fsanitize-undefined-trap-on-error -DOPENSHOCK_FW_CHIP_ESP32 -DOPENSHOCK_LED_GPIO=2 -DSOFTPROXY_PISHOCK_BUILD -DOPENSHOCK_RF_TX_GPIO=$TX"
+//   SRC="test/native/test_config_writers.cpp src/config/Config.cpp src/config/RootConfig.cpp src/config/RFConfig.cpp"
+//   SRC="$SRC src/config/EStopConfig.cpp src/config/internal/utils.cpp"
 //   g++ $FLAGS -Itest/native/config_stubs -Iinclude -I$FB $SRC -o config_writers_test && ./config_writers_test
 
 #include "config/Config.h"
@@ -17,6 +19,7 @@
 #include "estop/EStopManager.h"
 #include "softproxy/KillPath.h"
 #include "softproxy/SafetyCaps.h"
+#include "util/IPAddressUtils.h"
 
 #include "serialization/_fbs/HubConfig_generated.h"
 
@@ -56,115 +59,14 @@ bool Softproxy::SafetyCaps::Clear()
   return true;
 }
 
-namespace {
-  int jsonNumber(const cJSON* json, const char* name, int fallback)
-  {
-    const cJSON* item = cJSON_GetObjectItemCaseSensitive(json, name);
-    return item != nullptr && item->kind == cJSON::Kind::Number ? static_cast<int>(item->number) : fallback;
-  }
-  bool jsonBool(const cJSON* json, const char* name, bool fallback)
-  {
-    const cJSON* item = cJSON_GetObjectItemCaseSensitive(json, name);
-    return item != nullptr && item->kind == cJSON::Kind::Bool ? item->boolean : fallback;
-  }
-}  // namespace
+// `internal/utils.cpp` names this for the backend fields, and no leaf this test links parses one.
+bool OpenShock::IPV4AddressFromStringView(IPAddress&, std::string_view)
+{
+  return false;
+}
 
-// The leaf configs. RF and E-Stop follow the real parsers for the fields the gate reads.
+// The other leaf configs read and write nothing. RF and E-Stop are the real parsers.
 namespace OpenShock::Config {
-  RFConfig::RFConfig()
-    : txPin(static_cast<gpio_num_t>(OPENSHOCK_RF_TX_GPIO))
-    , keepAliveEnabled(true)
-  {
-  }
-  RFConfig::RFConfig(gpio_num_t txPin, bool keepAliveEnabled)
-    : txPin(txPin)
-    , keepAliveEnabled(keepAliveEnabled)
-  {
-  }
-  void RFConfig::ToDefault()
-  {
-    txPin            = static_cast<gpio_num_t>(OPENSHOCK_RF_TX_GPIO);
-    keepAliveEnabled = true;
-  }
-  bool RFConfig::FromFlatbuffers(const Fbs::RFConfig* config)
-  {
-    if (config == nullptr) {
-      ToDefault();
-      return true;
-    }
-    txPin            = static_cast<gpio_num_t>(config->tx_pin());
-    keepAliveEnabled = config->keepalive_enabled();
-    return true;
-  }
-  flatbuffers::Offset<Fbs::RFConfig> RFConfig::ToFlatbuffers(flatbuffers::FlatBufferBuilder& builder, bool) const
-  {
-    return Fbs::CreateRFConfig(builder, static_cast<int8_t>(txPin), keepAliveEnabled);
-  }
-  bool RFConfig::FromJSON(const cJSON* json)
-  {
-    if (json == nullptr) {
-      ToDefault();
-      return true;
-    }
-    if (cJSON_IsObject(json) == 0) {
-      return false;
-    }
-    txPin            = static_cast<gpio_num_t>(jsonNumber(json, "txPin", OPENSHOCK_RF_TX_GPIO));
-    keepAliveEnabled = jsonBool(json, "keepAliveEnabled", true);
-    return true;
-  }
-  cJSON* RFConfig::ToJSON(bool) const
-  {
-    return cJSON_CreateObject();
-  }
-
-  EStopConfig::EStopConfig()
-    : enabled(IsValidInputPin(OPENSHOCK_ESTOP_PIN))
-    , gpioPin(static_cast<gpio_num_t>(OPENSHOCK_ESTOP_PIN))
-  {
-  }
-  EStopConfig::EStopConfig(bool enabled, gpio_num_t gpioPin)
-    : enabled(enabled)
-    , gpioPin(gpioPin)
-  {
-  }
-  void EStopConfig::ToDefault()
-  {
-    enabled = IsValidInputPin(OPENSHOCK_ESTOP_PIN);
-    gpioPin = static_cast<gpio_num_t>(OPENSHOCK_ESTOP_PIN);
-  }
-  bool EStopConfig::FromFlatbuffers(const Fbs::EStopConfig* config)
-  {
-    if (config == nullptr) {
-      ToDefault();
-      return true;
-    }
-    gpioPin = static_cast<gpio_num_t>(config->gpio_pin());
-    enabled = IsValidInputPin(gpioPin) && config->enabled();
-    return true;
-  }
-  flatbuffers::Offset<Fbs::EStopConfig> EStopConfig::ToFlatbuffers(flatbuffers::FlatBufferBuilder& builder, bool) const
-  {
-    return Fbs::CreateEStopConfig(builder, enabled, static_cast<int8_t>(gpioPin));
-  }
-  bool EStopConfig::FromJSON(const cJSON* json)
-  {
-    if (json == nullptr) {
-      ToDefault();
-      return true;
-    }
-    if (cJSON_IsObject(json) == 0) {
-      return false;
-    }
-    gpioPin = static_cast<gpio_num_t>(jsonNumber(json, "gpioPin", OPENSHOCK_ESTOP_PIN));
-    enabled = jsonBool(json, "enabled", IsValidInputPin(gpioPin));
-    return true;
-  }
-  cJSON* EStopConfig::ToJSON(bool) const
-  {
-    return cJSON_CreateObject();
-  }
-
 #define SOFTPROXY_EMPTY_LEAF(Type)                                                                \
   void Type::ToDefault()                                                                          \
   {                                                                                               \
@@ -396,6 +298,140 @@ static void writerAppliesTheKillRule(Writer writer)
   }
 }
 
+// The E-Stop parser's refusal of a negative pin. `GPIO_IS_VALID_GPIO` has no sign check, so the parser must stop every
+// negative byte but -1 before the pin reaches it.
+static void negativeEStopPinsAreRefused()
+{
+  const int failuresBefore = s_failures;
+
+  for (int pin = -128; pin <= -2; ++pin) {
+    flatbuffers::FlatBufferBuilder builder;
+    builder.Finish(Fbs::CreateEStopConfig(builder, true, static_cast<int8_t>(pin)));
+    Config::EStopConfig parsed(true, static_cast<gpio_num_t>(kStopPin));
+    CHECK(!parsed.FromFlatbuffers(flatbuffers::GetRoot<Fbs::EStopConfig>(builder.GetBufferPointer())));
+    CHECK(parsed.enabled && parsed.gpioPin == kStopPin);
+
+    const Candidate candidate {true, pin, kTx, false};
+    for (Writer writer : {Writer::FlatBuffer, Writer::Raw}) {
+      seed(EStopLatchSource::Released, false, GPIO_NUM_NC);
+      CHECK(!write(writer, candidate));
+      CHECK(leftAlone());
+    }
+  }
+
+  // -1 is the stored form of no pin, so it parses, and it can never read as enabled.
+  flatbuffers::FlatBufferBuilder builder;
+  builder.Finish(Fbs::CreateEStopConfig(builder, true, -1));
+  Config::EStopConfig parsed(true, static_cast<gpio_num_t>(kStopPin));
+  CHECK(parsed.FromFlatbuffers(flatbuffers::GetRoot<Fbs::EStopConfig>(builder.GetBufferPointer())));
+  CHECK(!parsed.enabled && parsed.gpioPin == GPIO_NUM_NC);
+
+  const Candidate noPin {true, -1, kTx, false};
+  for (Writer writer : {Writer::FlatBuffer, Writer::Raw}) {
+    seed(EStopLatchSource::Released, false, GPIO_NUM_NC);
+    CHECK(write(writer, noPin));
+    CHECK(g_configFileWrites == 1);
+  }
+  CHECK(Config::SaveFromFlatBuffer(flatbuffers::GetRoot<Fbs::HubConfig>(asFlatBuffer(noPin).data())));
+  CHECK(storedIs(-1, false, kTx));
+
+  // JSON reads the pin as an unsigned byte, so a negative number falls back to the build default and never reaches the
+  // macro. The default is -1 on both PiShock envs. The same write is a pin change, so a lock refuses it.
+  const Candidate negative {true, -2, kTx, false};
+  seed(EStopLatchSource::Released, false, GPIO_NUM_NC);
+  CHECK(write(Writer::Json, negative));
+  CHECK(storedIs(OPENSHOCK_ESTOP_PIN, true, kTx));
+  seed(EStopLatchSource::Button, false, static_cast<gpio_num_t>(kStopPin));
+  CHECK(!write(Writer::Json, negative));
+  CHECK(leftAlone());
+
+  // A stored file that holds such a byte does not load, so boot writes the defaults over it: no E-Stop pin, not enabled.
+  seed(EStopLatchSource::Released, false, GPIO_NUM_NC);
+  g_configFile = asFlatBuffer({true, -2, kStopPin + 1, false});
+  Config::Init();
+  CHECK(g_configFileWrites == 1);
+  CHECK(storedIs(OPENSHOCK_ESTOP_PIN, false, kTx));
+
+  if (s_failures != failuresBefore) {
+    std::printf("scenario failed: negativeEStopPinsAreRefused\n");
+  }
+}
+
+// The real parsers differ from what the fakes they replaced did, and each difference here pins the real one.
+static void realLeafParsersRun()
+{
+  const int failuresBefore = s_failures;
+
+  auto parseEStop = [](bool enabled, int pin) {
+    flatbuffers::FlatBufferBuilder builder;
+    builder.Finish(Fbs::CreateEStopConfig(builder, enabled, static_cast<int8_t>(pin)));
+    Config::EStopConfig parsed;
+    CHECK(parsed.FromFlatbuffers(flatbuffers::GetRoot<Fbs::EStopConfig>(builder.GetBufferPointer())));
+    return parsed;
+  };
+  auto parseRf = [](int pin) {
+    flatbuffers::FlatBufferBuilder builder;
+    builder.Finish(Fbs::CreateRFConfig(builder, static_cast<int8_t>(pin), false));
+    Config::RFConfig parsed(static_cast<gpio_num_t>(kStopPin), true);
+    CHECK(parsed.FromFlatbuffers(flatbuffers::GetRoot<Fbs::RFConfig>(builder.GetBufferPointer())));
+    CHECK(!parsed.keepAliveEnabled);
+    return parsed;
+  };
+
+  // A pin Chipset.h refuses keeps its number and reads as not enabled: past the last pin, a hole in the ESP32 pin mask
+  // and pins on the chip's unsafe list. Pin 0 sits at the top of the range the negative-pin guard must not reach, and
+  // it is also what an absent `gpio_pin` field reads as.
+  for (int pin : {100, 30, 16, 0}) {
+    const Config::EStopConfig parsed = parseEStop(true, pin);
+    CHECK(!parsed.enabled && parsed.gpioPin == pin);
+  }
+
+  // So a stored file that holds pin 0 loads, and boot writes nothing over it.
+  seed(EStopLatchSource::Released, false, GPIO_NUM_NC);
+  g_configFile = asFlatBuffer({true, 0, kOtherPin, false});
+  Config::Init();
+  CHECK(g_configFileWrites == 0);
+  CHECK(storedIs(0, false, kOtherPin));
+
+  const Config::EStopConfig usable = parseEStop(true, kStopPin);
+  CHECK(usable.enabled && usable.gpioPin == kStopPin);
+  CHECK(!parseEStop(false, kStopPin).enabled);
+
+  // The RF parser reads the byte as unsigned, and a pin the mask refuses, or any negative one, falls back to the default.
+  for (int pin : {-2, -1, -128, 30, 100}) {
+    CHECK(parseRf(pin).txPin == kTx);
+  }
+  CHECK(parseRf(kOtherPin).txPin == kOtherPin);
+
+  // JSON: only the range check in `FromJsonU8` stops these two numbers. Each wraps to pin 13 as a byte, which the GPIO
+  // check would take.
+  for (int outOfRange : {-243, 269}) {
+    seed(EStopLatchSource::Released, false, GPIO_NUM_NC);
+    CHECK(write(Writer::Json, {false, kOtherPin, outOfRange, false}));
+    CHECK(storedIs(kOtherPin, false, kTx));
+    seed(EStopLatchSource::Released, false, GPIO_NUM_NC);
+    CHECK(write(Writer::Json, {false, outOfRange, kOtherPin, false}));
+    CHECK(storedIs(OPENSHOCK_ESTOP_PIN, false, kOtherPin));
+  }
+
+  // JSON: a pin that fails falls back to the default, and an `enabled` of the wrong type refuses the whole write.
+  seed(EStopLatchSource::Released, false, GPIO_NUM_NC);
+  CHECK(Config::SaveFromJSON(R"({"rf":{"txPin":300,"keepAliveEnabled":false},"estop":{"enabled":false,"gpioPin":300}})"));
+  CHECK(storedIs(OPENSHOCK_ESTOP_PIN, false, kTx));
+  seed(EStopLatchSource::Released, false, GPIO_NUM_NC);
+  CHECK(!Config::SaveFromJSON(R"({"rf":{"txPin":14},"estop":{"enabled":1,"gpioPin":13}})"));
+  CHECK(leftAlone());
+
+  // A missing `enabled` takes the validity of the pin.
+  seed(EStopLatchSource::Released, false, GPIO_NUM_NC);
+  CHECK(Config::SaveFromJSON(R"({"rf":{"txPin":14},"estop":{"gpioPin":13}})"));
+  CHECK(storedIs(kStopPin, true, kOtherPin));
+
+  if (s_failures != failuresBefore) {
+    std::printf("scenario failed: realLeafParsersRun\n");
+  }
+}
+
 static void malformedJsonWritesNothing()
 {
   const int failuresBefore = s_failures;
@@ -419,6 +455,8 @@ int main()
     writerAppliesTheKillRule(writer);
   }
   malformedJsonWritesNothing();
+  negativeEStopPinsAreRefused();
+  realLeafParsersRun();
 
   if (s_failures != 0) {
     std::printf("%d check(s) failed\n", s_failures);

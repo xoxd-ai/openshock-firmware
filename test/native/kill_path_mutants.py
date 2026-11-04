@@ -37,7 +37,10 @@ SERIAL_CAPS = 'src/serial/command_handlers/safetycaps.cpp'
 CONFIG = 'src/config/Config.cpp'
 CHIPSET = 'include/Chipset.h'
 CONFIG_TEST = 'test/native/test_config_writers.cpp'
-CONFIG_UNITS = [CONFIG_TEST, CONFIG, 'src/config/RootConfig.cpp']
+ESTOP_CONFIG = 'src/config/EStopConfig.cpp'
+RF_CONFIG = 'src/config/RFConfig.cpp'
+CONFIG_UTILS = 'src/config/internal/utils.cpp'
+CONFIG_UNITS = [CONFIG_TEST, CONFIG, 'src/config/RootConfig.cpp', RF_CONFIG, ESTOP_CONFIG, CONFIG_UTILS]
 ENCODERS = ['src/radio/rmt/%sEncoder.cpp' % name for name in ('CaiXianlin', 'D80', 'Petrainer998DR', 'Petrainer', 'T330')]
 UNITS = [TEST, CH, SC, DF, RF, 'src/radio/rmt/Sequence.cpp'] + ENCODERS + ['src/serial/command_handlers/estop.cpp', RFTXPIN, TR, 'src/util/StringUtils.cpp']
 
@@ -49,6 +52,7 @@ LOCK = 'return anyCapSet || source == EStopLatchSource::Button || source == ESto
 WARM = '    case ESP_RST_SW:\n'
 RESERVED = 'return pin == 0 || pin == 2 || pin == 5 || pin == 12 || pin == 15 || (pin >= 6 && pin <= 11);'
 GATE = 'if (EStopManager::IsEStopped() && triggerType != TriggerType::EmergencyStop) {'
+NEGATIVE_PIN = 'if (pin < 0 && pin != OPENSHOCK_GPIO_INVALID) {'
 
 # The clear before the sample count: it ends at the wall time 5 seconds after it started, however few samples ran.
 CLEAR_ON_WALL_TIME = ('} else if ([&] { static int64_t endsAt; if (clearSamplesLeft == k_estopClearSamples) endsAt = now + k_estopClearTime'
@@ -185,6 +189,18 @@ MUTANTS = [
   ('C1 SaveFromJSON skips the kill gate', CONFIG, 'if (!candidate.FromJSON(root) || !_killConfigChangeAllowed(candidate)) {', 'if (!candidate.FromJSON(root)) {', [CONFIG]),
   ('C2 SaveFromFlatBuffer skips the kill gate', CONFIG, 'if (!candidate.FromFlatbuffers(config) || !_killConfigChangeAllowed(candidate)) {', 'if (!candidate.FromFlatbuffers(config)) {', [CONFIG]),
   ('C3 SetRaw skips the kill gate', CONFIG, '  if (!_killConfigChangeAllowed(config)) {\n    return false;\n  }\n', '', [CONFIG]),
+  ('P1 E-Stop parser takes a negative pin', ESTOP_CONFIG, NEGATIVE_PIN, 'if (false) {', [ESTOP_CONFIG]),
+  ('P2 E-Stop parser refuses no pin', ESTOP_CONFIG, NEGATIVE_PIN, 'if (pin < 0) {', [ESTOP_CONFIG]),
+  ('P3 E-Stop parser takes the lowest negative pins', ESTOP_CONFIG, NEGATIVE_PIN, 'if (pin < 0 && pin != OPENSHOCK_GPIO_INVALID && pin > -64) {', [ESTOP_CONFIG]),
+  ('P4 E-Stop parser enables an invalid pin', ESTOP_CONFIG, 'if (OpenShock::IsValidInputPin(static_cast<int8_t>(gpioPin))) {', 'if (true) {', [ESTOP_CONFIG]),
+  ('P5 RF parser drops the flatbuffer pin', RF_CONFIG, 'Internal::Utils::FromU8GpioNum(txPin, config->tx_pin(), static_cast<gpio_num_t>(OPENSHOCK_RF_TX_GPIO));', '', [RF_CONFIG]),
+  ('P6 RF parser drops the JSON pin', RF_CONFIG, 'Internal::Utils::FromJsonGpioNum(txPin, json, "txPin", static_cast<gpio_num_t>(OPENSHOCK_RF_TX_GPIO));', '', [RF_CONFIG]),
+  ('P7 E-Stop parser drops the JSON pin', ESTOP_CONFIG, 'Internal::Utils::FromJsonGpioNum(gpioPin, json, "gpioPin", static_cast<gpio_num_t>(OPENSHOCK_ESTOP_PIN));', '', [ESTOP_CONFIG]),
+  ('P8 E-Stop parser takes an enabled of the wrong type', ESTOP_CONFIG, 'OS_LOGE(TAG, "Failed to parse enabled");\n    return false;', 'OS_LOGE(TAG, "Failed to parse enabled");', [ESTOP_CONFIG]),
+  ('P9 a pin outside the ESP32 mask passes', CONFIG_UTILS, 'if (u8Val >= GPIO_NUM_MAX || !GPIO_IS_VALID_GPIO(u8Val)) {', 'if (u8Val >= GPIO_NUM_MAX) {', [CONFIG_UTILS]),
+  ('M1 E-Stop parser refuses pin 0', ESTOP_CONFIG, NEGATIVE_PIN, 'if (pin <= 0 && pin != OPENSHOCK_GPIO_INVALID) {', [ESTOP_CONFIG]),
+  ('M23 a JSON number below the range wraps to a pin', CONFIG_UTILS, 'if (intVal < minVal) {', 'if (false) {', [CONFIG_UTILS]),
+  ('M24 a JSON number above the range wraps to a pin', CONFIG_UTILS, 'if (intVal > maxVal) {', 'if (false) {', [CONFIG_UTILS]),
   ('K78 boot never starts the keep-alive', CH, 'if (rfConfig.keepAliveEnabled && !EStopManager::IsEStopped()) {', 'if (false) {', [CH]),
   ('R4 RF task stops discarding while engaged', RF, 'if (OpenShock::EStopManager::IsEStopped()) {\n        // Immediately', 'if (false) {\n        // Immediately', [RF]),
   ('R4b RF task adds what it should discard', RF, '        // Discard next item in queue\n        continue;\n', '', [RF]),
