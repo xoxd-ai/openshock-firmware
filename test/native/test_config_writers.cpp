@@ -379,11 +379,20 @@ static void realLeafParsersRun()
   };
 
   // A pin Chipset.h refuses keeps its number and reads as not enabled: past the last pin, a hole in the ESP32 pin mask
-  // and a pin on the chip's unsafe list.
-  for (int pin : {100, 30, 16}) {
+  // and pins on the chip's unsafe list. Pin 0 sits at the top of the range the negative-pin guard must not reach, and
+  // it is also what an absent `gpio_pin` field reads as.
+  for (int pin : {100, 30, 16, 0}) {
     const Config::EStopConfig parsed = parseEStop(true, pin);
     CHECK(!parsed.enabled && parsed.gpioPin == pin);
   }
+
+  // So a stored file that holds pin 0 loads, and boot writes nothing over it.
+  seed(EStopLatchSource::Released, false, GPIO_NUM_NC);
+  g_configFile = asFlatBuffer({true, 0, kOtherPin, false});
+  Config::Init();
+  CHECK(g_configFileWrites == 0);
+  CHECK(storedIs(0, false, kOtherPin));
+
   const Config::EStopConfig usable = parseEStop(true, kStopPin);
   CHECK(usable.enabled && usable.gpioPin == kStopPin);
   CHECK(!parseEStop(false, kStopPin).enabled);
@@ -393,6 +402,17 @@ static void realLeafParsersRun()
     CHECK(parseRf(pin).txPin == kTx);
   }
   CHECK(parseRf(kOtherPin).txPin == kOtherPin);
+
+  // JSON: only the range check in `FromJsonU8` stops these two numbers. Each wraps to pin 13 as a byte, which the GPIO
+  // check would take.
+  for (int outOfRange : {-243, 269}) {
+    seed(EStopLatchSource::Released, false, GPIO_NUM_NC);
+    CHECK(write(Writer::Json, {false, kOtherPin, outOfRange, false}));
+    CHECK(storedIs(kOtherPin, false, kTx));
+    seed(EStopLatchSource::Released, false, GPIO_NUM_NC);
+    CHECK(write(Writer::Json, {false, outOfRange, kOtherPin, false}));
+    CHECK(storedIs(OPENSHOCK_ESTOP_PIN, false, kOtherPin));
+  }
 
   // JSON: a pin that fails falls back to the default, and an `enabled` of the wrong type refuses the whole write.
   seed(EStopLatchSource::Released, false, GPIO_NUM_NC);
