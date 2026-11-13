@@ -32,6 +32,7 @@ namespace OpenShock::Softproxy {
   static_assert(static_cast<uint8_t>(Verdict::Daily) == 9);
   static_assert(static_cast<uint8_t>(Verdict::EStopEngaged) == 10);
   static_assert(static_cast<uint8_t>(Verdict::EStopNotArmed) == 11);
+  static_assert(static_cast<uint8_t>(Verdict::OverOnTime) == 12);
 
   /// One consistent reading of the report.
   struct RefusalSnapshot {
@@ -81,7 +82,7 @@ namespace OpenShock::Softproxy {
     if (code == 0) {
       return "none";
     }
-    if (code > static_cast<uint8_t>(Verdict::EStopNotArmed)) {
+    if (code > static_cast<uint8_t>(Verdict::OverOnTime)) {
       return "unknown";
     }
     return VerdictName(static_cast<Verdict>(code));

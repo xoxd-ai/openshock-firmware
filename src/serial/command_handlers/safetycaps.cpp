@@ -83,7 +83,7 @@ static void _handleSafetyCapsSet(std::string_view arg, OpenShock::ShockerCommand
     return;
   }
   if (!OpenShock::Softproxy::CapsCoherent(caps)) {
-    SERPR_ERROR("Invalid caps (need maxIntensityPct <= 100, maxPerHour <= maxPerDay and minGapSec * maxPerHour <= 3600)");
+    SERPR_ERROR("Invalid caps (need maxIntensityPct <= 100, maxPerHour <= maxPerDay, minGapSec * maxPerHour <= 3600 and maxPulseMs <= minGapSec * 1000)");
     return;
   }
 

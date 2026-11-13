@@ -524,6 +524,47 @@ static void coldBootHolds()
   CHECK(g_radio.size() == 1);
 }
 
+// Review H1 through the real `HandleCommand` and serial `rftransmit`: pulses as long as the gap, one stage apart, abut,
+// so the second would join the first on the radio. It refuses as `over-on-time`, wire code 12, and never reaches the
+// radio. The run's output counts one radio frame past each command's end (review N2), and once the output has stayed
+// off for the 300 ms terminator after that a new run starts.
+static void onTimeCeilingRefusesAJoinedPulse()
+{
+  ChannelCaps abutting  = fixture();
+  abutting.maxPulseMs   = 1000;  // equal to the 1 s gap, the most the coherence rule allows
+  abutting.maxPerHour   = 3;
+  abutting.maxPerDay    = 5;
+  CHECK(CapsCoherent(abutting));
+  plantRecord(abutting, abutting);
+  bootHub();
+  g_nowMs = kWarmMs;
+
+  CHECK(CommandHandler::HandleCommand(ShockerModelType::CaiXianlin, 7, ShockerCommandType::Shock, 10, 1000));
+  CHECK(g_radio.size() == 1);
+
+  g_nowMs += 1000;
+  CHECK(!CommandHandler::HandleCommand(ShockerModelType::CaiXianlin, 7, ShockerCommandType::Shock, 10, 1000));
+  CHECK(SafetyCaps::GetRefusals().lastCode == 12);
+  CHECK(g_lastLog.find("verdict=over-on-time") != std::string::npos);
+  g_nowMs += kMaxRadioFrameMs + kOutputRunBreakMs - 1;
+  sendSerial(ShockerModelType::CaiXianlin, 7, ShockerCommandType::Shock, 10, 1000);
+  CHECK(g_radio.size() == 1);
+
+  g_nowMs += 1;
+  sendSerial(ShockerModelType::CaiXianlin, 7, ShockerCommandType::Shock, 10, 1000);
+  CHECK(g_radio.size() == 2);
+}
+
+// The run break in CapLimiter.h is the RF task's terminator time. The constant there is file-local, so read it.
+static void runBreakIsTheTerminator()
+{
+  std::ifstream in("src/radio/RFTransmitter.cpp");
+  const std::string source((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+  std::smatch match;
+  CHECK(std::regex_search(source, match, std::regex(R"(const int64_t kTerminatorDurationMs\s*=\s*(\d+);)")));
+  CHECK(match.size() == 2 && std::stoll(match[1].str()) == kOutputRunBreakMs);
+}
+
 static void estopRefusesWithCapsSet()
 {
   plantRecord(fixture(), fixture());
@@ -621,6 +662,58 @@ static void uncappedTypesNeverEncodeAsShock()
         }
       }
     }
+  }
+}
+
+// Review N2: `kMaxRadioFrameMs` in CapLimiter.h is the longest frame any encoder can send, rounded up to whole ms. For
+// each model, every item position takes the longest value it shows over ids 0, 0xFFFF and each single bit, every type
+// and intensities 0 to 255, which sets each id, type and intensity bit both ways. An item is a one or a zero, so the sum
+// bounds every frame that model can send. The RF task's tick, read from its source since the constant is file-local,
+// turns ticks into time. The constant must equal the largest bound rounded up, so an encoder or tick change that
+// lengthens a frame fails here, and so does one that shortens the longest.
+static void maxRadioFrameCoversEveryEncoder()
+{
+  std::ifstream in("src/radio/RFTransmitter.cpp");
+  const std::string source((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+  std::smatch match;
+  CHECK(std::regex_search(source, match, std::regex(R"(const float kTickrateNs\s*=\s*(\d+);)")));
+  const int64_t tickNs = match.size() == 2 ? std::stoll(match[1].str()) : 0;
+  CHECK(tickNs == 1000);
+
+  std::vector<uint16_t> ids = {0, 0xFFFF};
+  for (int bit = 0; bit < 16; ++bit) {
+    ids.push_back(static_cast<uint16_t>(1u << bit));
+  }
+  int64_t longestNs = 0;
+  for (const Encoder& e : encoders()) {
+    std::vector<int64_t> itemMax(e.size, 0);
+    int frames = 0;
+    for (uint16_t id : ids) {
+      for (ShockerCommandType type : {ShockerCommandType::Shock, ShockerCommandType::Vibrate, ShockerCommandType::Sound, ShockerCommandType::Light}) {
+        for (int intensity = 0; intensity <= 255; ++intensity) {
+          std::vector<rmt_data_t> buffer(e.size);
+          std::memset(buffer.data(), 0, e.size * sizeof(rmt_data_t));
+          if (!e.fill(buffer.data(), id, type, static_cast<uint8_t>(intensity))) {
+            continue;
+          }
+          ++frames;
+          for (std::size_t i = 0; i < e.size; ++i) {
+            itemMax[i] = std::max<int64_t>(itemMax[i], buffer[i].duration0 + buffer[i].duration1);
+          }
+        }
+      }
+    }
+    CHECK(frames > 0);
+    int64_t boundNs = 0;
+    for (int64_t ticks : itemMax) {
+      boundNs += ticks * tickNs;
+    }
+    longestNs = std::max(longestNs, boundNs);
+  }
+  CHECK(longestNs > 0);
+  CHECK(kMaxRadioFrameMs == (longestNs + 999'999) / 1'000'000);
+  if (kMaxRadioFrameMs != (longestNs + 999'999) / 1'000'000) {
+    std::printf("  longest frame bound %lld ns, kMaxRadioFrameMs %lld\n", static_cast<long long>(longestNs), static_cast<long long>(kMaxRadioFrameMs));
   }
 }
 
@@ -826,9 +919,12 @@ int main()
   SCENARIO(vibrateSetLeavesShockRefused);
   SCENARIO(clearRefusesAgain);
   SCENARIO(coldBootHolds);
+  SCENARIO(onTimeCeilingRefusesAJoinedPulse);
+  SCENARIO(runBreakIsTheTerminator);
   SCENARIO(estopRefusesWithCapsSet);
   SCENARIO(uncappedTypesPassAtZeroCaps);
   SCENARIO(uncappedTypesNeverEncodeAsShock);
+  SCENARIO(maxRadioFrameCoversEveryEncoder);
   SCENARIO(localSocketRefusesEveryPayload);
   SCENARIO(localSocketCannotMoveTransmitter);
   SCENARIO(serialStillMovesTransmitter);
