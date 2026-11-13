@@ -43,8 +43,10 @@ namespace OpenShock::Softproxy::SafetyCaps {
   bool Clear();
 
   /// Checks one command and records it when it is admitted. Stop, Sound and Light return `NotCapped`.
-  /// A refusal is counted and logged (include/softproxy/RefusalReport.h).
-  Verdict Admit(ShockerCommandType type, uint8_t intensity, uint16_t durationMs);
+  /// A refusal is counted and logged (include/softproxy/RefusalReport.h). `admittedAtMs` receives the
+  /// `OpenShock::millis()` reading the command was checked at, the start of the interval the limiter counts. The radio
+  /// ends the command from it (review 3 F1).
+  Verdict Admit(ShockerCommandType type, uint8_t intensity, uint16_t durationMs, int64_t& admittedAtMs);
 
   /// Counts and logs a refusal that came from outside `Admit`, for the E-Stop checks in `CommandHandler::HandleCommand`.
   void RecordRefusal(ShockerCommandType type, Verdict verdict);

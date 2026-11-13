@@ -223,10 +223,16 @@ void vTaskDelay(TickType_t)
     stepTasks();
   }
 }
+// Runs once when the test thread deletes another task, before that task stops: the point where the RF task on the other
+// core can still read `IsArmed` while the delete runs (review 3 F5).
+static std::function<void()> s_onTaskDelete;
 void vTaskDelete(TaskHandle_t handle)
 {
   if (handle == nullptr || handle == t_self) {
     throw HostTaskExit {};
+  }
+  if (s_onTaskDelete) {
+    std::exchange(s_onTaskDelete, nullptr)();
   }
   auto* task   = static_cast<HostTask*>(handle);
   task->killed = true;
@@ -2924,6 +2930,115 @@ static void engagementAfterAPopEndsTheSequence()
   (void)SafetyCaps::Clear();
 }
 
+// Time on the air of one RMT frame, in microseconds: its items' durations at the RF task's 1000 ns tick (`kTickrateNs`
+// in src/radio/RFTransmitter.cpp, which the fake `rmtSetTick` keeps).
+static int64_t frameAirUs(const std::vector<uint32_t>& words)
+{
+  int64_t ticks = 0;
+  for (uint32_t word : words) {
+    rmt_data_t item;
+    item.val = word;
+    ticks += item.duration0 + item.duration1;
+  }
+  return ticks;
+}
+
+static int64_t s_sendDelayMs = 0;
+
+// Review 3 F1: the limiter counts a command from the instant `Admit` reads the clock, and the radio used to set the
+// command's end from its own clock in `SendCommand`. A delay between the two, here a wait at the transmitter lock, moved
+// the output past the interval the limiter counted, and with it past the run break the limiter saw. The radio now ends
+// the command at the admitted instant plus its duration. Two stages at the minimum gap, the first delayed: every payload
+// frame, at its real length, ends inside its own command's counted interval, and no unbroken stretch on the air passes
+// the ceiling.
+static void delayedSendStaysInsideItsCount()
+{
+  for (int64_t delayMs : {int64_t {50}, int64_t {1000}}) {
+    armedHub();
+    engageByButton();
+    ChannelCaps caps       = highCaps();
+    caps.maxPulseMs        = 1000;
+    caps.maxPulsesPerStage = 1;
+    CHECK(SafetyCaps::Set(ShockerCommandType::Vibrate, caps) == SetResult::Stored);
+    twistToClear();
+    const int64_t ceilingMs = OnTimeCeilingMs(caps);
+    CHECK(ceilingMs == 1000 + kMaxRadioFrameMs);
+
+    Rmt::Sequence expected(kModel, 7, 0);
+    CHECK(expected.fill(ShockerCommandType::Vibrate, 20));
+    const std::vector<uint32_t> payload(reinterpret_cast<const uint32_t*>(expected.payload()), reinterpret_cast<const uint32_t*>(expected.payload()) + expected.size());
+    CHECK(frameAirUs(payload) <= kMaxRadioFrameMs * 1000);
+
+    s_air.clear();
+    const int64_t first = g_nowMs;
+    s_sendDelayMs       = delayMs;
+
+    OpenShock::g_onReadLock = [] {
+      advance(s_sendDelayMs);
+    };
+    CHECK(CommandHandler::HandleCommand(kModel, 7, ShockerCommandType::Vibrate, 20, 1000));
+    CHECK(OpenShock::g_onReadLock == nullptr);
+    CHECK(g_nowMs == first + delayMs);
+
+    // The next stage at the 2 second gap, sent at once. The limiter sees a new run: it starts past the first command's
+    // counted end plus the 300 ms break.
+    advance(first + 2000 - g_nowMs);
+    const int64_t second = g_nowMs;
+    CHECK(second >= first + CountedOutputMs(1000) + kOutputRunBreakMs);
+    CHECK(CommandHandler::HandleCommand(kModel, 7, ShockerCommandType::Vibrate, 20, 1000));
+    advance(1500);
+
+    std::size_t frames     = 0;
+    int64_t stretchStartUs = 0;
+    int64_t stretchEndUs   = -1;
+    int64_t longestUs      = 0;
+    for (const auto& frame : s_air) {
+      if (frame.words != payload) {
+        continue;
+      }
+      ++frames;
+      const int64_t admitted = frame.atMs < second ? first : second;
+      const int64_t startUs  = frame.atMs * 1000;
+      const int64_t endUs    = startUs + frameAirUs(frame.words);
+      CHECK(frame.atMs >= admitted);
+      CHECK(endUs <= (admitted + CountedOutputMs(1000)) * 1000);
+      if (startUs > stretchEndUs) {
+        stretchStartUs = startUs;
+      }
+      stretchEndUs = std::max(stretchEndUs, endUs);
+      longestUs    = std::max(longestUs, stretchEndUs - stretchStartUs);
+    }
+    CHECK(frames > 100);
+    CHECK(longestUs <= ceilingMs * 1000);
+    if (longestUs > ceilingMs * 1000) {
+      std::printf("  delay %lld ms: unbroken output %lld us against a ceiling of %lld ms\n", static_cast<long long>(delayMs), static_cast<long long>(longestUs), static_cast<long long>(ceilingMs));
+    }
+    (void)SafetyCaps::Clear();
+  }
+}
+
+// Review 3 F5: `estop enabled false` deleted the checker task and only then cleared its handle. In between, the RF task
+// could read the old handle with a fresh sample as armed. The handle is now cleared first.
+static void disableIsNotArmedDuringTheDelete()
+{
+  armedHub();
+  CHECK(EStopManager::IsArmed());
+  bool deleted          = false;
+  bool armedInTheDelete = true;
+  s_onTaskDelete        = [&] {
+    deleted          = true;
+    armedInTheDelete = EStopManager::IsArmed();
+  };
+  g_serialOut.clear();
+  _handleEStopEnabledCommand("false"sv, false);
+  CHECK(g_serialOut.find("Error|") == std::string::npos);
+  CHECK(deleted);
+  CHECK(!armedInTheDelete);
+  CHECK(s_estopTask == nullptr);
+  CHECK(!EStopManager::IsArmed());
+  s_onTaskDelete = nullptr;
+}
+
 static void stateIsReadable()
 {
   CHECK(EStopWireCode(false, false) == 0);
@@ -3039,6 +3154,8 @@ int main()
   SCENARIO(gatewayTriggerEndsAPulseInFlightWithNoTask);
   SCENARIO(radioDropsACommandQueuedWhileEngaged);
   SCENARIO(engagementAfterAPopEndsTheSequence);
+  SCENARIO(delayedSendStaysInsideItsCount);
+  SCENARIO(disableIsNotArmedDuringTheDelete);
   SCENARIO(stateIsReadable);
 
   if (s_failures != 0) {

@@ -26,6 +26,10 @@ namespace OpenShock {
     inline bool ok() const { return m_rmtHandle != nullptr && m_queueHandle != nullptr && m_taskHandle != nullptr; }
 
     bool SendCommand(ShockerModelType model, uint16_t shockerId, ShockerCommandType type, uint8_t intensity, uint16_t durationMs, bool overwriteExisting = true);
+    /// Softproxy (review 3 F1): the command's end counts from `startMs`, an `OpenShock::millis()` reading, not from this
+    /// call. `HandleCommand` passes the instant the cap limiter admitted the command, so a delay before the send cannot
+    /// move the output past the interval the limiter counted. A Stop still runs its 300 ms from this call.
+    bool SendCommand(ShockerModelType model, uint16_t shockerId, ShockerCommandType type, uint8_t intensity, uint16_t durationMs, bool overwriteExisting, int64_t startMs);
     void ClearPendingCommands();
 
   private:

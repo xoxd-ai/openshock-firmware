@@ -224,6 +224,12 @@ MUTANTS = [
   ('K108 a lasting post failure logs only once', ES, 'if (!s_postFailureLogged || now - s_postFailureLoggedAtMs >= k_estopPostFailureLogIntervalMs) {', 'if (!s_postFailureLogged) {', [TEST]),
   ('K109 the sample interval high-water never rises', ES, 'while (interval > highest && !s_maxSampleIntervalMs.compare_exchange_weak(highest, interval)) {', 'while (false) {', [TEST]),
   ('K110 estop state leaves out the checker health', ESTOP_SERIAL, '  SERPR_LINE(\n', '  if (false) SERPR_LINE(\n', [ESTOP_SERIAL]),
+  # Review 3 F1 and F5 (FORK-DELTA-REVIEW-3): the radio ends a command at its admitted instant, and the checker's handle
+  # clears before its task is deleted.
+  ('K112 the radio ends a command from its own clock', RF, '.transmitEnd = startMs + durationMs', '.transmitEnd = OpenShock::millis() + durationMs', [RF]),
+  ('K113 HandleCommand sends without the admitted instant', CH, 'durationMs, true, admittedAtMs);', 'durationMs);', [CH]),
+  ('K114 Admit reports a later instant than it counted', SC, '  return verdict;\n}\n\nvoid SafetyCaps::RecordRefusal', '  admittedAtMs = OpenShock::millis() + 60;\n  return verdict;\n}\n\nvoid SafetyCaps::RecordRefusal', [SC]),
+  ('K115 the checker task is deleted before its handle clears', ES, '    TaskHandle_t task = s_estopTask.exchange(nullptr);\n    if (task != nullptr) {\n      vTaskDelete(task);\n    }', '    TaskHandle_t task = s_estopTask.load();\n    if (task != nullptr) {\n      vTaskDelete(task);\n      s_estopTask = nullptr;\n    }', [TEST]),
 ]
 
 

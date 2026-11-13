@@ -288,8 +288,9 @@ bool SafetyCaps::Clear()
   return true;
 }
 
-// Checks a shock or vibrate command under the caps mutex.
-static Verdict admitCapped(ShockerCommandType type, uint8_t intensity, uint16_t durationMs)
+// Checks a shock or vibrate command under the caps mutex. `admittedAtMs` receives the boot clock reading behind the hub
+// clock the limiter counted from.
+static Verdict admitCapped(ShockerCommandType type, uint8_t intensity, uint16_t durationMs, int64_t& admittedAtMs)
 {
   ScopedLock lock__(&s_capsMutex);
   if (!lock__.isLocked()) {
@@ -300,7 +301,8 @@ static Verdict admitCapped(ShockerCommandType type, uint8_t intensity, uint16_t 
   }
 
   ensureRestored();
-  const int64_t now = hubNowMs();
+  admittedAtMs      = OpenShock::millis();
+  const int64_t now = s_clockBaseMs + admittedAtMs;  // hubNowMs() at the same reading.
   Verdict verdict   = type == ShockerCommandType::Shock ? s_shockLimiter.Admit(s_shock, intensity, durationMs, now) : s_vibrateLimiter.Admit(s_vibrate, intensity, durationMs, now);
   sealRetained(now);
   return verdict;
@@ -318,13 +320,14 @@ void SafetyCaps::RecordRefusal(ShockerCommandType type, Verdict verdict)
   }
 }
 
-Verdict SafetyCaps::Admit(ShockerCommandType type, uint8_t intensity, uint16_t durationMs)
+Verdict SafetyCaps::Admit(ShockerCommandType type, uint8_t intensity, uint16_t durationMs, int64_t& admittedAtMs)
 {
+  admittedAtMs = OpenShock::millis();
   if (type != ShockerCommandType::Shock && type != ShockerCommandType::Vibrate) {
     return Verdict::NotCapped;
   }
 
-  Verdict verdict = admitCapped(type, intensity, durationMs);
+  Verdict verdict = admitCapped(type, intensity, durationMs, admittedAtMs);
   RecordRefusal(type, verdict);
   return verdict;
 }
