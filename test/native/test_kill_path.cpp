@@ -1939,6 +1939,42 @@ static void capsLockTheEStopSettings()
   CHECK(!EStopManager::IsArmed());
 }
 
+// Review D4: a clear whose erase fails left `AnySet` false for that boot, so `estop pin` and `estop enabled false`
+// opened while the stored caps waited for the next boot. The settings now stay locked until an erase commits. Every
+// command still refuses, because the caps in RAM are 0.
+static void failedClearKeepsTheEStopLocked()
+{
+  armedHub();
+  engageByButton();
+  CHECK(SafetyCaps::Set(ShockerCommandType::Vibrate, lowCaps()) == SetResult::Stored);
+  twistToClear();
+  CHECK(!EStopManager::IsEStopped());
+  CHECK(SafetyCaps::AnySet());
+
+  g_nvs.eraseError = ESP_FAIL;
+  g_serialOut.clear();
+  _handleSafetyCapsClearCommand(""sv, false);
+  CHECK(g_serialOut.find("Caps are 0 until restart, but erasing the stored caps failed") != std::string::npos);
+  CHECK(g_nvs.present);
+  CHECK(SafetyCaps::AnySet());
+  CHECK(!EStopManager::SetEStopEnabled(false));
+  CHECK(!EStopManager::SetEStopPin(static_cast<gpio_num_t>(14)));
+  CHECK(!CommandHandler::HandleCommand(kModel, 7, ShockerCommandType::Vibrate, 1, 50));
+  CHECK(lastRefusalIs(Verdict::CapsNotSet));
+
+  // `safetycaps` still reads 0 with set=false, as the recovery text in SOFTPROXY.md says.
+  g_serialOut.clear();
+  _handleSafetyCapsGetCommand(""sv, false);
+  CHECK(g_serialOut.find("SafetyCaps|vibrate|maxIntensityPct=0,") != std::string::npos);
+
+  // A clear that commits opens them again.
+  g_nvs.eraseError = ESP_OK;
+  CHECK(SafetyCaps::Clear());
+  CHECK(!g_nvs.present);
+  CHECK(!SafetyCaps::AnySet());
+  CHECK(EStopManager::SetEStopPin(static_cast<gpio_num_t>(14)));
+}
+
 static void enableNeedsAValidPin()
 {
   freshHub();
@@ -2701,6 +2737,7 @@ int main()
   SCENARIO(taskRestartKeepsTheLatch);
   SCENARIO(restartedTaskPublishesEngaged);
   SCENARIO(capsLockTheEStopSettings);
+  SCENARIO(failedClearKeepsTheEStopLocked);
   SCENARIO(enableNeedsAValidPin);
   SCENARIO(enableRefusesAStoredConflictingPin);
   SCENARIO(failedTxReadRefusesThePin);

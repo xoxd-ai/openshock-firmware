@@ -137,7 +137,8 @@ inline int xPortGetCoreID()
 struct FakeNvs {
   bool present        = false;
   esp_err_t openError = ESP_OK;
-  esp_err_t readError = ESP_OK;
+  esp_err_t readError  = ESP_OK;
+  esp_err_t eraseError = ESP_OK;
   std::vector<uint8_t> blob;
 };
 extern FakeNvs g_nvs;
@@ -178,6 +179,9 @@ inline esp_err_t nvs_set_blob(nvs_handle_t, const char*, const void* in, std::si
 }
 inline esp_err_t nvs_erase_key(nvs_handle_t, const char*)
 {
+  if (g_nvs.eraseError != ESP_OK) {
+    return g_nvs.eraseError;
+  }
   g_nvs.present = false;
   g_nvs.blob.clear();
   return ESP_OK;

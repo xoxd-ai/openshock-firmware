@@ -742,6 +742,14 @@ static std::string sitesOf(const char* pattern)
     }                                                                                                              \
   } while (0)
 
+// Review H6: `jsonconfig` with no argument printed the Wi-Fi passwords and the backend auth token. Nothing in the
+// firmware asks for the config with its secrets as JSON now. `rawconfig` still prints the binary file, see SOFTPROXY.md.
+static void jsonconfigHidesSecrets()
+{
+  CHECK_SITES(R"(GetAsJSON\(true\))", "");
+  CHECK_SITES(R"(GetAsJSON\(false\))", "src/serial/command_handlers/jsonconfig.cpp=1 ");
+}
+
 // The runs above prove the paths they reach. This pins the list of paths, so a new caller of the radio has to change
 // this test.
 static void radioHasNoOtherCaller()
@@ -804,6 +812,7 @@ static void storedRecordCase()
 int main()
 {
   SCENARIO(zeroCapsAtBoot);
+  SCENARIO(jsonconfigHidesSecrets);
   SCENARIO((storedRecordCase<0, 0>));
   SCENARIO((storedRecordCase<0, 1>));
   SCENARIO((storedRecordCase<0, 2>));
