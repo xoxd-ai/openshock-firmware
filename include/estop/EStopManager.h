@@ -21,6 +21,14 @@ namespace OpenShock::EStopManager {
   /// The pin the checker reads, or GPIO_NUM_NC when none is set. The stored pin can differ until a restart.
   gpio_num_t GetRunningPin();
 
+  /// The longest time between two samples of one checker task since boot, in ms. A checker is stale, so not armed, after
+  /// 1000 ms without a sample. The bench reads this to see how close the real worst gap comes (review T1).
+  uint32_t MaxSampleIntervalMs();
+
+  /// State event posts that failed since boot. A post that fails is retried on the next pass. Only the keep-alive
+  /// switch and the LED follow the post, so the latch and `IsArmed` never wait on it (review T2).
+  uint32_t FailedStatePosts();
+
   /// What set the latch, or `Released`. The first source holds until the clear: a later press or `Trigger` does not
   /// restate it. The one change is `Unconfirmed` to `Button`, when a press that follows a measured release turns solid.
   /// A rise needs `Button` (SP-156).

@@ -526,6 +526,10 @@ static void bootEStopManager(esp_reset_reason_t reason, bool loseRetained)
   s_gatewayStops        = 0;
   s_estopInitialized    = false;
   g_resetReason         = reason;
+
+  s_failedStatePosts      = 0;
+  s_postFailureLoggedAtMs = 0;
+  s_maxSampleIntervalMs   = 0;
   if (loseRetained) {
     std::memset(static_cast<void*>(&s_retainedLatch), 0xA5, sizeof(s_retainedLatch));
   }
@@ -1130,7 +1134,7 @@ static void gatewayStopContendingForTheLatchHolds()
       return false;
     }
     OpenShock::g_nowMs += 5;
-    resume(static_cast<HostTask*>(s_estopTask));
+    resume(static_cast<HostTask*>(s_estopTask.load()));
     return true;
   };
   EStopManager::Trigger();
@@ -2226,6 +2230,69 @@ static void eventPostCannotHoldTheChecker()
   CHECK(!s_published.empty() && s_published.back() == EStopState::Idle);
 }
 
+// Review T2: a post that keeps failing logged once and then stayed silent. Each failure now counts, `estop state`
+// prints the count, and the failure logs again at most every 10 seconds while it lasts.
+static void failedStatePostsCountAndLogAgain()
+{
+  armedHub();
+  s_eventPostResult = ESP_FAIL;
+  engageByButton();
+  CHECK(EStopManager::IsEStopped());
+  CHECK(EStopManager::FailedStatePosts() > 0);
+  CHECK(g_lastLog.find("Failed to post the EStop state") != std::string::npos);
+
+  g_lastLog.clear();
+  advance(k_estopPostFailureLogIntervalMs - 1000);
+  CHECK(g_lastLog.find("Failed to post the EStop state") == std::string::npos);
+  advance(1000);
+  CHECK(g_lastLog.find("Failed to post the EStop state") != std::string::npos);
+  CHECK(g_lastLog.find(" failed since boot") != std::string::npos);
+  CHECK(EStopManager::FailedStatePosts() > 1000);  // one a pass, every 5 ms, for 10 s
+
+  g_serialOut.clear();
+  const uint32_t failed = EStopManager::FailedStatePosts();
+  _handleEStopStateCommand(""sv, false);
+  CHECK(g_serialOut.find("failedStatePosts=" + std::to_string(failed) + "\n") != std::string::npos);
+
+  // The post succeeds again: the state reaches the event loop and the count stays as a record.
+  s_eventPostResult = ESP_OK;
+  advance(10);
+  CHECK(!s_published.empty() && s_published.back() == EStopState::Active);
+  CHECK(EStopManager::FailedStatePosts() == failed);
+  twistToClear();
+  CHECK(!EStopManager::IsEStopped());
+}
+
+// Review T1: the checker's longest sample interval is kept, so the bench can read the real worst gap. A stall of 400 ms
+// shows as at least 400. `estop state` prints it on a plain line before the reply line, which stays as Softproxy reads it.
+static void sampleIntervalHighWaterIsReadable()
+{
+  armedHub();
+  CHECK(EStopManager::MaxSampleIntervalMs() >= k_estopUpdateRate);
+  CHECK(EStopManager::MaxSampleIntervalMs() < 100);
+  s_stallChecker = true;
+  advance(400);
+  s_stallChecker = false;
+  advance(20);
+  CHECK(EStopManager::MaxSampleIntervalMs() >= 400);
+  CHECK(EStopManager::MaxSampleIntervalMs() <= 410);
+  advance(200);
+  CHECK(EStopManager::MaxSampleIntervalMs() >= 400);  // a high-water mark: shorter intervals leave it
+
+  g_serialOut.clear();
+  _handleEStopStateCommand(""sv, false);
+  const std::string health   = "plain|softproxy-estop-health maxSampleIntervalMs=" + std::to_string(EStopManager::MaxSampleIntervalMs()) + " failedStatePosts=0\n";
+  const std::size_t healthAt = g_serialOut.find(health);
+  const std::size_t stateAt  = g_serialOut.find("Response|EStopState|armed=true,engaged=false,pin=13,source=released\n");
+  CHECK(healthAt != std::string::npos);
+  CHECK(stateAt != std::string::npos);
+  CHECK(healthAt < stateAt);
+}
+
+// Review T3: `IsArmed` reads the task handle and the pin on the RF task without the mutex, so both are atomic.
+static_assert(std::is_same_v<decltype(s_estopTask), std::atomic<TaskHandle_t>>, "the RF task reads the handle without the mutex");
+static_assert(std::is_same_v<decltype(s_estopPin), std::atomic<gpio_num_t>>, "the RF task reads the pin without the mutex");
+
 // Review H5: a task restarted by a pin move is not armed until it samples, whatever the old task left behind.
 static void restartedTaskIsNotArmedBeforeItsFirstSample()
 {
@@ -2897,6 +2964,8 @@ int main()
   SCENARIO(stalledCheckerEndsAPulseInFlight);
   SCENARIO(notArmedKeepsTheStopFrameAndTheKeepAlive);
   SCENARIO(eventPostCannotHoldTheChecker);
+  SCENARIO(failedStatePostsCountAndLogAgain);
+  SCENARIO(sampleIntervalHighWaterIsReadable);
   SCENARIO(restartedTaskIsNotArmedBeforeItsFirstSample);
   SCENARIO(capRiseNeedsAnEngagedEStop);
   SCENARIO(capsRiseCoversEveryField);

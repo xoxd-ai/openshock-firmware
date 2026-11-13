@@ -34,6 +34,7 @@ KP = 'include/softproxy/KillPath.h'
 TR = 'src/message_handlers/websocket/gateway/Trigger.cpp'
 RFTXPIN = 'src/serial/command_handlers/rftxpin.cpp'
 SERIAL_CAPS = 'src/serial/command_handlers/safetycaps.cpp'
+ESTOP_SERIAL = 'src/serial/command_handlers/estop.cpp'
 CONFIG = 'src/config/Config.cpp'
 CHIPSET = 'include/Chipset.h'
 CONFIG_TEST = 'test/native/test_config_writers.cpp'
@@ -216,6 +217,11 @@ MUTANTS = [
   ('K104 state post waits forever', ES, 'pdMS_TO_TICKS(k_estopEventPostWaitMs)', 'portMAX_DELAY', [TEST]),
   ('K105 failed state post is not retried', ES, '  if (state != s_lastLoggedState) {', '  s_lastPublishedState = state;\n  if (state != s_lastLoggedState) {', [TEST]),
   ('K106 IsArmed before the first sample', ES, 'if (!s_sampledSinceStart.load()) {', 'if (false) {', [TEST]),
+  # Review 2 T1 and T2 (FORK-DELTA-REVIEW-2): the failed post count, its repeated log and the sample interval high-water.
+  ('K107 a failed state post is not counted', ES, 'const uint32_t failed = s_failedStatePosts.fetch_add(1) + 1;', 'const uint32_t failed = s_failedStatePosts.load();', [TEST]),
+  ('K108 a lasting post failure logs only once', ES, 'if (!s_postFailureLogged || now - s_postFailureLoggedAtMs >= k_estopPostFailureLogIntervalMs) {', 'if (!s_postFailureLogged) {', [TEST]),
+  ('K109 the sample interval high-water never rises', ES, 'while (interval > highest && !s_maxSampleIntervalMs.compare_exchange_weak(highest, interval)) {', 'while (false) {', [TEST]),
+  ('K110 estop state leaves out the checker health', ESTOP_SERIAL, '  SERPR_LINE(\n', '  if (false) SERPR_LINE(\n', [ESTOP_SERIAL]),
 ]
 
 

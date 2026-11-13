@@ -46,9 +46,15 @@ const uint32_t k_estopSampleStaleTime = 1000;
 // Longest wait to post the state event. A full event queue must not stop the checker task from sampling (review H2).
 const uint32_t k_estopEventPostWaitMs = k_estopUpdateRate;
 
+// How long a failing state post stays quiet before it logs again, so a lasting failure is not silent (review T2).
+const int64_t k_estopPostFailureLogIntervalMs = 10'000;
+
 static OpenShock::SimpleMutex s_estopMutex = {};
-static gpio_num_t s_estopPin               = GPIO_NUM_NC;
-static TaskHandle_t s_estopTask            = nullptr;
+
+// Written only under `s_estopMutex`. Atomic because `IsArmed` reads both on the RF task every pass, and the checker
+// reads the pin on every sample, without the mutex (review T3).
+static std::atomic<gpio_num_t> s_estopPin    = {GPIO_NUM_NC};
+static std::atomic<TaskHandle_t> s_estopTask = {nullptr};
 
 static EStopState s_lastPublishedState      = EStopState::Idle;
 static int64_t s_estopActivatedAt           = 0;
@@ -61,6 +67,14 @@ static std::atomic<bool> s_sampledSinceStart = {false};
 // The state last logged, so a post that fails and is retried on every pass logs the state line once.
 static EStopState s_lastLoggedState = EStopState::Idle;
 static bool s_postFailureLogged     = false;
+
+// State event posts that failed since boot, and when a failure last logged (review T2). `estop state` prints the count.
+static std::atomic<uint32_t> s_failedStatePosts = {0};
+static int64_t s_postFailureLoggedAtMs          = 0;
+
+// The longest time between two samples of one checker task since boot, in ms, so the bench can read the real worst
+// gap against `k_estopSampleStaleTime` (review T1). `estop state` prints it.
+static std::atomic<uint32_t> s_maxSampleIntervalMs = {0};
 
 static volatile bool s_externallyTriggered = false;
 
@@ -182,9 +196,12 @@ static void estopmanager_updateexternals(EStopState state)
   // pass posts again. The latch never waits on this: it is written before the post.
   const esp_err_t err = esp_event_post(OPENSHOCK_EVENTS, OPENSHOCK_EVENT_ESTOP_STATE_CHANGED, &state, sizeof(state), pdMS_TO_TICKS(k_estopEventPostWaitMs));
   if (err != ESP_OK) {
-    if (!s_postFailureLogged) {
-      s_postFailureLogged = true;
-      OS_LOGE(TAG, "Failed to post the EStop state, retrying on the next pass: %s", esp_err_to_name(err));
+    const uint32_t failed = s_failedStatePosts.fetch_add(1) + 1;
+    const int64_t now     = OpenShock::millis();
+    if (!s_postFailureLogged || now - s_postFailureLoggedAtMs >= k_estopPostFailureLogIntervalMs) {
+      s_postFailureLogged     = true;
+      s_postFailureLoggedAtMs = now;
+      OS_LOGE(TAG, "Failed to post the EStop state, retrying on the next pass: %s, %u failed since boot", esp_err_to_name(err), static_cast<unsigned>(failed));
     }
     return;
   }
@@ -221,6 +238,10 @@ static void estopmgr_checkertask(void* pvParameters)
   // Whether the press that engaged the E-Stop is still down, so a full window of high samples can confirm it.
   bool confirming = false;
 
+  // This task's previous sample time, for the interval high-water mark. 0 until its first sample.
+  int64_t previousSampleMs = 0;
+  bool sampledBefore       = false;
+
   // Whether this task measured the mushroom down, a full window of high samples, while engaged and since the last
   // gateway stop. The clear starts only when the contact closes after that, so a cold boot, a warm restart or a gateway
   // stop with the mushroom already up stays engaged until it goes down and up again.
@@ -234,6 +255,16 @@ static void estopmgr_checkertask(void* pvParameters)
     int64_t now = OpenShock::millis();
     s_lastSampleMs.store(static_cast<uint32_t>(now));
     s_sampledSinceStart.store(true);
+
+    if (sampledBefore) {
+      const uint32_t interval = static_cast<uint32_t>(now - previousSampleMs);
+      uint32_t highest        = s_maxSampleIntervalMs.load();
+      while (interval > highest && !s_maxSampleIntervalMs.compare_exchange_weak(highest, interval)) {
+        // A failed exchange loads the stored value into `highest`, so the loop ends once that is at least `interval`.
+      }
+    }
+    previousSampleMs = now;
+    sampledBefore    = true;
 
     // Handle external trigger: forcibly set the E-Stop active.
     if (s_externallyTriggered) {
@@ -328,17 +359,21 @@ static bool estopmgr_setestopenabled(bool enabled)
     }
     if (s_estopTask == nullptr) {
       s_sampledSinceStart.store(false);
-      if (TaskUtils::TaskCreateUniversal(estopmgr_checkertask, TAG, 4096, nullptr, 5, &s_estopTask, 1) != pdPASS) {  // TODO: Profile stack size and set priority
+      TaskHandle_t task = nullptr;
+      if (TaskUtils::TaskCreateUniversal(estopmgr_checkertask, TAG, 4096, nullptr, 5, &task, 1) != pdPASS) {  // TODO: Profile stack size and set priority
         OS_LOGE(TAG, "Failed to create EStop event handler task");
         s_estopTask = nullptr;
         return false;
       }
+      s_estopTask = task;  // Until this store `IsArmed` reads no task, which is not armed.
     }
   } else {
     if (s_estopTask != nullptr) {
       vTaskDelete(s_estopTask);
       s_estopTask = nullptr;
     }
+    // A task running on the other core dies at that core's next switch, so it can still set the flag after this line.
+    // That is masked: `IsArmed` reads no task until the next create, and the create resets the flag first (review T4).
     s_sampledSinceStart.store(false);
   }
 
@@ -544,6 +579,16 @@ bool EStopManager::IsArmed()
 gpio_num_t EStopManager::GetRunningPin()
 {
   return s_estopPin;
+}
+
+uint32_t EStopManager::MaxSampleIntervalMs()
+{
+  return s_maxSampleIntervalMs.load();
+}
+
+uint32_t EStopManager::FailedStatePosts()
+{
+  return s_failedStatePosts.load();
 }
 
 int64_t EStopManager::LastEStopped()
