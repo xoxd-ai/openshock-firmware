@@ -52,10 +52,27 @@ namespace OpenShock::Softproxy {
   /// overwrites it. Only output that stays off for the whole terminator ends a run.
   constexpr int64_t kOutputRunBreakMs = 300;
 
-  /// Most output time one run may hold: one full stage, `maxPulsesPerStage` pulses of `maxPulseMs` (review H1).
+  /// Longest radio frame of any shocker model the fork encodes, in ms, rounded up (review N2). The RF task writes whole
+  /// frames and starts one whenever a sequence's end still lies ahead, so the last frame of a command can run up to one
+  /// frame past its end. The value bounds every frame: for each model, each item of the frame at the longest value any
+  /// id, type and intensity gives it, summed. The largest is the Petrainer's, 72200 us at the RF task's 1000 ns tick
+  /// (src/radio/rmt/PetrainerEncoder.cpp), against 69200 us for its longest real frame. test/native/test_command_paths.cpp
+  /// rebuilds the bound from every encoder and the tick, and fails if this constant drifts from it.
+  constexpr int64_t kMaxRadioFrameMs = 73;
+
+  /// Output time one admitted command counts in its run: its duration plus one frame, since the radio can send up to
+  /// one frame past the end. A command of 0 ms sends no payload, only the stop frame, and counts nothing.
+  constexpr int64_t CountedOutputMs(uint16_t durationMs)
+  {
+    return durationMs > 0 ? static_cast<int64_t>(durationMs) + kMaxRadioFrameMs : 0;
+  }
+
+  /// Most output time one run may hold: one full stage, `maxPulsesPerStage` pulses of `maxPulseMs`, each counted with
+  /// its frame as `CountedOutputMs` counts it (review H1, N2). A stage of full pulses whose frames do not overlap the
+  /// next pulse reaches it exactly.
   constexpr int64_t OnTimeCeilingMs(const ChannelCaps& c)
   {
-    return static_cast<int64_t>(c.maxPulseMs) * c.maxPulsesPerStage;
+    return CountedOutputMs(c.maxPulseMs) * c.maxPulsesPerStage;
   }
 
   /// Every field is 0: the channel is cleared, which refuses every command.
@@ -194,10 +211,10 @@ namespace OpenShock::Softproxy {
   /// counters start empty, so the boot hold refuses until the clock reaches `ColdBootHoldMs`.
   ///
   /// The limiter also bounds continuous output, whatever the stages (review H1). A run is the channel's output from
-  /// a start until it stays off for `kOutputRunBreakMs`. Each admitted command counts as output from `nowMs` for its
-  /// duration, and a time two commands overlap counts once. A command that would bring the run's output time above
-  /// `OnTimeCeilingMs` refuses with `OverOnTime`. The run is kept per channel, not per shocker, so output to two
-  /// shockers counts as one run, which can only refuse sooner.
+  /// a start until it stays off for `kOutputRunBreakMs`. Each admitted command counts as output from `nowMs` for
+  /// `CountedOutputMs`, its duration plus one radio frame, and a time two commands overlap counts once. A command that
+  /// would bring the run's output time above `OnTimeCeilingMs` refuses with `OverOnTime`. The run is kept per channel,
+  /// not per shocker, so output to two shockers counts as one run, which can only refuse sooner per shocker.
   class ChannelLimiter {
   public:
     /// Checks one command against the caps. On `Allow` it records the command before returning.
@@ -220,9 +237,10 @@ namespace OpenShock::Softproxy {
       const int64_t gapMs = static_cast<int64_t>(caps.minGapSec) * 1000;
 
       // The output time the run would hold with this command (see the class comment).
-      const int64_t endMs      = nowMs + durationMs;
+      const int64_t countedMs  = CountedOutputMs(durationMs);
+      const int64_t endMs      = nowMs + countedMs;
       const bool continuesRun  = m_hasRun && nowMs < m_runEndMs + kOutputRunBreakMs;
-      const int64_t addedMs    = continuesRun ? std::max<int64_t>(0, endMs - std::max(nowMs, m_runEndMs)) : durationMs;
+      const int64_t addedMs    = continuesRun ? std::max<int64_t>(0, endMs - std::max(nowMs, m_runEndMs)) : countedMs;
       const int64_t runOnMs    = (continuesRun ? m_runOnMs : 0) + addedMs;
       const int64_t runEndMs   = continuesRun ? std::max(m_runEndMs, endMs) : endMs;
       const bool overOnTime    = runOnMs > OnTimeCeilingMs(caps);
