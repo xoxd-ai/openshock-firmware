@@ -682,6 +682,12 @@ static void lockouts()
 {
   static_assert(!kAllowOtaInstall, "the fork never installs firmware over the air");
   static_assert(!kAllowGatewayRestart, "the fork ignores the gateway restart trigger");
+  static_assert(!kAllowGatewayActuation, "only the serial port actuates (review H3)");
+  CHECK(!GatewayCommandAllowed(OpenShock::ShockerCommandType::Shock));
+  CHECK(!GatewayCommandAllowed(OpenShock::ShockerCommandType::Vibrate));
+  CHECK(GatewayCommandAllowed(OpenShock::ShockerCommandType::Stop));
+  CHECK(GatewayCommandAllowed(OpenShock::ShockerCommandType::Sound));
+  CHECK(GatewayCommandAllowed(OpenShock::ShockerCommandType::Light));
 }
 
 static void verdictHelpers()

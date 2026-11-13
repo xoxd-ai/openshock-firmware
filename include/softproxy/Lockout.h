@@ -4,6 +4,8 @@
 // caps (include/softproxy/CapLimiter.h) or the hub E-Stop. No Arduino or ESP-IDF dependency, so the host test
 // can check them.
 
+#include "ShockerCommandType.h"
+
 #include <array>
 #include <cstddef>
 #include <string_view>
@@ -23,6 +25,18 @@ namespace OpenShock::Softproxy {
   /// while the gateway is unreachable, as upstream does, but the gateway can no longer hold it open.
   /// `CaptivePortalDisable` still works, since it only closes the portal.
   constexpr bool kAllowGatewayCaptivePortalEnable = false;
+
+  /// The fork refuses Shock and Vibrate that arrive from the gateway in a `ShockerCommandList` (review H3). The hub caps
+  /// and the E-Stop would still apply, but none of Softproxy's server checks 4 to 8, so a linked account could actuate
+  /// outside the alarm service. Only the local serial port, where Softproxy's driver runs, actuates. The gateway
+  /// `Trigger` `EmergencyStop` still engages the E-Stop, and a gateway Stop or Sound still passes.
+  constexpr bool kAllowGatewayActuation = false;
+
+  /// Whether a command of this type from the gateway may reach `HandleCommand`.
+  constexpr bool GatewayCommandAllowed(ShockerCommandType type)
+  {
+    return kAllowGatewayActuation || (type != ShockerCommandType::Shock && type != ShockerCommandType::Vibrate);
+  }
 
   /// The fork keeps the portal closed when only the radio fails. Upstream opens it so a phone can fix the RF TX pin,
   /// but the local socket serves no command here, so the portal would add an open access point and no repair path.
