@@ -10,7 +10,9 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <algorithm>
 #include <cstring>
+#include <utility>
 #include <vector>
 
 using namespace OpenShock::Softproxy;
@@ -126,6 +128,37 @@ static void incoherentCapsRefuse()
   CHECK(CapsCoherent(fixture()));
 }
 
+// Review H1: a pulse longer than the gap let stages started every `minGapSec` join into one output. The review's caps,
+// 5000 ms pulses with a 2 s gap, 1800 per hour, now refuse as incoherent. A pulse equal to the gap is the edge.
+static void pulseLongerThanTheGapIsIncoherent()
+{
+  ChannelCaps review       = fixture();
+  review.maxIntensityPct   = 10;
+  review.maxPulseMs        = 5000;
+  review.maxPulsesPerStage = 1;
+  review.minGapSec         = 2;
+  review.maxPerHour        = 1800;
+  review.maxPerDay         = 1800;
+  CHECK(CapsSet(review));
+  CHECK(!CapsCoherent(review));
+  ChannelLimiter l;
+  CHECK_VERDICT(l.Admit(review, 1, 1, kWarm), Verdict::CapsNotSet);
+
+  ChannelCaps edge = review;
+  edge.maxPulseMs  = 2000;
+  CHECK(CapsCoherent(edge));
+  edge.maxPulseMs = 2001;
+  CHECK(!CapsCoherent(edge));
+
+  // The longest pulse the wire carries fits under the widest gap the hourly product allows.
+  ChannelCaps hourGap = fixture();
+  hourGap.minGapSec   = 3600;
+  hourGap.maxPerHour  = 1;
+  hourGap.maxPerDay   = 1;
+  hourGap.maxPulseMs  = UINT16_MAX;
+  CHECK(CapsCoherent(hourGap));
+}
+
 static void requestCaps()
 {
   ChannelCaps c = fixture();
@@ -222,6 +255,162 @@ static void stageJoin()
   ChannelLimiter s;
   CHECK_VERDICT(s.Admit(strict, 1, 100, t0), Verdict::Allow);
   CHECK_VERDICT(s.Admit(strict, 1, 100, t0 + 300), Verdict::Gap);
+}
+
+// Review H1: a sender that starts a stage every `minGapSec`, each pulse as long as the gap, gets abutting pulses, which
+// the radio joins into one output. The run ceiling, one full stage of 1 x 2000 ms, refuses the second pulse, so the
+// output is 2 s on and 2 s off, and the stage count shows only the admitted half.
+static void stagesEveryGapCannotHoldOutputOn()
+{
+  ChannelCaps c       = fixture();
+  c.maxPulseMs        = 2000;
+  c.maxPulsesPerStage = 1;
+  c.minGapSec         = 2;
+  c.maxPerHour        = 1800;
+  c.maxPerDay         = 1800;
+  CHECK(CapsCoherent(c));
+  CHECK(OnTimeCeilingMs(c) == 2000);
+
+  ChannelLimiter l;
+  const int64_t t0 = kWarm;
+  int allowed      = 0;
+  int overOnTime   = 0;
+  for (int i = 0; i < 1800; ++i) {
+    const Verdict v = l.Admit(c, 1, 2000, t0 + i * 2 * kSec);
+    if (v == Verdict::Allow) {
+      ++allowed;
+      CHECK(i % 2 == 0);
+    } else {
+      CHECK_VERDICT(v, Verdict::OverOnTime);
+      CHECK(i % 2 == 1);
+      ++overOnTime;
+    }
+  }
+  CHECK(allowed == 900);
+  CHECK(overOnTime == 900);
+}
+
+// A sender that joins full stages back to back, three pulses each, with no join window: each pulse is its own stage.
+// The run holds one full stage, 3 x 2000 ms, exactly. The next pulse is refused until the output has been off for the
+// whole 300 ms terminator, and one millisecond short of that still counts as the same run.
+static void onTimeCeilingBoundaries()
+{
+  ChannelCaps c       = fixture();
+  c.maxPulseMs        = 2000;
+  c.maxPulsesPerStage = 3;
+  c.minGapSec         = 2;
+  c.maxPerHour        = 1800;
+  c.maxPerDay         = 1800;
+  CHECK(OnTimeCeilingMs(c) == 6000);
+
+  ChannelLimiter l;
+  const int64_t t0 = kWarm;
+  CHECK_VERDICT(l.Admit(c, 1, 2000, t0), Verdict::Allow);
+  CHECK_VERDICT(l.Admit(c, 1, 2000, t0 + 2000), Verdict::Allow);
+  CHECK_VERDICT(l.Admit(c, 1, 2000, t0 + 4000), Verdict::Allow);  // exactly the ceiling, 6000 ms
+  CHECK_VERDICT(l.Admit(c, 1, 1, t0 + 6000), Verdict::OverOnTime);
+  CHECK_VERDICT(l.Admit(c, 1, 2000, t0 + 6000 + kOutputRunBreakMs - 1), Verdict::OverOnTime);
+  CHECK(l.StagesLastHour(t0 + 6299) == 3);  // a refusal records nothing
+  CHECK_VERDICT(l.Admit(c, 1, 2000, t0 + 6000 + kOutputRunBreakMs), Verdict::Allow);
+
+  // The gap after the run: 6000 ms after the run ended, plus the 300 ms, is a new run that can hold 6000 ms again.
+  ChannelLimiter m;
+  CHECK_VERDICT(m.Admit(c, 1, 2000, t0), Verdict::Allow);
+  CHECK_VERDICT(m.Admit(c, 1, 2000, t0 + 2000), Verdict::Allow);
+  CHECK_VERDICT(m.Admit(c, 1, 2000, t0 + 4000), Verdict::Allow);
+  CHECK_VERDICT(m.Admit(c, 1, 2000, t0 + 6000 + kOutputRunBreakMs), Verdict::Allow);
+  CHECK_VERDICT(m.Admit(c, 1, 2000, t0 + 8300), Verdict::Allow);
+  CHECK_VERDICT(m.Admit(c, 1, 2000, t0 + 10'300), Verdict::Allow);
+  CHECK_VERDICT(m.Admit(c, 1, 2000, t0 + 12'300), Verdict::OverOnTime);
+}
+
+// The ceiling leaves ordinary use alone: a single pulse, a joined stage of back to back pulses, a stage whose pulses
+// leave short gaps and a stage whose pulses overlap all pass. A joined pulse that ends earlier adds no time.
+static void normalStagesPass()
+{
+  ChannelLimiter single;
+  CHECK_VERDICT(single.Admit(fixture(), 10, 100, kWarm), Verdict::Allow);
+
+  ChannelCaps c       = fixture();
+  c.maxPulseMs        = 100;
+  c.maxPulsesPerStage = 3;
+  c.minGapSec         = 60;
+  c.maxPerHour        = 2;
+  c.stageJoinMs       = 500;
+  CHECK(OnTimeCeilingMs(c) == 300);
+  const int64_t t0 = kWarm;
+
+  ChannelLimiter backToBack;
+  CHECK_VERDICT(backToBack.Admit(c, 1, 100, t0), Verdict::Allow);
+  CHECK_VERDICT(backToBack.Admit(c, 1, 100, t0 + 100), Verdict::Allow);
+  CHECK_VERDICT(backToBack.Admit(c, 1, 100, t0 + 200), Verdict::Allow);
+  CHECK_VERDICT(backToBack.Admit(c, 1, 100, t0 + 300), Verdict::OverPulses);
+  CHECK_VERDICT(backToBack.Admit(c, 1, 100, t0 + 60 * kSec), Verdict::Allow);
+
+  ChannelLimiter shortGaps;
+  CHECK_VERDICT(shortGaps.Admit(c, 1, 100, t0), Verdict::Allow);
+  CHECK_VERDICT(shortGaps.Admit(c, 1, 100, t0 + 299), Verdict::Allow);
+  CHECK_VERDICT(shortGaps.Admit(c, 1, 100, t0 + 598), Verdict::Allow);
+
+  ChannelLimiter overlapping;
+  CHECK_VERDICT(overlapping.Admit(c, 1, 100, t0), Verdict::Allow);
+  CHECK_VERDICT(overlapping.Admit(c, 1, 100, t0 + 50), Verdict::Allow);
+  CHECK_VERDICT(overlapping.Admit(c, 1, 10, t0 + 60), Verdict::Allow);
+
+  // Two stages a full gap apart are two runs.
+  ChannelCaps paced       = fixture();
+  paced.maxPulseMs        = 1000;
+  paced.maxPulsesPerStage = 1;
+  paced.minGapSec         = 2;
+  ChannelLimiter twoStages;
+  CHECK_VERDICT(twoStages.Admit(paced, 1, 1000, t0), Verdict::Allow);
+  CHECK_VERDICT(twoStages.Admit(paced, 1, 1000, t0 + 2 * kSec), Verdict::Allow);
+}
+
+// Any sender, any caps: rebuild the output of the admitted commands as intervals, split it into runs wherever it stays
+// off for the 300 ms terminator, and check that no run holds more output time than one full stage. The union of the
+// intervals is at least what the radio sends, since an overwrite can only end a sequence sooner.
+static void noRunExceedsTheCeiling()
+{
+  uint64_t seed = 0x2545'F491'4F6C'DD1DULL;
+  auto next     = [&seed](uint64_t mod) {
+    seed = seed * 6'364'136'223'846'793'005ULL + 1'442'695'040'888'963'407ULL;
+    return (seed >> 33) % mod;
+  };
+  for (int trial = 0; trial < 200; ++trial) {
+    ChannelCaps c       = fixture();
+    c.minGapSec         = 1 + static_cast<uint32_t>(next(4));
+    c.maxPulseMs        = static_cast<uint16_t>(1 + next(c.minGapSec * 1000));
+    c.maxPulsesPerStage = static_cast<uint16_t>(1 + next(4));
+    c.maxPerHour        = static_cast<uint16_t>(3600 / c.minGapSec);
+    c.maxPerDay         = 60'000;
+    c.stageJoinMs       = static_cast<uint32_t>(next(2) == 0 ? 0 : next(1000));
+    CHECK(CapsSet(c) && CapsCoherent(c));
+
+    ChannelLimiter l;
+    std::vector<std::pair<int64_t, int64_t>> admitted;
+    int64_t now = kWarm;
+    for (int i = 0; i < 400; ++i) {
+      now += static_cast<int64_t>(next(c.minGapSec * 1000 + 600));
+      const uint16_t duration = static_cast<uint16_t>(next(c.maxPulseMs + 1u));
+      if (l.Admit(c, 1, duration, now) == Verdict::Allow) {
+        admitted.emplace_back(now, now + duration);
+      }
+    }
+
+    int64_t runOn  = 0;
+    int64_t runEnd = INT64_MIN / 2;
+    for (const auto& [start, end] : admitted) {
+      if (start >= runEnd + kOutputRunBreakMs) {
+        runOn  = end - start;
+        runEnd = end;
+      } else {
+        runOn += std::max<int64_t>(0, end - std::max(start, runEnd));
+        runEnd = std::max(runEnd, end);
+      }
+      CHECK(runOn <= OnTimeCeilingMs(c));
+    }
+  }
 }
 
 static void refusalsRecordNothing()
@@ -349,6 +538,7 @@ static void verdictHelpers()
   CHECK(!Admitted(Verdict::CapsNotSet));
   CHECK(!Admitted(Verdict::BootHold));
   CHECK(!Admitted(Verdict::Gap));
+  CHECK(!Admitted(Verdict::OverOnTime));
 }
 
 int main()
@@ -356,12 +546,17 @@ int main()
   zeroCapsRefuse();
   zeroCapsRefuseEveryCommand();
   incoherentCapsRefuse();
+  pulseLongerThanTheGapIsIncoherent();
   requestCaps();
   coldBootHoldSpacing();
   bootHold();
   gapBetweenStages();
   hourlyAndDaily();
   stageJoin();
+  stagesEveryGapCannotHoldOutputOn();
+  onTimeCeilingBoundaries();
+  normalStagesPass();
+  noRunExceedsTheCeiling();
   refusalsRecordNothing();
   windowNeverUnderstates();
   retainedSurvivesRestart();

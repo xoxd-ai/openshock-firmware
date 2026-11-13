@@ -128,7 +128,7 @@ static void reportIgnoresAdmitted()
 
 static void reportCountsEachRefusal()
 {
-  const Verdict refusals[] = {Verdict::CapsNotSet, Verdict::BootHold, Verdict::OverIntensity, Verdict::OverPulseMs, Verdict::OverPulses, Verdict::Gap, Verdict::Hourly, Verdict::Daily};
+  const Verdict refusals[] = {Verdict::CapsNotSet, Verdict::BootHold, Verdict::OverIntensity, Verdict::OverPulseMs, Verdict::OverPulses, Verdict::Gap, Verdict::Hourly, Verdict::Daily, Verdict::OverOnTime};
 
   RefusalReport r;
   uint32_t expected = 0;
@@ -167,7 +167,8 @@ static void wireCodeNames()
   CHECK(std::strcmp(RefusalCodeName(9), "daily") == 0);
   CHECK(std::strcmp(RefusalCodeName(10), "estop-engaged") == 0);
   CHECK(std::strcmp(RefusalCodeName(11), "estop-not-armed") == 0);
-  CHECK(std::strcmp(RefusalCodeName(12), "unknown") == 0);
+  CHECK(std::strcmp(RefusalCodeName(12), "over-on-time") == 0);
+  CHECK(std::strcmp(RefusalCodeName(13), "unknown") == 0);
   CHECK(std::strcmp(RefusalCodeName(255), "unknown") == 0);
 }
 

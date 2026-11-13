@@ -524,6 +524,46 @@ static void coldBootHolds()
   CHECK(g_radio.size() == 1);
 }
 
+// Review H1 through the real `HandleCommand` and serial `rftransmit`: pulses as long as the gap, one stage apart, abut,
+// so the second would join the first on the radio. It refuses as `over-on-time`, wire code 12, and never reaches the
+// radio. Once the output has stayed off for the 300 ms terminator a new run starts.
+static void onTimeCeilingRefusesAJoinedPulse()
+{
+  ChannelCaps abutting  = fixture();
+  abutting.maxPulseMs   = 1000;  // equal to the 1 s gap, the most the coherence rule allows
+  abutting.maxPerHour   = 3;
+  abutting.maxPerDay    = 5;
+  CHECK(CapsCoherent(abutting));
+  plantRecord(abutting, abutting);
+  bootHub();
+  g_nowMs = kWarmMs;
+
+  CHECK(CommandHandler::HandleCommand(ShockerModelType::CaiXianlin, 7, ShockerCommandType::Shock, 10, 1000));
+  CHECK(g_radio.size() == 1);
+
+  g_nowMs += 1000;
+  CHECK(!CommandHandler::HandleCommand(ShockerModelType::CaiXianlin, 7, ShockerCommandType::Shock, 10, 1000));
+  CHECK(SafetyCaps::GetRefusals().lastCode == 12);
+  CHECK(g_lastLog.find("verdict=over-on-time") != std::string::npos);
+  g_nowMs += 299;
+  sendSerial(ShockerModelType::CaiXianlin, 7, ShockerCommandType::Shock, 10, 1000);
+  CHECK(g_radio.size() == 1);
+
+  g_nowMs += 1;
+  sendSerial(ShockerModelType::CaiXianlin, 7, ShockerCommandType::Shock, 10, 1000);
+  CHECK(g_radio.size() == 2);
+}
+
+// The run break in CapLimiter.h is the RF task's terminator time. The constant there is file-local, so read it.
+static void runBreakIsTheTerminator()
+{
+  std::ifstream in("src/radio/RFTransmitter.cpp");
+  const std::string source((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+  std::smatch match;
+  CHECK(std::regex_search(source, match, std::regex(R"(const int64_t kTerminatorDurationMs\s*=\s*(\d+);)")));
+  CHECK(match.size() == 2 && std::stoll(match[1].str()) == kOutputRunBreakMs);
+}
+
 static void estopRefusesWithCapsSet()
 {
   plantRecord(fixture(), fixture());
@@ -826,6 +866,8 @@ int main()
   SCENARIO(vibrateSetLeavesShockRefused);
   SCENARIO(clearRefusesAgain);
   SCENARIO(coldBootHolds);
+  SCENARIO(onTimeCeilingRefusesAJoinedPulse);
+  SCENARIO(runBreakIsTheTerminator);
   SCENARIO(estopRefusesWithCapsSet);
   SCENARIO(uncappedTypesPassAtZeroCaps);
   SCENARIO(uncappedTypesNeverEncodeAsShock);

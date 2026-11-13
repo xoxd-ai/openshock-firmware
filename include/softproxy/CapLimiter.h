@@ -13,6 +13,7 @@
 // This header holds only the decision logic. It has no Arduino, FreeRTOS or ESP-IDF dependency, so a
 // host compiler can test it (test/native/test_cap_limiter.cpp).
 
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -37,10 +38,24 @@ namespace OpenShock::Softproxy {
     return c.maxIntensityPct > 0 && c.maxPulseMs > 0 && c.maxPulsesPerStage > 0 && c.minGapSec > 0 && c.maxPerHour > 0 && c.maxPerDay > 0;
   }
 
-  /// Caps agree with each other (Softproxy `capsCoherent`). Units and arithmetic only, no ceiling on any value.
+  /// Caps agree with each other (Softproxy `capsCoherent`). Units and arithmetic only, no ceiling on any value. A
+  /// pulse may not outlast the gap: the radio overwrites a shocker's running sequence with each new command, so a pulse
+  /// longer than the gap would let stages started every `minGapSec` join into one unbroken output (review H1).
   constexpr bool CapsCoherent(const ChannelCaps& c)
   {
-    return c.maxIntensityPct <= 100 && c.maxPerHour <= c.maxPerDay && static_cast<uint64_t>(c.minGapSec) * c.maxPerHour <= 3600;
+    return c.maxIntensityPct <= 100 && c.maxPerHour <= c.maxPerDay && static_cast<uint64_t>(c.minGapSec) * c.maxPerHour <= 3600 && static_cast<uint64_t>(c.maxPulseMs) <= static_cast<uint64_t>(c.minGapSec) * 1000;
+  }
+
+  /// Output that resumes less than this many ms after the channel's previous output ended continues the same run. It is
+  /// the RF task's terminator time (`kTerminatorDurationMs` in src/radio/RFTransmitter.cpp): a shocker's sequence stays
+  /// in the task, sending the stop frame, for 300 ms after its end, and a command for that shocker in those 300 ms
+  /// overwrites it. Only output that stays off for the whole terminator ends a run.
+  constexpr int64_t kOutputRunBreakMs = 300;
+
+  /// Most output time one run may hold: one full stage, `maxPulsesPerStage` pulses of `maxPulseMs` (review H1).
+  constexpr int64_t OnTimeCeilingMs(const ChannelCaps& c)
+  {
+    return static_cast<int64_t>(c.maxPulseMs) * c.maxPulsesPerStage;
   }
 
   /// Every field is 0: the channel is cleared, which refuses every command.
@@ -80,6 +95,7 @@ namespace OpenShock::Softproxy {
     Daily,          // `maxPerDay` stages started in the last 24 hours.
     EStopEngaged,   // The E-Stop is engaged. Any command refuses, capped or not.
     EStopNotArmed,  // No live E-Stop checker task on a valid pin. Shock and vibrate refuse (include/softproxy/KillPath.h).
+    OverOnTime,     // The command would take the channel's output run past `OnTimeCeilingMs`.
   };
 
   constexpr const char* VerdictName(Verdict v)
@@ -109,6 +125,8 @@ namespace OpenShock::Softproxy {
         return "estop-engaged";
       case Verdict::EStopNotArmed:
         return "estop-not-armed";
+      case Verdict::OverOnTime:
+        return "over-on-time";
       default:
         return "unknown";
     }
@@ -174,6 +192,12 @@ namespace OpenShock::Softproxy {
   /// A stage starts with a command that does not join the open stage. Gap, hourly and daily limits
   /// apply to stage starts, as the Softproxy server counts one request per stage. After a cold boot the
   /// counters start empty, so the boot hold refuses until the clock reaches `ColdBootHoldMs`.
+  ///
+  /// The limiter also bounds continuous output, whatever the stages (review H1). A run is the channel's output from
+  /// a start until it stays off for `kOutputRunBreakMs`. Each admitted command counts as output from `nowMs` for its
+  /// duration, and a time two commands overlap counts once. A command that would bring the run's output time above
+  /// `OnTimeCeilingMs` refuses with `OverOnTime`. The run is kept per channel, not per shocker, so output to two
+  /// shockers counts as one run, which can only refuse sooner.
   class ChannelLimiter {
   public:
     /// Checks one command against the caps. On `Allow` it records the command before returning.
@@ -195,11 +219,23 @@ namespace OpenShock::Softproxy {
 
       const int64_t gapMs = static_cast<int64_t>(caps.minGapSec) * 1000;
 
+      // The output time the run would hold with this command (see the class comment).
+      const int64_t endMs      = nowMs + durationMs;
+      const bool continuesRun  = m_hasRun && nowMs < m_runEndMs + kOutputRunBreakMs;
+      const int64_t addedMs    = continuesRun ? std::max<int64_t>(0, endMs - std::max(nowMs, m_runEndMs)) : durationMs;
+      const int64_t runOnMs    = (continuesRun ? m_runOnMs : 0) + addedMs;
+      const int64_t runEndMs   = continuesRun ? std::max(m_runEndMs, endMs) : endMs;
+      const bool overOnTime    = runOnMs > OnTimeCeilingMs(caps);
+
       const bool joins = m_hasStage && caps.stageJoinMs > 0 && nowMs >= m_stageStartMs && nowMs <= m_lastPulseEndMs + static_cast<int64_t>(caps.stageJoinMs);
       if (joins) {
         if (m_pulsesInStage >= caps.maxPulsesPerStage) {
           return Verdict::OverPulses;
         }
+        if (overOnTime) {
+          return Verdict::OverOnTime;
+        }
+        recordRun(runOnMs, runEndMs);
         ++m_pulsesInStage;
         m_lastPulseEndMs = nowMs + durationMs;
         return Verdict::Allow;
@@ -214,7 +250,11 @@ namespace OpenShock::Softproxy {
       if (m_day.Count(nowMs) >= caps.maxPerDay) {
         return Verdict::Daily;
       }
+      if (overOnTime) {
+        return Verdict::OverOnTime;
+      }
 
+      recordRun(runOnMs, runEndMs);
       m_hasStage       = true;
       m_stageStartMs   = nowMs;
       m_lastPulseEndMs = nowMs + durationMs;
@@ -228,10 +268,20 @@ namespace OpenShock::Softproxy {
     uint32_t StagesLastDay(int64_t nowMs) const { return m_day.Count(nowMs); }
 
   private:
+    void recordRun(int64_t runOnMs, int64_t runEndMs)
+    {
+      m_hasRun   = true;
+      m_runOnMs  = runOnMs;
+      m_runEndMs = runEndMs;
+    }
+
     bool m_hasStage          = false;
     int64_t m_stageStartMs   = 0;
     int64_t m_lastPulseEndMs = 0;
     uint16_t m_pulsesInStage = 0;
+    bool m_hasRun            = false;
+    int64_t m_runOnMs        = 0;  // Output time in the current run, overlaps counted once.
+    int64_t m_runEndMs       = 0;  // Latest end of any output in the current run.
     WindowCounter<3'600'000, 60'000> m_hour;   // 1 minute buckets.
     WindowCounter<86'400'000, 900'000> m_day;  // 15 minute buckets.
   };
@@ -261,7 +311,7 @@ namespace OpenShock::Softproxy {
   static_assert(sizeof(RetainedLimiters) <= UINT16_MAX, "the size field is 16 bits");
 
   constexpr uint32_t kRetainedMagic   = 0x53505254;  // "SPRT"
-  constexpr uint16_t kRetainedVersion = 1;
+  constexpr uint16_t kRetainedVersion = 2;  // 2 added the output run to `ChannelLimiter`. A version 1 record reads as a cold boot.
 
   /// FNV-1a over every byte before `checksum`.
   inline uint32_t RetainedChecksum(const RetainedLimiters& r)
