@@ -457,7 +457,7 @@ static void withinCapsReachesRadio()
   CHECK(g_radio.back().durationMs == 100);
 
   g_nowMs += 1000;
-  sendGateway(ShockerModelType::CaiXianlin, 7, ShockerCommandType::Shock, 10, 100);
+  sendSerial(ShockerModelType::CaiXianlin, 7, ShockerCommandType::Shock, 10, 100);
   CHECK(g_radio.size() == 2);
   CHECK(g_radio.back().type == ShockerCommandType::Shock);
 
@@ -481,7 +481,7 @@ static void vibrateSetLeavesShockRefused()
   bootHub();
   g_nowMs = kWarmMs;
 
-  sendGateway(ShockerModelType::CaiXianlin, 7, ShockerCommandType::Vibrate, 10, 100);
+  sendSerial(ShockerModelType::CaiXianlin, 7, ShockerCommandType::Vibrate, 10, 100);
   CHECK(g_radio.size() == 1);
 
   const std::size_t sent = g_radio.size();
@@ -698,6 +698,40 @@ static void gatewayTriggers()
   CHECK(s_estopTriggers == 1);
 }
 
+// Review H3: a linked gateway cannot actuate. Shock and Vibrate within every cap never reach `HandleCommand`, so they
+// leave no refusal in Softproxy's count either. The same commands over serial reach the radio. A gateway Stop and Sound
+// still pass, and its emergency stop still reaches `Trigger`.
+static void gatewayCannotActuate()
+{
+  plantRecord(fixture(), fixture());
+  bootHub();
+  g_nowMs = kWarmMs;
+
+  const uint32_t refusals = SafetyCaps::GetRefusals().count;
+  for (ShockerCommandType type : kCapped) {
+    for (ShockerModelType model : kGatewayModels) {
+      g_nowMs += kDayMs;  // past every gap, hourly and daily cap, so only the lockout can refuse
+      sendGateway(model, 7, type, 10, 100);
+      CHECK(g_radio.empty());
+      CHECK(g_lastLog.find("Refusing gateway") != std::string::npos);
+    }
+  }
+  CHECK(SafetyCaps::GetRefusals().count == refusals);
+
+  sendSerial(ShockerModelType::CaiXianlin, 7, ShockerCommandType::Vibrate, 10, 100);
+  CHECK(g_radio.size() == 1);
+
+  sendGateway(ShockerModelType::CaiXianlin, 7, ShockerCommandType::Stop, 0, 0);
+  sendGateway(ShockerModelType::CaiXianlin, 7, ShockerCommandType::Sound, 0, 300);
+  CHECK(g_radio.size() == 3);
+  CHECK(g_radio[1].type == ShockerCommandType::Stop);
+  CHECK(g_radio[2].type == ShockerCommandType::Sound);
+
+  const int triggers = s_estopTriggers;
+  sendTrigger(GatewaySchema::TriggerType::EmergencyStop);
+  CHECK(s_estopTriggers == triggers + 1);
+}
+
 static std::string readFile(const std::filesystem::path& path)
 {
   std::ifstream in(path);
@@ -833,6 +867,7 @@ int main()
   SCENARIO(localSocketCannotMoveTransmitter);
   SCENARIO(serialStillMovesTransmitter);
   SCENARIO(gatewayTriggers);
+  SCENARIO(gatewayCannotActuate);
   SCENARIO(radioHasNoOtherCaller);
 
   if (s_failures != 0) {

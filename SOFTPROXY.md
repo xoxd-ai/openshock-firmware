@@ -1,6 +1,6 @@
 # Softproxy cap enforcement (xoxd-ai fork)
 
-This fork of `OpenShock/Firmware` starts from tag `1.5.2` (commit `5546c13eb745e4fb2b4ca7b0f4160de8b261872c`). It adds one change: the hub checks every shock and vibrate command against operator-set caps before the radio sends it. Softproxy's alarm service checks the same caps first (Softproxy ADR-0008 decision 6, `Device.dhall` server check 3). The hub check is the second line. A step over the intensity, pulse, per-stage or gap caps cannot reach the shocker even when the server sends it. The hourly and daily caps hold across a warm restart, and a power cycle that loses RTC memory costs a full cold boot hold (see Fail closed). To keep the gateway from removing the check, the fork also refuses over-the-air installs and ignores the gateway restart trigger (see Remote paths). The captive portal's local socket refuses the E-Stop, Wi-Fi and account-link commands (SP-46, see Local socket). The hub refuses shock and vibrate unless a live E-Stop stands behind them, a cap rises only while a button press holds the E-Stop engaged, and a cold boot starts engaged (SP-113, SP-156, SP-158, see Kill path). The E-Stop is a latching mushroom with a normally closed contact, so a cut cable or an unwired pin reads as stop (R-SOFTPROXY-ESTOP-NC). Each cap or E-Stop refusal reaches the hub log and the gateway heartbeat (see Refusal report). Linear: TIN-7545.
+This fork of `OpenShock/Firmware` starts from tag `1.5.2` (commit `5546c13eb745e4fb2b4ca7b0f4160de8b261872c`). It adds one change: the hub checks every shock and vibrate command against operator-set caps before the radio sends it. Softproxy's alarm service checks the same caps first (Softproxy ADR-0008 decision 6, `Device.dhall` server check 3). The hub check is the second line. A step over the intensity, pulse, per-stage or gap caps cannot reach the shocker even when the server sends it. The hourly and daily caps hold across a warm restart, and a power cycle that loses RTC memory costs a full cold boot hold (see Fail closed). To keep the gateway from removing the check, the fork also refuses over-the-air installs and ignores the gateway restart trigger, and it refuses shock and vibrate from the gateway, so only the local serial port actuates (see Remote paths). The captive portal's local socket refuses the E-Stop, Wi-Fi and account-link commands (SP-46, see Local socket). The hub refuses shock and vibrate unless a live E-Stop stands behind them, a cap rises only while a button press holds the E-Stop engaged, and a cold boot starts engaged (SP-113, SP-156, SP-158, see Kill path). The E-Stop is a latching mushroom with a normally closed contact, so a cut cable or an unwired pin reads as stop (R-SOFTPROXY-ESTOP-NC). Each cap or E-Stop refusal reaches the hub log and the gateway heartbeat (see Refusal report). Linear: TIN-7545.
 
 ## What the hub enforces
 
@@ -27,13 +27,14 @@ A stage is one Softproxy request. A command starts a new stage unless `stageJoin
 
 ## Remote paths
 
-Upstream lets the gateway replace the firmware and reboot the hub. Either would undo the hub check: an upstream image carries no caps, and a reboot used to empty the counters. `include/softproxy/Lockout.h` closes both, whatever the stored config says:
+Upstream lets the gateway replace the firmware and reboot the hub. Either would undo the hub check: an upstream image carries no caps, and a reboot used to empty the counters. Upstream also lets a linked gateway send shock and vibrate, which pass the hub caps and the E-Stop but none of Softproxy's server checks 4 to 8 (review H3). `include/softproxy/Lockout.h` closes all three, whatever the stored config says:
 
 | Path | Upstream 1.5.2 | This fork |
 | --- | --- | --- |
 | Gateway `OtaUpdateRequest` | queues an install of any version from the CDN | `TryStartFirmwareUpdate` refuses |
 | OTA check on startup or on a timer, a changed CDN domain | installs the found version | the OTA task stops before any download |
 | Gateway `Trigger` `Restart` | `esp_restart()` | ignored and logged |
+| Gateway `ShockerCommandList` Shock or Vibrate | sends within the caps | refused before `HandleCommand` and logged (`Refusing gateway <type>`), at compile time by `kAllowGatewayActuation = false`. The refusal does not count in the refusal report, which counts Softproxy's own steps. A gateway Stop and Sound still pass, and the gateway `Trigger` `EmergencyStop` still engages the E-Stop |
 | Gateway `Trigger` `CaptivePortalEnable` | holds the portal open while the gateway is connected | ignored and logged (SP-46). `CaptivePortal::SetAlwaysEnabled(true)` also refuses, whatever the caller |
 | Serial flash, serial `restart` | allowed | allowed, both need the local serial port |
 
@@ -136,7 +137,7 @@ The CADE-1 review of `25f1449` found these gaps. No run-time product code change
 
 ## Refusal report
 
-Before this change a refused step left one log line and nothing else, so Softproxy logged an actuation that never reached the shocker (softproxy #27 review, finding 4). `SafetyCaps::Admit` now counts every cap refusal in `include/softproxy/RefusalReport.h` and writes one log line, and `HandleCommand` does the same for the E-Stop refusals through `SafetyCaps::RecordRefusal`. Gateway and serial `rftransmit` commands both pass there. A Stop, Sound or Light refused by an engaged E-Stop logs `channel=other`.
+Before this change a refused step left one log line and nothing else, so Softproxy logged an actuation that never reached the shocker (softproxy #27 review, finding 4). `SafetyCaps::Admit` now counts every cap refusal in `include/softproxy/RefusalReport.h` and writes one log line, and `HandleCommand` does the same for the E-Stop refusals through `SafetyCaps::RecordRefusal`. Serial `rftransmit` commands pass there, and so do the gateway commands the lockout lets through, Stop and Sound. A Stop, Sound or Light refused by an engaged E-Stop logs `channel=other`.
 
 | Trace | Form | Read by |
 | --- | --- | --- |
@@ -173,10 +174,10 @@ Raising a cap needs the E-Stop armed and engaged by its button (see Kill path). 
 | `src/WebSocketDeFragger.cpp`, `include/TinyVec.h`, `src/captiveportal/CaptivePortalInstance.cpp` | the message bound on port 81 and the disconnect after an overflow |
 | `include/softproxy/RefusalReport.h` | the refusal count, the wire codes and the hub log line, no Arduino or ESP-IDF dependency |
 | `include/softproxy/SafetyCaps.h`, `src/softproxy/SafetyCaps.cpp` | NVS store, mutex, the `Admit` gate, the hub clock and the RTC no-init copy of the counters |
-| `src/OtaUpdateManager.cpp`, `src/message_handlers/websocket/gateway/Trigger.cpp`, `src/captiveportal/Manager.cpp` | apply the gateway lockouts |
+| `src/OtaUpdateManager.cpp`, `src/message_handlers/websocket/gateway/Trigger.cpp`, `src/message_handlers/websocket/gateway/ShockerCommandList.cpp`, `src/captiveportal/Manager.cpp` | apply the gateway lockouts |
 | `src/message_handlers/websocket/Local.cpp` | applies the local socket allow list |
 | `src/serialization/WSGateway.cpp`, `softproxy/schemas/HubToGatewayMessage.fbs` | the three `Pong` fields |
-| `src/CommandHandler.cpp` | `HandleCommand` calls the E-Stop checks and `SafetyCaps::Admit` before the radio, and `SetRfTxPin` applies the pin rule. Gateway and serial `rftransmit` commands both pass here |
+| `src/CommandHandler.cpp` | `HandleCommand` calls the E-Stop checks and `SafetyCaps::Admit` before the radio, and `SetRfTxPin` applies the pin rule. Serial `rftransmit` commands and the gateway Stop and Sound pass here |
 | `src/serial/command_handlers/safetycaps.cpp` | the `safetycaps` serial command |
 | `src/config/Config.cpp` | `FactoryReset` clears the caps, and the whole-config writers apply the E-Stop rule |
 | `test/native/test_cap_limiter.cpp` | host test of the decision logic, the retained state and the lockout constants. Every cap at 0 is checked against all 256 intensities by all 65536 durations |
