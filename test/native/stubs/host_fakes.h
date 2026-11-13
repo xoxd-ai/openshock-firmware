@@ -22,6 +22,7 @@
 #include <memory>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 // `int64_t` is `long long` on the hub and `long` on a 64-bit host, which breaks one `std::clamp` call in
@@ -277,9 +278,16 @@ namespace OpenShock {
     bool isLocked() const { return true; }
   };
   class ReadWriteMutex { };
+  // Runs once at the next read lock, so a scenario can let time pass where a real lock could wait (test_kill_path.cpp).
+  inline void (*g_onReadLock)() = nullptr;
   class ScopedReadLock {
   public:
-    ScopedReadLock(ReadWriteMutex*, TickType_t = portMAX_DELAY) { }
+    ScopedReadLock(ReadWriteMutex*, TickType_t = portMAX_DELAY)
+    {
+      if (auto hook = std::exchange(g_onReadLock, nullptr)) {
+        hook();
+      }
+    }
     bool unlock() { return true; }
   };
   class ScopedWriteLock {
@@ -407,6 +415,10 @@ namespace OpenShock {
     {
       g_radio.push_back(RadioSend {model, id, type, intensity, durationMs});
       return true;
+    }
+    bool SendCommand(ShockerModelType model, uint16_t id, ShockerCommandType type, uint8_t intensity, uint16_t durationMs, bool overwrite, int64_t)
+    {
+      return SendCommand(model, id, type, intensity, durationMs, overwrite);
     }
 
   private:

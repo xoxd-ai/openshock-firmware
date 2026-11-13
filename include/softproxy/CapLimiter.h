@@ -329,7 +329,10 @@ namespace OpenShock::Softproxy {
   static_assert(sizeof(RetainedLimiters) <= UINT16_MAX, "the size field is 16 bits");
 
   constexpr uint32_t kRetainedMagic   = 0x53505254;  // "SPRT"
-  constexpr uint16_t kRetainedVersion = 2;  // 2 added the output run to `ChannelLimiter`. A version 1 record reads as a cold boot.
+  // 2 added the output run to `ChannelLimiter`. 3 keeps the layout of 2, but the run end and run total now count one radio
+  // frame per command (review N2), so a version 2 record would restore a run end 73 ms early (review 3 F3). Any older
+  // record reads as a cold boot.
+  constexpr uint16_t kRetainedVersion = 3;
 
   /// FNV-1a over every byte before `checksum`.
   inline uint32_t RetainedChecksum(const RetainedLimiters& r)

@@ -678,6 +678,37 @@ static void retainedRejectsCorruption()
   CHECK(s.StagesLastDay(kWarm) == 1);
 }
 
+// Review 3 F3: version 3 keeps the layout of version 2, but the run end and run total count one radio frame per command
+// since review N2. A record a version 2 image sealed must not restore. It reads as a cold boot: the clock starts at 0, as
+// `SafetyCaps` then sets it, and the channel holds.
+static void version2RecordReadsAsColdBoot()
+{
+  CHECK(kRetainedVersion == 3);
+  ChannelCaps c = fixture();
+  ChannelLimiter shock;
+  ChannelLimiter vibrate;
+  CHECK_VERDICT(shock.Admit(c, 1, 1, kWarm), Verdict::Allow);
+
+  RetainedLimiters older;
+  SealRetained(older, kWarm + kSec, shock, vibrate);
+  older.version  = 2;
+  older.checksum = RetainedChecksum(older);
+
+  int64_t clockMs = -1;
+  ChannelLimiter s;
+  ChannelLimiter v;
+  CHECK(!RestoreRetained(older, clockMs, s, v));
+  CHECK(clockMs == -1);
+  CHECK(s.StagesLastDay(kWarm + kSec) == 0);
+
+  // The cold boot path: the hub clock is the time since boot, which is below the hold.
+  const int64_t sinceBoot = 5 * kSec;
+  CHECK(sinceBoot < ColdBootHoldMs(c));
+  CHECK_VERDICT(s.Admit(c, 1, 1, sinceBoot), Verdict::BootHold);
+  CHECK_VERDICT(v.Admit(c, 1, 1, sinceBoot), Verdict::BootHold);
+  CHECK_VERDICT(s.Admit(c, 1, 1, ColdBootHoldMs(c)), Verdict::Allow);
+}
+
 static void lockouts()
 {
   static_assert(!kAllowOtaInstall, "the fork never installs firmware over the air");
@@ -722,6 +753,7 @@ int main()
   windowNeverUnderstates();
   retainedSurvivesRestart();
   retainedRejectsCorruption();
+  version2RecordReadsAsColdBoot();
   lockouts();
   verdictHelpers();
 

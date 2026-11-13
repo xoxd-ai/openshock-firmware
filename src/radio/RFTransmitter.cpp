@@ -78,6 +78,11 @@ RFTransmitter::~RFTransmitter()
 
 bool RFTransmitter::SendCommand(ShockerModelType model, uint16_t shockerId, ShockerCommandType type, uint8_t intensity, uint16_t durationMs, bool overwriteExisting)
 {
+  return SendCommand(model, shockerId, type, intensity, durationMs, overwriteExisting, OpenShock::millis());
+}
+
+bool RFTransmitter::SendCommand(ShockerModelType model, uint16_t shockerId, ShockerCommandType type, uint8_t intensity, uint16_t durationMs, bool overwriteExisting, int64_t startMs)
+{
   if (m_queueHandle == nullptr) {
     OS_LOGE(TAG, "[pin-%hhi] Queue is null", m_txPin);
     return false;
@@ -91,11 +96,12 @@ bool RFTransmitter::SendCommand(ShockerModelType model, uint16_t shockerId, Shoc
     intensity         = 0;
     durationMs        = 300;
     overwriteExisting = true;
+    startMs           = OpenShock::millis();
   } else {
     OS_LOGD(TAG, "Command received: %u %u %u %u", model, shockerId, type, intensity);
   }
 
-  Command cmd = Command {.transmitEnd = OpenShock::millis() + durationMs, .modelType = model, .type = type, .shockerId = shockerId, .intensity = intensity, .flags = overwriteExisting ? kFlagOverwrite : (uint8_t)0};
+  Command cmd = Command {.transmitEnd = startMs + durationMs, .modelType = model, .type = type, .shockerId = shockerId, .intensity = intensity, .flags = overwriteExisting ? kFlagOverwrite : (uint8_t)0};
 
   // Add the command to the queue, wait max 10 ms (Adjust this)
   if (xQueueSend(m_queueHandle, &cmd, pdMS_TO_TICKS(10)) != pdTRUE) {

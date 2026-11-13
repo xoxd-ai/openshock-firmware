@@ -340,7 +340,8 @@ bool CommandHandler::HandleCommand(ShockerModelType model, uint16_t shockerId, S
 
   // Softproxy caps (ADR-0008 decision 6). Every shock and vibrate command passes here before the radio.
   // Admit counts and logs each refusal (softproxy/RefusalReport.h).
-  Softproxy::Verdict verdict = Softproxy::SafetyCaps::Admit(type, intensity, durationMs);
+  int64_t admittedAtMs       = 0;
+  Softproxy::Verdict verdict = Softproxy::SafetyCaps::Admit(type, intensity, durationMs, admittedAtMs);
   if (!Softproxy::Admitted(verdict)) {
     return false;
   }
@@ -352,7 +353,9 @@ bool CommandHandler::HandleCommand(ShockerModelType model, uint16_t shockerId, S
     return false;
   }
 
-  bool ok = s_rfTransmitter->SendCommand(model, shockerId, type, intensity, durationMs);
+  // The radio ends the command at the admitted instant plus its duration, the interval the cap limiter counted, however
+  // long the lock above or the queue took (review 3 F1).
+  bool ok = s_rfTransmitter->SendCommand(model, shockerId, type, intensity, durationMs, true, admittedAtMs);
 
   lock__rf.unlock();
   ScopedReadLock lock__ka(&s_keepAliveMutex);

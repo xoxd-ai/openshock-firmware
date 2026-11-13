@@ -368,9 +368,11 @@ static bool estopmgr_setestopenabled(bool enabled)
       s_estopTask = task;  // Until this store `IsArmed` reads no task, which is not armed.
     }
   } else {
-    if (s_estopTask != nullptr) {
-      vTaskDelete(s_estopTask);
-      s_estopTask = nullptr;
+    // Clear the handle before the delete, so `IsArmed` on the RF task cannot read the old task, with its fresh sample, as
+    // armed while the delete runs (review 3 F5).
+    TaskHandle_t task = s_estopTask.exchange(nullptr);
+    if (task != nullptr) {
+      vTaskDelete(task);
     }
     // A task running on the other core dies at that core's next switch, so it can still set the flag after this line.
     // That is masked: `IsArmed` reads no task until the next create, and the create resets the flag first (review T4).
