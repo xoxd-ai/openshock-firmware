@@ -381,13 +381,20 @@ bool rmtWriteBlocking(rmt_obj_t*, const rmt_data_t* data, std::size_t size)
 // Events run at once on the posting thread.
 static void (*s_estopHandler)(void*, esp_event_base_t, int32_t, void*) = nullptr;
 static std::vector<EStopState> s_published;
+// A post can fail, as a full event queue would after its wait. Each post records the wait it asked for.
+static esp_err_t s_eventPostResult = ESP_OK;
+static std::vector<TickType_t> s_eventPostWaits;
 esp_err_t esp_event_handler_register(esp_event_base_t, int32_t, void (*handler)(void*, esp_event_base_t, int32_t, void*), void*)
 {
   s_estopHandler = handler;
   return ESP_OK;
 }
-esp_err_t esp_event_post(esp_event_base_t base, int32_t id, const void* data, std::size_t, TickType_t)
+esp_err_t esp_event_post(esp_event_base_t base, int32_t id, const void* data, std::size_t, TickType_t wait)
 {
+  s_eventPostWaits.push_back(wait);
+  if (s_eventPostResult != ESP_OK) {
+    return s_eventPostResult;
+  }
   s_published.push_back(*static_cast<const EStopState*>(data));
   if (s_estopHandler != nullptr) {
     s_estopHandler(nullptr, base, id, const_cast<void*>(data));
@@ -511,6 +518,10 @@ static void bootEStopManager(esp_reset_reason_t reason, bool loseRetained)
   s_latch               = EStopLatchSource::ColdBoot;
   s_estopActivatedAt    = 0;
   s_lastSampleMs        = 0;
+  s_sampledSinceStart   = false;
+  s_lastLoggedState     = EStopState::Idle;
+  s_postFailureLogged   = false;
+  s_eventPostResult     = ESP_OK;
   s_externallyTriggered = false;
   s_gatewayStops        = 0;
   s_estopInitialized    = false;
@@ -2069,6 +2080,182 @@ static void stalledCheckerCannotSkipTheClear()
   CHECK(s_published.back() == EStopState::Idle);
 }
 
+// Review H2: a checker that stalls cannot latch a press, so the transmit task ends output once the hub is not armed,
+// about 1000 milliseconds after the last sample, instead of running the admitted pulse to its end.
+static void stalledCheckerEndsAPulseInFlight()
+{
+  armedHub();
+  engageByButton();
+  CHECK(SafetyCaps::Set(ShockerCommandType::Vibrate, highCaps()) == SetResult::Stored);
+  twistToClear();
+
+  Rmt::Sequence expected(kModel, 7, 0);
+  CHECK(expected.fill(ShockerCommandType::Vibrate, 20));
+  const std::vector<uint32_t> payload(reinterpret_cast<const uint32_t*>(expected.payload()), reinterpret_cast<const uint32_t*>(expected.payload()) + expected.size());
+  const std::vector<uint32_t> terminator(reinterpret_cast<const uint32_t*>(expected.terminator()), reinterpret_cast<const uint32_t*>(expected.terminator()) + expected.size());
+
+  s_air.clear();
+  CHECK(CommandHandler::HandleCommand(kModel, 7, ShockerCommandType::Vibrate, 20, 2000));
+  advance(100);
+  s_stallChecker        = true;
+  const int64_t stalled = g_nowMs;
+  advance(1500);
+  CHECK(!EStopManager::IsArmed());
+  CHECK(!EStopManager::IsEStopped());
+
+  std::size_t payloadFrames = 0;
+  for (const auto& frame : s_air) {
+    if (frame.words == payload) {
+      ++payloadFrames;
+      CHECK(frame.atMs <= stalled + static_cast<int64_t>(k_estopSampleStaleTime) + 15);
+    } else {
+      CHECK(frame.words == terminator);
+    }
+  }
+  CHECK(payloadFrames > 5);
+  CHECK(s_air.back().words == terminator);
+  const std::size_t frames = s_air.size();
+  advance(500);
+  CHECK(s_air.size() == frames);
+
+  s_stallChecker = false;
+  advance(20);
+  CHECK(EStopManager::IsArmed());
+  (void)SafetyCaps::Clear();
+}
+
+// Review H2, the other side: a hub that is not armed still sends a stop frame, a keep-alive and Sound for their full
+// length. A vibrate above 0 and a shock end before any payload frame. A transmitter of the test's own sends those,
+// since `HandleCommand` refuses shock and vibrate first.
+static void notArmedKeepsTheStopFrameAndTheKeepAlive()
+{
+  releasedHubWithNoTask();
+  CHECK(!EStopManager::IsArmed());
+  CHECK(!EStopManager::IsEStopped());
+
+  Rmt::Sequence stop(kModel, 7, 0);
+  CHECK(stop.fill(ShockerCommandType::Vibrate, 0));
+  const std::vector<uint32_t> stopFrame(reinterpret_cast<const uint32_t*>(stop.payload()), reinterpret_cast<const uint32_t*>(stop.payload()) + stop.size());
+
+  // A Stop through the real `HandleCommand`: 300 milliseconds of stop frames, then the 300 millisecond terminator, which
+  // is the same frame. Ended at once it would last only the terminator.
+  s_air.clear();
+  CHECK(CommandHandler::HandleCommand(kModel, 7, ShockerCommandType::Stop, 0, 0));
+  advance(1000);
+  CHECK(!s_air.empty());
+  for (const auto& frame : s_air) {
+    CHECK(frame.words == stopFrame);
+  }
+  CHECK(!s_air.empty() && s_air.back().atMs - s_air.front().atMs >= 550);
+
+  {
+    OpenShock::RFTransmitter radio(static_cast<gpio_num_t>(27));
+    CHECK(radio.ok());
+
+    // The keep-alive: vibrate at intensity 0 for 300 milliseconds, not overwriting.
+    s_air.clear();
+    CHECK(radio.SendCommand(kModel, 7, ShockerCommandType::Vibrate, 0, 300, false));
+    advance(1000);
+    CHECK(!s_air.empty() && s_air.back().atMs - s_air.front().atMs >= 550);
+
+    // Sound carries no cap and passes `HandleCommand` when not armed, so it runs its length.
+    Rmt::Sequence sound(kModel, 7, 0);
+    CHECK(sound.fill(ShockerCommandType::Sound, 0));
+    const std::vector<uint32_t> soundFrame(reinterpret_cast<const uint32_t*>(sound.payload()), reinterpret_cast<const uint32_t*>(sound.payload()) + sound.size());
+    s_air.clear();
+    CHECK(radio.SendCommand(kModel, 7, ShockerCommandType::Sound, 0, 1000));
+    advance(1500);
+    std::size_t soundFrames = 0;
+    for (const auto& frame : s_air) {
+      soundFrames += frame.words == soundFrame ? 1 : 0;
+    }
+    CHECK(soundFrames > 150);
+
+    // Output ends on the pass that takes it: no payload frame reaches the air.
+    for (ShockerCommandType type : {ShockerCommandType::Vibrate, ShockerCommandType::Shock}) {
+      Rmt::Sequence out(kModel, 7, 0);
+      CHECK(out.fill(type, 20));
+      const std::vector<uint32_t> outFrame(reinterpret_cast<const uint32_t*>(out.payload()), reinterpret_cast<const uint32_t*>(out.payload()) + out.size());
+      s_air.clear();
+      CHECK(radio.SendCommand(kModel, 7, type, 20, 2000));
+      advance(1000);
+      CHECK(!s_air.empty());
+      for (const auto& frame : s_air) {
+        CHECK(frame.words != outFrame);
+      }
+    }
+  }
+
+  // The decision itself, for every type and intensity.
+  for (int raw = 0; raw <= static_cast<int>(ShockerCommandType::Light); ++raw) {
+    const auto type = static_cast<ShockerCommandType>(raw);
+    for (int intensity = 0; intensity <= 255; ++intensity) {
+      const auto i        = static_cast<uint8_t>(intensity);
+      const bool carrying = type == ShockerCommandType::Shock || (type == ShockerCommandType::Vibrate && i > 0);
+      CHECK(TransmitEndsSequence(true, true, type, i));
+      CHECK(TransmitEndsSequence(true, false, type, i));
+      CHECK(!TransmitEndsSequence(false, true, type, i));
+      CHECK(TransmitEndsSequence(false, false, type, i) == carrying);
+    }
+  }
+}
+
+// Review H2: the checker posted its state event with no time limit, so a full event queue held it there and the
+// mushroom went unread. The wait is now bounded, the checker keeps sampling, and the state posts on a later pass.
+static void eventPostCannotHoldTheChecker()
+{
+  armedHub();
+  s_eventPostWaits.clear();
+  s_eventPostResult = ESP_FAIL;
+  engageByButton();
+  CHECK(EStopManager::IsEStopped());
+  CHECK(!s_eventPostWaits.empty());
+  for (TickType_t wait : s_eventPostWaits) {
+    CHECK(wait != portMAX_DELAY);
+    CHECK(wait <= pdMS_TO_TICKS(k_estopUpdateRate));
+  }
+  advance(k_estopSampleStaleTime + 500);
+  CHECK(EStopManager::IsArmed());
+  CHECK(s_published.empty());
+
+  s_eventPostResult = ESP_OK;
+  advance(10);
+  CHECK(!s_published.empty() && s_published.back() == EStopState::Active);
+  twistToClear();
+  CHECK(!EStopManager::IsEStopped());
+  CHECK(!s_published.empty() && s_published.back() == EStopState::Idle);
+}
+
+// Review H5: a task restarted by a pin move is not armed until it samples, whatever the old task left behind.
+static void restartedTaskIsNotArmedBeforeItsFirstSample()
+{
+  armedHub();
+  CHECK(EStopManager::IsArmed());
+  CHECK(EStopManager::SetEStopPin(static_cast<gpio_num_t>(14)));
+  CHECK(s_estopTask != nullptr);
+  CHECK(!EStopManager::IsArmed());
+  advance(5);  // The task's first pass sleeps one sample period before it reads the pin.
+  CHECK(!EStopManager::IsArmed());
+  advance(5);
+  CHECK(EStopManager::IsArmed());
+}
+
+// Review H5 at boot: within the first second of uptime the sample time 0 used to pass the staleness test.
+static void bootIsNotArmedBeforeTheFirstSample()
+{
+  inChildProcess([] {
+    s_cfgEnabled         = true;
+    s_cfgPin             = kButton;
+    s_gpioLevel[kButton] = kRunLevel;
+    OpenShock::g_nowMs   = 200;
+    restartEStopManager(true);
+    CHECK(s_estopTask != nullptr);
+    CHECK(!EStopManager::IsArmed());
+    advance(10);
+    CHECK(EStopManager::IsArmed());
+  });
+}
+
 // SP-113 rule 2.
 static void capRiseNeedsAnEngagedEStop()
 {
@@ -2663,6 +2850,7 @@ int main()
   // These fork, so they run before any task thread exists.
   SCENARIO(bootKeepAliveWaitsForTheClear);
   SCENARIO(bootKeepAliveStartsWhenReleased);
+  SCENARIO(bootIsNotArmedBeforeTheFirstSample);
 
   SCENARIO(unreadableCapsLockTheEStop);
   SCENARIO(bootWithTxOnEStopLeavesRadioOff);
@@ -2706,6 +2894,10 @@ int main()
   SCENARIO(failedTxReadRefusesThePin);
   SCENARIO(stalledCheckerIsNotArmed);
   SCENARIO(stalledCheckerCannotSkipTheClear);
+  SCENARIO(stalledCheckerEndsAPulseInFlight);
+  SCENARIO(notArmedKeepsTheStopFrameAndTheKeepAlive);
+  SCENARIO(eventPostCannotHoldTheChecker);
+  SCENARIO(restartedTaskIsNotArmedBeforeItsFirstSample);
   SCENARIO(capRiseNeedsAnEngagedEStop);
   SCENARIO(capsRiseCoversEveryField);
   SCENARIO(pinsStaySeparate);

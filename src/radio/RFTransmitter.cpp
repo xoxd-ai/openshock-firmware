@@ -8,6 +8,7 @@ const char* const TAG = "RFTransmitter";
 #include "estop/EStopManager.h"
 #include "Logging.h"
 #include "radio/rmt/Sequence.h"
+#include "softproxy/KillPath.h"
 #include "util/FnProxy.h"
 #include "util/TaskUtils.h"
 
@@ -242,16 +243,20 @@ void RFTransmitter::TransmitTask()
       }
     }
 
+    // A checker that has not sampled within its staleness window cannot latch a press, so a hub that is not armed ends
+    // shock and vibrate output too, and keeps the stop frame, the keep-alive, Sound and Light (review H2).
+    const bool armed = OpenShock::EStopManager::IsArmed();
+
     // Terminate all remaining sequences
     bool isEstopped = OpenShock::EStopManager::IsEStopped();
     wasEstopped     = isEstopped;
 
-    if (isEstopped) {
+    if (isEstopped || !armed) {
       // On every pass, not only on the change: a sequence added after a release can meet a new engagement before this
       // line, with `wasEstopped` still true. Only a later end moves, so a terminator already running still finishes.
       int64_t now = OpenShock::millis();
       for (auto seq = sequences.begin(); seq != sequences.end(); ++seq) {
-        if (seq->transmitEnd() > now) {
+        if (seq->transmitEnd() > now && Softproxy::TransmitEndsSequence(isEstopped, armed, seq->commandType(), seq->intensity())) {
           seq->setTransmitEnd(now);
         }
       }

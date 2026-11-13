@@ -5,6 +5,7 @@
 // src/EStopManager.cpp, src/CommandHandler.cpp, src/softproxy/SafetyCaps.cpp and src/config/Config.cpp apply them. No
 // Arduino or ESP-IDF dependency, so a host compiler can test them (test/native/test_kill_path.cpp).
 
+#include "ShockerCommandType.h"
 #include "softproxy/CapLimiter.h"
 
 #include <cstdint>
@@ -150,6 +151,24 @@ namespace OpenShock::Softproxy {
   constexpr bool CapRiseAllowed(bool estopArmed, EStopLatchSource source)
   {
     return estopArmed && source == EStopLatchSource::Button;
+  }
+
+  /// Whether the RF transmit task ends a sequence in flight on this pass (review H2). An engaged E-Stop ends every
+  /// sequence, as upstream 1.5.1 does. A hub that is not armed ends every sequence that carries output: a shock at any
+  /// intensity and a vibrate above intensity 0. Not armed covers a checker that has not sampled within its staleness
+  /// window, which can no longer latch a press, so output admitted before it stalled stops within one pass instead of
+  /// running to its end. A vibrate at intensity 0 runs its full length: it is the stop frame that `SendCommand` makes
+  /// of a Stop, the keep-alive and the terminator. Sound and Light pass `HandleCommand` when not armed, and they run
+  /// on too.
+  constexpr bool TransmitEndsSequence(bool estopped, bool armed, ShockerCommandType type, uint8_t intensity)
+  {
+    if (estopped) {
+      return true;
+    }
+    if (armed) {
+      return false;
+    }
+    return type == ShockerCommandType::Shock || (type == ShockerCommandType::Vibrate && intensity > 0);
   }
 
   /// Wire code of the E-Stop in the `Pong` field `softproxy_estop`: bit 0 armed, bit 1 engaged.

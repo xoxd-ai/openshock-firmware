@@ -43,6 +43,9 @@ const uint32_t k_estopClearSamples = k_estopClearTime / k_estopUpdateRate;
 // The checker counts as dead when it has not sampled for this long, so a stalled task cannot read as armed.
 const uint32_t k_estopSampleStaleTime = 1000;
 
+// Longest wait to post the state event. A full event queue must not stop the checker task from sampling (review H2).
+const uint32_t k_estopEventPostWaitMs = k_estopUpdateRate;
+
 static OpenShock::SimpleMutex s_estopMutex = {};
 static gpio_num_t s_estopPin               = GPIO_NUM_NC;
 static TaskHandle_t s_estopTask            = nullptr;
@@ -50,6 +53,14 @@ static TaskHandle_t s_estopTask            = nullptr;
 static EStopState s_lastPublishedState      = EStopState::Idle;
 static int64_t s_estopActivatedAt           = 0;
 static std::atomic<uint32_t> s_lastSampleMs = {0};
+
+// Whether the running checker task has sampled since it started. `s_lastSampleMs` starts at 0 and a restarted task
+// inherits the old task's value, so without this `IsArmed` could read true before the first sample (review H5).
+static std::atomic<bool> s_sampledSinceStart = {false};
+
+// The state last logged, so a post that fails and is retried on every pass logs the state line once.
+static EStopState s_lastLoggedState = EStopState::Idle;
+static bool s_postFailureLogged     = false;
 
 static volatile bool s_externallyTriggered = false;
 
@@ -161,12 +172,24 @@ static void estopmanager_updateexternals(EStopState state)
     return;  // No state change -> no event
   }
 
+  if (state != s_lastLoggedState) {
+    s_lastLoggedState = state;
+    OS_LOGW(TAG, "softproxy-estop state=%s", estopmanager_statename(state));
+  }
+
+  // Post the current state as the event payload. The wait is finite, so a full event queue cannot hold the checker task
+  // here while the mushroom goes unread (review H2). A failed post leaves the published state as it was, so the next
+  // pass posts again. The latch never waits on this: it is written before the post.
+  const esp_err_t err = esp_event_post(OPENSHOCK_EVENTS, OPENSHOCK_EVENT_ESTOP_STATE_CHANGED, &state, sizeof(state), pdMS_TO_TICKS(k_estopEventPostWaitMs));
+  if (err != ESP_OK) {
+    if (!s_postFailureLogged) {
+      s_postFailureLogged = true;
+      OS_LOGE(TAG, "Failed to post the EStop state, retrying on the next pass: %s", esp_err_to_name(err));
+    }
+    return;
+  }
+  s_postFailureLogged  = false;
   s_lastPublishedState = state;
-
-  OS_LOGW(TAG, "softproxy-estop state=%s", estopmanager_statename(state));
-
-  // Post the current state as the event payload
-  ESP_ERROR_CHECK(esp_event_post(OPENSHOCK_EVENTS, OPENSHOCK_EVENT_ESTOP_STATE_CHANGED, &state, sizeof(state), portMAX_DELAY));
 }
 
 // Samples the mushroom at a fixed rate and updates internal state and events.
@@ -210,6 +233,7 @@ static void estopmgr_checkertask(void* pvParameters)
     // Get current time
     int64_t now = OpenShock::millis();
     s_lastSampleMs.store(static_cast<uint32_t>(now));
+    s_sampledSinceStart.store(true);
 
     // Handle external trigger: forcibly set the E-Stop active.
     if (s_externallyTriggered) {
@@ -303,6 +327,7 @@ static bool estopmgr_setestopenabled(bool enabled)
       return false;
     }
     if (s_estopTask == nullptr) {
+      s_sampledSinceStart.store(false);
       if (TaskUtils::TaskCreateUniversal(estopmgr_checkertask, TAG, 4096, nullptr, 5, &s_estopTask, 1) != pdPASS) {  // TODO: Profile stack size and set priority
         OS_LOGE(TAG, "Failed to create EStop event handler task");
         s_estopTask = nullptr;
@@ -314,6 +339,7 @@ static bool estopmgr_setestopenabled(bool enabled)
       vTaskDelete(s_estopTask);
       s_estopTask = nullptr;
     }
+    s_sampledSinceStart.store(false);
   }
 
   return true;
@@ -501,6 +527,12 @@ Softproxy::EStopLatchSource EStopManager::GetLatchSource()
 bool EStopManager::IsArmed()
 {
   if (s_estopTask == nullptr || !OpenShock::IsValidInputPin(s_estopPin)) {
+    return false;
+  }
+
+  // A task that has not sampled since it started is not armed, whatever the boot value or an older task left in
+  // `s_lastSampleMs` (review H5). Read before the sample: the task stores its sample, then the flag.
+  if (!s_sampledSinceStart.load()) {
     return false;
   }
 
