@@ -52,6 +52,10 @@ static ChannelLimiter s_shockLimiter;
 static ChannelLimiter s_vibrateLimiter;
 static RefusalReport s_refusals;
 
+// A clear zeroed the caps in RAM, but its erase has not committed, so the stored record may still hold caps that load at
+// the next boot. `AnySet` reads true meanwhile, so the E-Stop settings stay locked (review D4).
+static bool s_eraseUncommitted = false;
+
 // Survives a warm restart. Its content is garbage after a cold boot, which the checksum rejects.
 static RTC_NOINIT_ATTR RetainedLimiters s_retained;
 static bool s_restored       = false;
@@ -232,6 +236,7 @@ SafetyCaps::SetResult SafetyCaps::Set(ShockerCommandType type, const ChannelCaps
     slot = previous;
     return SetResult::StoreFailed;
   }
+  s_eraseUncommitted = false;  // The store now holds what RAM holds.
 
   OS_LOGI(TAG, "Stored %s caps", type == ShockerCommandType::Shock ? "shock" : "vibrate");
   return SetResult::Stored;
@@ -240,7 +245,7 @@ SafetyCaps::SetResult SafetyCaps::Set(ShockerCommandType type, const ChannelCaps
 bool SafetyCaps::AnySet()
 {
   ScopedLock lock__(&s_capsMutex);
-  if (!lock__.isLocked() || !ensureLoaded()) {
+  if (!lock__.isLocked() || s_eraseUncommitted || !ensureLoaded()) {
     return true;
   }
   return !CapsCleared(s_shock) || !CapsCleared(s_vibrate);
@@ -250,10 +255,12 @@ bool SafetyCaps::Clear()
 {
   ScopedLock lock__(&s_capsMutex);
 
-  // Refuse from now on, whether or not the erase below succeeds.
-  s_shock   = {};
-  s_vibrate = {};
-  s_loaded  = true;
+  // Refuse from now on, whether or not the erase below succeeds. Until it commits the settings lock still counts the
+  // caps as set, because the stored record would load them again at the next boot.
+  s_shock            = {};
+  s_vibrate          = {};
+  s_loaded           = true;
+  s_eraseUncommitted = true;
 
   nvs_handle_t handle;
   esp_err_t err = nvs_open(kNvsNamespace, NVS_READWRITE, &handle);
@@ -276,6 +283,7 @@ bool SafetyCaps::Clear()
     return false;
   }
 
+  s_eraseUncommitted = false;
   OS_LOGI(TAG, "Cleared every cap, shock and vibrate commands refuse");
   return true;
 }

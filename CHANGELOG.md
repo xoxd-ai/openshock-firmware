@@ -1,3 +1,19 @@
+# Version 1.5.2-softproxy Release Notes
+
+Fork changes on `feat/tin-7545-softproxy-caps` from the delta review of `11c3fe6c` (TIN-7545 `6fb2f27f`), under Jess's ruling TIN-7125 `d6065fb8` item 1. No tag carries this version yet. Rename the heading when the release image is tagged.
+
+### Bug Fixes
+
+- **Output bound (H1, N2, N3, #9)** - `CapsCoherent` needs `maxPulseMs <= minGapSec * 1000`. The cap limiter counts each shock or vibrate command above 0 ms as its duration plus one radio frame, `kMaxRadioFrameMs` of 73 ms, and refuses a command that would take a channel's output run above `maxPulsesPerStage * (maxPulseMs + 73)` as `over-on-time`, wire code 12. A run ends 300 ms after its last counted end. A host test pins the frame constant to the five encoders.
+- **Transmit stop (H2, H5, #10)** - The transmit task ends shock and vibrate output above intensity 0 when the E-Stop is not armed. The stop frame, the keep-alive, Sound and Light run on. The checker posts its state event with a finite wait, and `IsArmed` needs a sample since the task started. `estop state` prints a plain `softproxy-estop-health` line with the longest checker sample interval and the failed state posts since boot, and a failing post logs again every 10 s (T1, T2). The checker's task handle and pin are atomic (T3).
+- **Gateway actuation (H3, #11)** - `kAllowGatewayActuation = false` refuses Shock and Vibrate from the gateway. The gateway emergency stop, Stop and Sound still pass, and the serial path is unchanged.
+- **Failed caps clear (D4, C1)** - The E-Stop settings stay locked until the erase of a `safetycaps clear` commits. A failed open, erase or commit each keeps them locked.
+- **Config print (H6)** - `jsonconfig` with no argument prints the config without the Wi-Fi passwords and the auth token.
+- **Docs (D1, D2, D3, D5, C2, C3)** - `SOFTPROXY.md` lists every E-Stop pin refusal, drops the app-only write, marks the merged write as measured and asks for `source=cold-boot` to be read after a power cycle. It warns that writing `jsonconfig` output back stores empty Wi-Fi passwords, so the hub opens its no-password access point, and names `estop pin` and `rftxpin` for single fields. The `estop pin` refusal names a pin this chip cannot use.
+
+
+
+
 # Version 1.6.0-rc.1 Release Notes
 
 Upstream release candidate, tagged at `9c7d347` in OpenShock/Firmware. The tag came to this fork with the upstream history. The fork builds from 1.5.2 and does not ship this release candidate.

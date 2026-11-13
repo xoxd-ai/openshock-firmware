@@ -109,7 +109,9 @@ MUTANTS = [
   ('K23 no pull-up pin allowed', KP, '|| !HasInternalPullUp(estopPin)', '', HEADER),
   ('K24 tx rule ignores the running pin', KP, 'txPin == configuredEStopPin || txPin == runningEStopPin ||', 'txPin == configuredEStopPin ||', HEADER),
   ('K25 config rule skips the tx side', KP, 'if (EStopPinConflicts(next.pin, nextTxPin) || TxPinConflicts(nextTxPin, next.pin, runningEStopPin)) {', 'if (EStopPinConflicts(next.pin, nextTxPin)) {', HEADER),
-  ('K26 unreadable caps count as clear', SC, 'if (!lock__.isLocked() || !ensureLoaded()) {\n    return true;', 'if (!lock__.isLocked() || !ensureLoaded()) {\n    return false;', [SC]),
+  ('K26 unreadable caps count as clear', SC, 'if (!lock__.isLocked() || s_eraseUncommitted || !ensureLoaded()) {\n    return true;', 'if (!lock__.isLocked() || s_eraseUncommitted || !ensureLoaded()) {\n    return false;', [SC]),
+  # Review D4 and review 2 C1: a clear whose erase has not committed keeps the settings locked.
+  ('K111 AnySet ignores an uncommitted erase', SC, 'if (!lock__.isLocked() || s_eraseUncommitted || !ensureLoaded()) {', 'if (!lock__.isLocked() || !ensureLoaded()) {', [SC]),
   ('K27 tx rule ignores the stored pin', KP, 'return txPin == configuredEStopPin || txPin == runningEStopPin', 'return txPin == runningEStopPin', HEADER),
   ('K28 estop rule ignores the stored tx pin', KP, 'return estopPin == txPin || estopPin == kBoardRfTxPin', 'return estopPin == kBoardRfTxPin', HEADER),
   ('K30 Set has no rise check', SC, 'if (CapsRise(previous, caps) && !CapRiseAllowed(EStopManager::IsArmed(), EStopManager::GetLatchSource())) {', 'if (false) {', [SC]),

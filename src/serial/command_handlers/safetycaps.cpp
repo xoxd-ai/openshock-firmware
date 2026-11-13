@@ -126,7 +126,7 @@ static void _handleSafetyCapsClearCommand(std::string_view arg, bool isAutomated
   }
 
   if (!OpenShock::Softproxy::SafetyCaps::Clear()) {
-    SERPR_ERROR("Caps are 0 until restart, but erasing the stored caps failed");
+    SERPR_ERROR("Caps are 0 until restart, but erasing the stored caps failed, so the E-Stop settings stay locked");
     return;
   }
 

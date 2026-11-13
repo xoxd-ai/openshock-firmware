@@ -84,7 +84,7 @@ void _handleEStopPinCommand(std::string_view arg, bool isAutomated)
   }
 
   if (!OpenShock::EStopManager::SetEStopPin(estopPin)) {
-    SERPR_ERROR("Failed to set EStop pin (refused while a press or the gateway holds it engaged or a cap is set, and for the RF TX pin, a board LED, a strapping or flash pin or a pin with no pull-up)");
+    SERPR_ERROR("Failed to set EStop pin (refused while a press or the gateway holds it engaged or a cap is set, and for the RF TX pin, a board LED, a strapping or flash pin, a pin with no pull-up or a pin this chip cannot use)");
     return;
   }
 
