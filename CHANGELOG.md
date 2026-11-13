@@ -1,6 +1,6 @@
 # Version 1.5.2-softproxy Release Notes
 
-Fork changes on `feat/tin-7545-softproxy-caps` from the delta review of `11c3fe6c` (TIN-7545 `6fb2f27f`), under Jess's ruling TIN-7125 `d6065fb8` item 1. No tag carries this version yet. Rename the heading when the release image is tagged.
+Fork changes on `feat/tin-7545-softproxy-caps` from the delta review of `11c3fe6c` (TIN-7545 `6fb2f27f`) and its re-reads (`84da516e`, `feb40cc6`), under Jess's ruling TIN-7125 `d6065fb8` item 1. No tag carries this version yet. Rename the heading when the release image is tagged.
 
 ### Bug Fixes
 
@@ -8,8 +8,12 @@ Fork changes on `feat/tin-7545-softproxy-caps` from the delta review of `11c3fe6
 - **Transmit stop (H2, H5, #10)** - The transmit task ends shock and vibrate output above intensity 0 when the E-Stop is not armed. The stop frame, the keep-alive, Sound and Light run on. The checker posts its state event with a finite wait, and `IsArmed` needs a sample since the task started. `estop state` prints a plain `softproxy-estop-health` line with the longest checker sample interval and the failed state posts since boot, and a failing post logs again every 10 s (T1, T2). The checker's task handle and pin are atomic (T3).
 - **Gateway actuation (H3, #11)** - `kAllowGatewayActuation = false` refuses Shock and Vibrate from the gateway. The gateway emergency stop, Stop and Sound still pass, and the serial path is unchanged.
 - **Failed caps clear (D4, C1)** - The E-Stop settings stay locked until the erase of a `safetycaps clear` commits. A failed open, erase or commit each keeps them locked.
+- **Admitted start (review 3 F1)** - `SafetyCaps::Admit` returns the `millis()` reading it counted a command from, and `HandleCommand` passes it to a new `RFTransmitter::SendCommand` overload. The radio ends the command at that instant plus its duration, so a wait between admission and the send no longer moves output past the counted interval. The keep-alive and Stop keep the upstream timing.
+- **Checker delete order (review 3 F5)** - Disabling the E-Stop or moving its pin clears the checker task handle before it deletes the task, so `IsArmed` cannot read a task under deletion as armed.
+- **Retained version (review 3 F3)** - `kRetainedVersion` is 3, since the run end and run total now count one radio frame per command. A version 2 record reads as a cold boot and holds.
 - **Config print (H6)** - `jsonconfig` with no argument prints the config without the Wi-Fi passwords and the auth token.
 - **Docs (D1, D2, D3, D5, C2, C3)** - `SOFTPROXY.md` lists every E-Stop pin refusal, drops the app-only write, marks the merged write as measured and asks for `source=cold-boot` to be read after a power cycle. It warns that writing `jsonconfig` output back stores empty Wi-Fi passwords, so the hub opens its no-password access point, and names `estop pin` and `rftxpin` for single fields. The `estop pin` refusal names a pin this chip cannot use.
+- **Dose ruling (review 3 F2)** - `SOFTPROXY.md` records Jess's ruling on the dose, TIN-7125 `7f50c8e5` item 1, "Accept it as is": the hub bounds unbroken output and keeps no hourly on-time cap.
 
 
 
