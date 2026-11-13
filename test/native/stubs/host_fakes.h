@@ -135,10 +135,11 @@ inline int xPortGetCoreID()
 
 // In-memory NVS: one blob, with injectable errors.
 struct FakeNvs {
-  bool present        = false;
-  esp_err_t openError = ESP_OK;
-  esp_err_t readError  = ESP_OK;
-  esp_err_t eraseError = ESP_OK;
+  bool present          = false;
+  esp_err_t openError   = ESP_OK;
+  esp_err_t readError   = ESP_OK;
+  esp_err_t eraseError  = ESP_OK;
+  esp_err_t commitError = ESP_OK;
   std::vector<uint8_t> blob;
 };
 extern FakeNvs g_nvs;
@@ -156,7 +157,7 @@ inline void nvs_close(nvs_handle_t)
 }
 inline esp_err_t nvs_commit(nvs_handle_t)
 {
-  return ESP_OK;
+  return g_nvs.commitError;
 }
 inline esp_err_t nvs_get_blob(nvs_handle_t, const char*, void* out, std::size_t* size)
 {
