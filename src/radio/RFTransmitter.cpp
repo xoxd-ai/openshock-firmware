@@ -8,6 +8,7 @@ const char* const TAG = "RFTransmitter";
 #include "estop/EStopManager.h"
 #include "Logging.h"
 #include "radio/rmt/Sequence.h"
+#include "softproxy/KillPath.h"
 #include "util/FnProxy.h"
 #include "util/TaskUtils.h"
 
@@ -77,6 +78,11 @@ RFTransmitter::~RFTransmitter()
 
 bool RFTransmitter::SendCommand(ShockerModelType model, uint16_t shockerId, ShockerCommandType type, uint8_t intensity, uint16_t durationMs, bool overwriteExisting)
 {
+  return SendCommand(model, shockerId, type, intensity, durationMs, overwriteExisting, OpenShock::millis());
+}
+
+bool RFTransmitter::SendCommand(ShockerModelType model, uint16_t shockerId, ShockerCommandType type, uint8_t intensity, uint16_t durationMs, bool overwriteExisting, int64_t startMs)
+{
   if (m_queueHandle == nullptr) {
     OS_LOGE(TAG, "[pin-%hhi] Queue is null", m_txPin);
     return false;
@@ -90,11 +96,12 @@ bool RFTransmitter::SendCommand(ShockerModelType model, uint16_t shockerId, Shoc
     intensity         = 0;
     durationMs        = 300;
     overwriteExisting = true;
+    startMs           = OpenShock::millis();
   } else {
     OS_LOGD(TAG, "Command received: %u %u %u %u", model, shockerId, type, intensity);
   }
 
-  Command cmd = Command {.transmitEnd = OpenShock::millis() + durationMs, .modelType = model, .type = type, .shockerId = shockerId, .intensity = intensity, .flags = overwriteExisting ? kFlagOverwrite : (uint8_t)0};
+  Command cmd = Command {.transmitEnd = startMs + durationMs, .modelType = model, .type = type, .shockerId = shockerId, .intensity = intensity, .flags = overwriteExisting ? kFlagOverwrite : (uint8_t)0};
 
   // Add the command to the queue, wait max 10 ms (Adjust this)
   if (xQueueSend(m_queueHandle, &cmd, pdMS_TO_TICKS(10)) != pdTRUE) {
@@ -242,15 +249,20 @@ void RFTransmitter::TransmitTask()
       }
     }
 
+    // A checker that has not sampled within its staleness window cannot latch a press, so a hub that is not armed ends
+    // shock and vibrate output too, and keeps the stop frame, the keep-alive, Sound and Light (review H2).
+    const bool armed = OpenShock::EStopManager::IsArmed();
+
     // Terminate all remaining sequences
     bool isEstopped = OpenShock::EStopManager::IsEStopped();
-    if (isEstopped != wasEstopped) {
-      wasEstopped = isEstopped;
+    wasEstopped     = isEstopped;
 
-      if (isEstopped) {
-        // Set all sequences to transmit their terminators
-        int64_t now = OpenShock::millis();
-        for (auto seq = sequences.begin(); seq != sequences.end(); ++seq) {
+    if (isEstopped || !armed) {
+      // On every pass, not only on the change: a sequence added after a release can meet a new engagement before this
+      // line, with `wasEstopped` still true. Only a later end moves, so a terminator already running still finishes.
+      int64_t now = OpenShock::millis();
+      for (auto seq = sequences.begin(); seq != sequences.end(); ++seq) {
+        if (seq->transmitEnd() > now && Softproxy::TransmitEndsSequence(isEstopped, armed, seq->commandType(), seq->intensity())) {
           seq->setTransmitEnd(now);
         }
       }

@@ -7,8 +7,11 @@ const char* const TAG = "Config";
 #include "Chipset.h"
 #include "Common.h"
 #include "config/RootConfig.h"
+#include "estop/EStopManager.h"
 #include "Logging.h"
 #include "ReadWriteMutex.h"
+#include "softproxy/KillPath.h"
+#include "softproxy/SafetyCaps.h"
 
 #include <FS.h>
 #include <LittleFS.h>
@@ -136,6 +139,23 @@ bool _trySaveConfig()
   return _trySaveConfig(builder.GetBufferPointer(), builder.GetSize());
 }
 
+// Softproxy kill path (SP-113): a whole-config write may not put the RF transmitter on the E-Stop pin, or change the
+// E-Stop settings while serial `estop` would refuse the same change. Call it with the config lock held.
+static bool _killConfigChangeAllowed(const OpenShock::Config::RootConfig& next)
+{
+  const OpenShock::Softproxy::KillConfig current {_configData.estop.enabled, static_cast<int>(_configData.estop.gpioPin)};
+  const OpenShock::Softproxy::KillConfig candidate {next.estop.enabled, static_cast<int>(next.estop.gpioPin)};
+  const bool killLocked = OpenShock::Softproxy::EStopSettingsLocked(OpenShock::EStopManager::GetLatchSource(), OpenShock::Softproxy::SafetyCaps::AnySet());
+
+  const int runningPin = static_cast<int>(OpenShock::EStopManager::GetRunningPin());
+
+  if (!OpenShock::Softproxy::KillConfigChangeAllowed(current, candidate, static_cast<int>(next.rf.txPin), runningPin, killLocked)) {
+    OS_LOGE(TAG, "Refusing config: it puts the RF transmitter on the E-Stop pin or a board LED, or changes the E-Stop while it is locked");
+    return false;
+  }
+  return true;
+}
+
 void Config::Init()
 {
   CONFIG_LOCK_WRITE();
@@ -188,6 +208,12 @@ bool Config::SaveFromJSON(std::string_view json)
 
   CONFIG_LOCK_WRITE_ACTION(false, cJSON_Delete(root));
 
+  OpenShock::Config::RootConfig candidate;
+  if (!candidate.FromJSON(root) || !_killConfigChangeAllowed(candidate)) {
+    cJSON_Delete(root);
+    return false;
+  }
+
   bool result = _configData.FromJSON(root);
 
   cJSON_Delete(root);
@@ -210,6 +236,11 @@ flatbuffers::Offset<Serialization::Configuration::HubConfig> Config::GetAsFlatBu
 bool Config::SaveFromFlatBuffer(const Serialization::Configuration::HubConfig* config)
 {
   CONFIG_LOCK_WRITE(false);
+
+  OpenShock::Config::RootConfig candidate;
+  if (!candidate.FromFlatbuffers(config) || !_killConfigChangeAllowed(candidate)) {
+    return false;
+  }
 
   if (!_configData.FromFlatbuffers(config)) {
     OS_LOGE(TAG, "Failed to read config file");
@@ -236,6 +267,10 @@ bool Config::SetRaw(const uint8_t* buffer, std::size_t size)
     return false;
   }
 
+  if (!_killConfigChangeAllowed(config)) {
+    return false;
+  }
+
   return _trySaveConfig(buffer, size);
 }
 
@@ -251,6 +286,11 @@ void Config::FactoryReset()
 
   if (!_trySaveConfig()) {
     OS_PANIC(TAG, "Failed to save default config. Recommend formatting microcontroller and re-flashing firmware");
+  }
+
+  // The Softproxy caps sit outside the config file. A factory reset returns them to 0 as well.
+  if (!Softproxy::SafetyCaps::Clear()) {
+    OS_LOGE(TAG, "Failed to erase the stored Softproxy caps during factory reset");
   }
 
   OS_LOGI(TAG, "Factory reset complete");

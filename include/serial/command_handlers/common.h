@@ -17,6 +17,17 @@
 #define SERPR_SYS(format, ...) OS_SERIAL.printf("$SYS$|" format "\r\n", ##__VA_ARGS__)
 #endif
 
+// A plain line with no `$SYS$|` prefix. A reader that waits for the `$SYS$` reply of a command takes it as a log line.
+#if ARDUINO_USB_MODE
+#define SERPR_LINE(format, ...)                         \
+  {                                                     \
+    OS_SERIAL.printf(format "\r\n", ##__VA_ARGS__);     \
+    OS_SERIAL_USB.printf(format "\r\n", ##__VA_ARGS__); \
+  }
+#else
+#define SERPR_LINE(format, ...) OS_SERIAL.printf(format "\r\n", ##__VA_ARGS__)
+#endif
+
 #define SERPR_RESPONSE(format, ...) SERPR_SYS("Response|" format, ##__VA_ARGS__)
 #define SERPR_SUCCESS(format, ...)  SERPR_SYS("Success|" format, ##__VA_ARGS__)
 #define SERPR_ERROR(format, ...)    SERPR_SYS("Error|" format, ##__VA_ARGS__)

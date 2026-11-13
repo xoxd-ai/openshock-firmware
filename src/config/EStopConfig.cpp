@@ -34,7 +34,16 @@ bool EStopConfig::FromFlatbuffers(const Serialization::Configuration::EStopConfi
     return true;
   }
 
-  gpioPin = static_cast<gpio_num_t>(config->gpio_pin());
+  // `GPIO_IS_VALID_GPIO` in this framework version (arduino-esp32 2.0.17) shifts by the pin with no sign check, and a
+  // negative shift count is undefined. `IsValidInputPin` stops only `OPENSHOCK_GPIO_INVALID`, so the other negative bytes
+  // stop here.
+  const int8_t pin = config->gpio_pin();
+  if (pin < 0 && pin != OPENSHOCK_GPIO_INVALID) {
+    OS_LOGE(TAG, "Refusing E-Stop pin %hhi", pin);
+    return false;
+  }
+
+  gpioPin = static_cast<gpio_num_t>(pin);
 
   if (OpenShock::IsValidInputPin(static_cast<int8_t>(gpioPin))) {
     enabled = config->enabled();

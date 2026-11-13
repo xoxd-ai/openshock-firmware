@@ -8,9 +8,11 @@ const char* const TAG = "WebSocketDeFragger";
 
 using namespace OpenShock;
 
-WebSocketDeFragger::WebSocketDeFragger(EventCallback callback)
+WebSocketDeFragger::WebSocketDeFragger(EventCallback callback, std::size_t maxMessageBytes, OverflowCallback onOverflow)
   : m_messages()
   , m_callback(callback)
+  , m_maxMessageBytes(maxMessageBytes)
+  , m_onOverflow(onOverflow)
 {
 }
 
@@ -86,15 +88,34 @@ void WebSocketDeFragger::clear()
   m_messages.clear();
 }
 
+void WebSocketDeFragger::overflow(uint8_t socketId)
+{
+  OS_LOGW(TAG, "WebSocket client #%u went over the message bound, dropping its message", socketId);
+  clear(socketId);
+  m_onOverflow(socketId);
+}
+
+// Softproxy fork: a client on the open access point sets how much arrives here, so growth is bounded and a failure
+// drops the message. It must never reach the TinyVec panic, since a restart is what it would want.
+bool WebSocketDeFragger::store(uint8_t socketId, Message& message, const uint8_t* data, uint32_t length)
+{
+  if (length > m_maxMessageBytes - message.data.size() || !message.data.try_append(data, length)) {
+    overflow(socketId);
+    return false;
+  }
+  return true;
+}
+
 void WebSocketDeFragger::start(uint8_t socketId, WebSocketMessageType type, const uint8_t* data, uint32_t length)
 {
   auto it = m_messages.find(socketId);
-  if (it != m_messages.end()) {
-    it->second.data.assign(data, length);
-    return;
+  if (it == m_messages.end()) {
+    it = m_messages.insert(std::make_pair(socketId, Message {.data = TinyVec<uint8_t>(), .type = type})).first;
   }
 
-  m_messages.insert(std::make_pair(socketId, Message {.data = TinyVec<uint8_t>(data, length), .type = type}));
+  it->second.data.clear();
+  it->second.type = type;
+  store(socketId, it->second, data, length);
 }
 
 void WebSocketDeFragger::append(uint8_t socketId, const uint8_t* data, uint32_t length)
@@ -104,7 +125,7 @@ void WebSocketDeFragger::append(uint8_t socketId, const uint8_t* data, uint32_t 
     return;
   }
 
-  it->second.data.append(data, length);
+  store(socketId, it->second, data, length);
 }
 
 void WebSocketDeFragger::finish(uint8_t socketId, const uint8_t* data, uint32_t length)
@@ -115,7 +136,9 @@ void WebSocketDeFragger::finish(uint8_t socketId, const uint8_t* data, uint32_t 
   }
 
   auto& message = it->second;
-  message.data.append(data, length);
+  if (!store(socketId, message, data, length)) {
+    return;
+  }
 
   m_callback(socketId, message.type, message.data);
 

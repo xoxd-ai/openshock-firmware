@@ -10,6 +10,7 @@ const char* const TAG = "CaptivePortalInstance";
 #include "Logging.h"
 #include "message_handlers/WebSocket.h"
 #include "serialization/WSLocal.h"
+#include "softproxy/Lockout.h"
 #include "util/FnProxy.h"
 #include "util/HexUtils.h"
 #include "util/PartitionUtils.h"
@@ -63,10 +64,13 @@ static const char* getPartitionHash()
 CaptivePortal::CaptivePortalInstance::CaptivePortalInstance()
   : m_webServer(HTTP_PORT)
   , m_socketServer(WEBSOCKET_PORT, "/ws", "flatbuffers")  // Sec-WebSocket-Protocol = flatbuffers
-  , m_socketDeFragger(std::bind(&CaptivePortalInstance::handleWebSocketEvent, this, std::placeholders::_1, std::placeholders::_2, std::placeholders::_3))
+  , m_socketDeFragger(
+      std::bind(&CaptivePortalInstance::handleWebSocketEvent, this, std::placeholders::_1, std::placeholders::_2, std::placeholders::_3), Softproxy::kLocalSocketMaxMessageBytes, [this](uint8_t socketId) { m_socketsToDrop |= 1u << socketId; }
+    )
   , m_fileSystem()
   , m_dnsServer()
   , m_taskHandle(nullptr)
+  , m_socketsToDrop(0)
 {
   m_socketServer.onEvent(std::bind(&WebSocketDeFragger::handler, &m_socketDeFragger, std::placeholders::_1, std::placeholders::_2, std::placeholders::_3, std::placeholders::_4));
   m_socketServer.begin();
@@ -154,6 +158,15 @@ void CaptivePortal::CaptivePortalInstance::task()
 {
   while (true) {
     m_socketServer.loop();
+
+    // Disconnect here, not in the socket event, since the library still uses the client when the event returns.
+    for (uint8_t socketId = 0; m_socketsToDrop != 0; ++socketId) {
+      if ((m_socketsToDrop & (1u << socketId)) != 0) {
+        m_socketsToDrop &= ~(1u << socketId);
+        m_socketServer.disconnect(socketId);
+      }
+    }
+
     m_dnsServer.processNextRequest();
     vTaskDelay(pdMS_TO_TICKS(WEBSOCKET_UPDATE_INTERVAL));
   }

@@ -3,6 +3,34 @@
 #include "config/Config.h"
 #include "Convert.h"
 #include "estop/EStopManager.h"
+#include "softproxy/KillPath.h"
+
+void _handleEStopStateCommand(std::string_view arg, bool isAutomated)
+{
+  (void)isAutomated;
+
+  if (!arg.empty()) {
+    SERPR_ERROR("Invalid argument (takes no argument)");
+    return;
+  }
+
+  // Checker health for the bench (review T1, T2), on a plain line before the reply. Softproxy reads the reply line
+  // strictly, refusing any extra field, and its read ends at the first `$SYS$` line, so the health stays off both.
+  SERPR_LINE(
+    "softproxy-estop-health maxSampleIntervalMs=%u failedStatePosts=%u",
+    static_cast<unsigned>(OpenShock::EStopManager::MaxSampleIntervalMs()),
+    static_cast<unsigned>(OpenShock::EStopManager::FailedStatePosts())
+  );
+
+  // The running state. `estop enabled` and `estop pin` read the stored config, which can differ until a restart.
+  SERPR_RESPONSE(
+    "EStopState|armed=%s,engaged=%s,pin=%hhi,source=%s",
+    OpenShock::EStopManager::IsArmed() ? "true" : "false",
+    OpenShock::EStopManager::IsEStopped() ? "true" : "false",
+    static_cast<int8_t>(OpenShock::EStopManager::GetRunningPin()),
+    OpenShock::Softproxy::EStopLatchName(OpenShock::EStopManager::GetLatchSource())
+  );
+}
 
 void _handleEStopEnabledCommand(std::string_view arg, bool isAutomated)
 {
@@ -24,7 +52,7 @@ void _handleEStopEnabledCommand(std::string_view arg, bool isAutomated)
   }
 
   if (!OpenShock::EStopManager::SetEStopEnabled(enabled)) {
-    SERPR_ERROR("Failed to set EStop enabled");
+    SERPR_ERROR("Failed to set EStop enabled (needs a valid pin, and disabling refuses while a press or the gateway holds it engaged or a cap is set)");
     return;
   }
 
@@ -56,7 +84,7 @@ void _handleEStopPinCommand(std::string_view arg, bool isAutomated)
   }
 
   if (!OpenShock::EStopManager::SetEStopPin(estopPin)) {
-    SERPR_ERROR("Failed to set EStop pin");
+    SERPR_ERROR("Failed to set EStop pin (refused while a press or the gateway holds it engaged or a cap is set, and for the RF TX pin, a board LED, a strapping or flash pin, a pin with no pull-up or a pin this chip cannot use)");
     return;
   }
 
@@ -71,6 +99,8 @@ void _handleEStopPinCommand(std::string_view arg, bool isAutomated)
 OpenShock::Serial::CommandGroup OpenShock::Serial::CommandHandlers::EStopHandler()
 {
   auto group = OpenShock::Serial::CommandGroup("estop"sv);
+
+  group.addCommand("state"sv, "Get the running E-Stop state: armed, engaged, pin and what set the latch."sv, _handleEStopStateCommand);
 
   auto& getEnabledCommand = group.addCommand("enabled"sv, "Get the E-Stop enabled state."sv, _handleEStopEnabledCommand);
   auto& setEnabledCommand = group.addCommand("enabled"sv, "Set the E-Stop enabled state."sv, _handleEStopEnabledCommand);

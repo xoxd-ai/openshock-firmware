@@ -19,6 +19,8 @@ namespace OpenShock::Rmt {
       , m_transmitEnd(0)
       , m_shockerId(0)
       , m_shockerModel()
+      , m_commandType()
+      , m_intensity(0)
     {
     }
     Sequence(ShockerModelType shockerModel, uint16_t shockerId, int64_t transmitEnd);
@@ -28,6 +30,8 @@ namespace OpenShock::Rmt {
       , m_transmitEnd(other.m_transmitEnd)
       , m_shockerId(other.m_shockerId)
       , m_shockerModel(other.m_shockerModel)
+      , m_commandType(other.m_commandType)
+      , m_intensity(other.m_intensity)
     {
       other.reset();
     }
@@ -37,6 +41,11 @@ namespace OpenShock::Rmt {
 
     inline ShockerModelType shockerModel() const noexcept { return m_shockerModel; }
     inline uint16_t shockerId() const noexcept { return m_shockerId; }
+
+    // What the payload carries, as the last `fill` set it. The transmit task reads it to end output when the E-Stop
+    // is not armed (include/softproxy/KillPath.h `TransmitEndsSequence`).
+    inline ShockerCommandType commandType() const noexcept { return m_commandType; }
+    inline uint8_t intensity() const noexcept { return m_intensity; }
 
     inline int64_t transmitEnd() const noexcept { return m_transmitEnd; }
     inline void setTransmitEnd(int64_t transmitEnd) noexcept { m_transmitEnd = transmitEnd; }
@@ -60,6 +69,8 @@ namespace OpenShock::Rmt {
       m_transmitEnd  = other.m_transmitEnd;
       m_shockerId    = other.m_shockerId;
       m_shockerModel = other.m_shockerModel;
+      m_commandType  = other.m_commandType;
+      m_intensity    = other.m_intensity;
 
       other.reset();
 
@@ -74,6 +85,8 @@ namespace OpenShock::Rmt {
       m_transmitEnd  = 0;
       m_shockerId    = 0;
       m_shockerModel = static_cast<ShockerModelType>(0);
+      m_commandType  = static_cast<ShockerCommandType>(0);
+      m_intensity    = 0;
     }
 
     rmt_data_t* m_data;
@@ -81,5 +94,7 @@ namespace OpenShock::Rmt {
     int64_t m_transmitEnd;
     uint16_t m_shockerId;
     ShockerModelType m_shockerModel;
+    ShockerCommandType m_commandType;
+    uint8_t m_intensity;
   };
 }  // namespace OpenShock::Rmt
