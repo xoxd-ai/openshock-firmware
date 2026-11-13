@@ -207,6 +207,7 @@ extern std::string g_serialOut;
 #define SERPR_RESPONSE(format, ...) SERPR_SYS("Response|" format, ##__VA_ARGS__)
 #define SERPR_SUCCESS(format, ...)  SERPR_SYS("Success|" format, ##__VA_ARGS__)
 #define SERPR_ERROR(format, ...)    SERPR_SYS("Error|" format, ##__VA_ARGS__)
+#define SERPR_LINE(format, ...)     hostSerial("plain|" format, ##__VA_ARGS__)
 inline void hostSerial(const char* format, ...)
 {
   char line[256];

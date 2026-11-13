@@ -34,6 +34,7 @@ KP = 'include/softproxy/KillPath.h'
 TR = 'src/message_handlers/websocket/gateway/Trigger.cpp'
 RFTXPIN = 'src/serial/command_handlers/rftxpin.cpp'
 SERIAL_CAPS = 'src/serial/command_handlers/safetycaps.cpp'
+ESTOP_SERIAL = 'src/serial/command_handlers/estop.cpp'
 CONFIG = 'src/config/Config.cpp'
 CHIPSET = 'include/Chipset.h'
 CONFIG_TEST = 'test/native/test_config_writers.cpp'
@@ -112,7 +113,7 @@ MUTANTS = [
   ('K27 tx rule ignores the stored pin', KP, 'return txPin == configuredEStopPin || txPin == runningEStopPin', 'return txPin == runningEStopPin', HEADER),
   ('K28 estop rule ignores the stored tx pin', KP, 'return estopPin == txPin || estopPin == kBoardRfTxPin', 'return estopPin == kBoardRfTxPin', HEADER),
   ('K30 Set has no rise check', SC, 'if (CapsRise(previous, caps) && !CapRiseAllowed(EStopManager::IsArmed(), EStopManager::GetLatchSource())) {', 'if (false) {', [SC]),
-  ('K31 armed with no pin or task', ES, 'if (s_estopTask == nullptr || !OpenShock::IsValidInputPin(s_estopPin)) {\n    return false;\n  }\n\n  // Read the sample', 'if (false) {\n    return false;\n  }\n  return true;\n  // Read the sample', [TEST]),
+  ('K31 armed with no pin or task', ES, 'if (s_estopTask == nullptr || !OpenShock::IsValidInputPin(s_estopPin)) {\n    return false;\n  }\n\n  // A task that', 'if (false) {\n    return false;\n  }\n  return true;\n  // A task that', [TEST]),
   ('K32 tx rule keyed on no run-time pin', CH, 'Softproxy::TxPinConflicts(txPin, estopPin, EStopManager::GetRunningPin())', 'Softproxy::TxPinConflicts(txPin, GPIO_NUM_NC, GPIO_NUM_NC)', [CH]),
   ('K33 rftxpin falls through on a bad argument', RFTXPIN, 'SERPR_ERROR("Invalid argument (number invalid or out of range)");\n    return;', 'SERPR_ERROR("Invalid argument (number invalid or out of range)");', [RFTXPIN]),
   ('K34 serial refusal reads as saved', SERIAL_CAPS, 'SERPR_ERROR("Refused (raising a cap needs the E-Stop armed and engaged by its button, see `estop state`)");', 'SERPR_SUCCESS("Saved caps");', [TEST]),
@@ -154,8 +155,8 @@ MUTANTS = [
   ('K72 an open pin at task start confirms', ES, 'confirming = sawRun;', 'confirming = true;', [TEST]),
   ('K73 the unmeasured start counts as a run', ES, 'bool solidRun         = window == 0 && samplesRead == k_estopCheckCount;', 'bool solidRun         = window == 0;', [TEST]),
   ('K74 a confirmed press needs no measured run', ES, 'sawRun                = sawRun || solidRun;', 'sawRun                = true;', [TEST]),
-  ('K75 terminators forced only on the change', RF, '    wasEstopped     = isEstopped;\n\n    if (isEstopped) {', '    const bool changed = isEstopped != wasEstopped;\n    wasEstopped     = isEstopped;\n\n    if (isEstopped && changed) {', [RF]),
-  ('K76 a forced end restarts a running terminator', RF, 'if (seq->transmitEnd() > now) {', 'if (true) {', [RF]),
+  ('K75 terminators forced only on the change', RF, '    wasEstopped     = isEstopped;\n\n    if (isEstopped || !armed) {', '    const bool changed = isEstopped != wasEstopped;\n    wasEstopped     = isEstopped;\n\n    if ((isEstopped && changed) || !armed) {', [RF]),
+  ('K76 a forced end restarts a running terminator', RF, 'if (seq->transmitEnd() > now && ', 'if (true && ', [RF]),
   ('K77 GPIO 10 stays on the safe list', CHIPSET, '(pin) == GPIO_NUM_9 || (pin) == GPIO_NUM_10 \\\n   || (pin) == GPIO_NUM_11', '(pin) == GPIO_NUM_9 \\\n   || (pin) == GPIO_NUM_11', []),
   ('K79 the contact reads as normally open', ES, '== k_estopRunLevel ? 0 : 1;', '== k_estopRunLevel ? 1 : 0;', [TEST]),
   ('K80 one high sample engages nothing', ES, '        // A high level at any time engages. There is no rearm window.\n        if (stopSeen) {', '        // A high level at any time engages. There is no rearm window.\n        if (solidStop) {', [TEST]),
@@ -205,10 +206,22 @@ MUTANTS = [
   ('R4 RF task stops discarding while engaged', RF, 'if (OpenShock::EStopManager::IsEStopped()) {\n        // Immediately', 'if (false) {\n        // Immediately', [RF]),
   ('R4b RF task adds what it should discard', RF, '        // Discard next item in queue\n        continue;\n', '', [RF]),
   ('R9 restore ignores the magic', KP, 'in.magic != kRetainedEStopMagic || ', '', HEADER),
-  ('R32 IsArmed drops the valid pin check', ES, 'if (s_estopTask == nullptr || !OpenShock::IsValidInputPin(s_estopPin)) {\n    return false;\n  }\n\n  // Read the sample', 'if (s_estopTask == nullptr) {\n    return false;\n  }\n\n  // Read the sample', [TEST]),
+  ('R32 IsArmed drops the valid pin check', ES, 'if (s_estopTask == nullptr || !OpenShock::IsValidInputPin(s_estopPin)) {\n    return false;\n  }\n\n  // A task that', 'if (s_estopTask == nullptr) {\n    return false;\n  }\n\n  // A task that', [TEST]),
   ('R37 boot keep-alive ignores engaged', CH, 'if (rfConfig.keepAliveEnabled && !EStopManager::IsEStopped()) {', 'if (rfConfig.keepAliveEnabled) {', [CH]),
   ('R38 keep-alive stays on while engaged', CH, 'bool keepAlive = state == EStopState::Idle;', 'bool keepAlive = true;', [CH]),
   ('R52 engaged hub takes every trigger', TR, GATE, 'if (false) {', [TR]),
+  # Review H2 and H5 (TIN-7545 6fb2f27f).
+  ('K101 transmit task ignores not armed', RF, '    if (isEstopped || !armed) {', '    if (isEstopped) {', [RF]),
+  ('K102 not armed ends the stop frame and the keep-alive', KP, '(type == ShockerCommandType::Vibrate && intensity > 0)', 'type == ShockerCommandType::Vibrate', [RF, TEST]),
+  ('K103 not armed lets a shock run on', KP, 'return type == ShockerCommandType::Shock || (type == ShockerCommandType::Vibrate && intensity > 0);', 'return type == ShockerCommandType::Vibrate && intensity > 0;', [RF, TEST]),
+  ('K104 state post waits forever', ES, 'pdMS_TO_TICKS(k_estopEventPostWaitMs)', 'portMAX_DELAY', [TEST]),
+  ('K105 failed state post is not retried', ES, '  if (state != s_lastLoggedState) {', '  s_lastPublishedState = state;\n  if (state != s_lastLoggedState) {', [TEST]),
+  ('K106 IsArmed before the first sample', ES, 'if (!s_sampledSinceStart.load()) {', 'if (false) {', [TEST]),
+  # Review 2 T1 and T2 (FORK-DELTA-REVIEW-2): the failed post count, its repeated log and the sample interval high-water.
+  ('K107 a failed state post is not counted', ES, 'const uint32_t failed = s_failedStatePosts.fetch_add(1) + 1;', 'const uint32_t failed = s_failedStatePosts.load();', [TEST]),
+  ('K108 a lasting post failure logs only once', ES, 'if (!s_postFailureLogged || now - s_postFailureLoggedAtMs >= k_estopPostFailureLogIntervalMs) {', 'if (!s_postFailureLogged) {', [TEST]),
+  ('K109 the sample interval high-water never rises', ES, 'while (interval > highest && !s_maxSampleIntervalMs.compare_exchange_weak(highest, interval)) {', 'while (false) {', [TEST]),
+  ('K110 estop state leaves out the checker health', ESTOP_SERIAL, '  SERPR_LINE(\n', '  if (false) SERPR_LINE(\n', [ESTOP_SERIAL]),
 ]
 
 

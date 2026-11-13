@@ -14,6 +14,14 @@ void _handleEStopStateCommand(std::string_view arg, bool isAutomated)
     return;
   }
 
+  // Checker health for the bench (review T1, T2), on a plain line before the reply. Softproxy reads the reply line
+  // strictly, refusing any extra field, and its read ends at the first `$SYS$` line, so the health stays off both.
+  SERPR_LINE(
+    "softproxy-estop-health maxSampleIntervalMs=%u failedStatePosts=%u",
+    static_cast<unsigned>(OpenShock::EStopManager::MaxSampleIntervalMs()),
+    static_cast<unsigned>(OpenShock::EStopManager::FailedStatePosts())
+  );
+
   // The running state. `estop enabled` and `estop pin` read the stored config, which can differ until a restart.
   SERPR_RESPONSE(
     "EStopState|armed=%s,engaged=%s,pin=%hhi,source=%s",
