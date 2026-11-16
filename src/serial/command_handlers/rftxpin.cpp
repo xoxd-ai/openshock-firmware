@@ -29,7 +29,7 @@ void _handleRfTxPinCommand(std::string_view arg, bool isAutomated)
 
   switch (result) {
     case OpenShock::SetGPIOResultCode::InvalidPin:
-      SERPR_ERROR("Invalid argument (invalid pin, or it is the E-Stop pin or a board LED)");
+      SERPR_ERROR("Invalid argument (invalid pin)");
       break;
 
     case OpenShock::SetGPIOResultCode::InternalError:

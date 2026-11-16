@@ -1,7 +1,7 @@
 // Host test of the real command paths: gateway, port 81 socket, serial and radio encoders. It links the firmware's
 // own dispatchers, `HandleCommand`, `SafetyCaps` and the encoders. test/native/stubs fakes the hardware edge and also
-// three pieces of firmware logic: `EStopManager` (one boolean), `Config` and `CaptivePortal`, plus `RFTransmitter`.
-// So nothing here runs the E-Stop or the radio task. test/native/test_kill_path.cpp runs both for real.
+// three pieces of firmware logic: `EStopManager`, `Config` and `CaptivePortal`, plus `RFTransmitter`. So nothing here
+// runs the radio task. test/native/test_radio_path.cpp runs it for real.
 // `softproxy-host-test.yml` runs it. Run it from the repository root after `pio pkg install -e Pishock-2023`:
 //
 //   FB=.pio/libdeps/Pishock-2023/flatbuffers/include
@@ -68,8 +68,6 @@ namespace OpenShock {
 }  // namespace OpenShock
 
 int g_panics                    = 0;
-static bool s_estopped          = false;
-static int s_estopTriggers      = 0;
 static gpio_num_t s_configTxPin = static_cast<gpio_num_t>(OPENSHOCK_RF_TX_GPIO);
 static int s_configTxPinWrites  = 0;
 static std::vector<bool> s_alwaysOpen;  // Each `SetAlwaysEnabled` argument, in order.
@@ -78,23 +76,10 @@ static int s_localHandlerRuns;
 
 bool EStopManager::IsEStopped()
 {
-  return s_estopped;
-}
-bool EStopManager::IsArmed()
-{
-  return true;
-}
-Softproxy::EStopLatchSource EStopManager::GetLatchSource()
-{
-  return s_estopped ? Softproxy::EStopLatchSource::Button : Softproxy::EStopLatchSource::Released;
-}
-gpio_num_t EStopManager::GetRunningPin()
-{
-  return GPIO_NUM_NC;
+  return false;
 }
 void EStopManager::Trigger()
 {
-  ++s_estopTriggers;
 }
 bool Config::GetRFConfig(Config::RFConfig& out)
 {
@@ -124,11 +109,6 @@ bool Config::SetRFConfigKeepAliveEnabled(bool)
 bool Config::GetEStop(Config::EStopConfig& out)
 {
   out = {.enabled = false, .gpioPin = GPIO_NUM_NC};
-  return true;
-}
-bool Config::GetEStopGpioPin(gpio_num_t& out)
-{
-  out = GPIO_NUM_NC;
   return true;
 }
 void CaptivePortal::SetAlwaysEnabled(bool alwaysEnabled)
@@ -565,19 +545,6 @@ static void runBreakIsTheTerminator()
   CHECK(match.size() == 2 && std::stoll(match[1].str()) == kOutputRunBreakMs);
 }
 
-static void estopRefusesWithCapsSet()
-{
-  plantRecord(fixture(), fixture());
-  bootHub();
-  g_nowMs    = kWarmMs;
-  s_estopped = true;
-  sendGateway(ShockerModelType::CaiXianlin, 7, ShockerCommandType::Vibrate, 10, 100);
-  sendSerial(ShockerModelType::CaiXianlin, 7, ShockerCommandType::Vibrate, 10, 100);
-  CHECK(!CommandHandler::HandleCommand(ShockerModelType::CaiXianlin, 7, ShockerCommandType::Sound, 0, 100));
-  CHECK(!CommandHandler::HandleCommand(ShockerModelType::CaiXianlin, 7, ShockerCommandType::Stop, 0, 100));
-  CHECK(g_radio.empty());
-}
-
 // Stop, Sound and Light carry no cap, so they pass at every cap 0, and the radio gets exactly what was asked.
 // `uncappedTypesNeverEncodeAsShock` covers what those types become on the air.
 static void uncappedTypesPassAtZeroCaps()
@@ -782,18 +749,15 @@ static void gatewayTriggers()
   sendTrigger(GatewaySchema::TriggerType::Restart);
   CHECK(g_restarts == 0);
 
-  // Closing the portal still works, and the handler reaches `Trigger`. What `Trigger` does is test_kill_path.cpp's.
+  // Closing the portal still works.
   sendTrigger(GatewaySchema::TriggerType::CaptivePortalDisable);
   CHECK(s_alwaysOpen.size() == 1);
   CHECK(!s_alwaysOpen.back());
-
-  sendTrigger(GatewaySchema::TriggerType::EmergencyStop);
-  CHECK(s_estopTriggers == 1);
 }
 
 // Review H3: a linked gateway cannot actuate. Shock and Vibrate within every cap never reach `HandleCommand`, so they
 // leave no refusal in Softproxy's count either. The same commands over serial reach the radio. A gateway Stop and Sound
-// still pass, and its emergency stop still reaches `Trigger`.
+// still pass.
 static void gatewayCannotActuate()
 {
   plantRecord(fixture(), fixture());
@@ -819,10 +783,6 @@ static void gatewayCannotActuate()
   CHECK(g_radio.size() == 3);
   CHECK(g_radio[1].type == ShockerCommandType::Stop);
   CHECK(g_radio[2].type == ShockerCommandType::Sound);
-
-  const int triggers = s_estopTriggers;
-  sendTrigger(GatewaySchema::TriggerType::EmergencyStop);
-  CHECK(s_estopTriggers == triggers + 1);
 }
 
 static std::string readFile(const std::filesystem::path& path)
@@ -898,13 +858,12 @@ static void radioHasNoOtherCaller()
   // The keep-alive task is the one send outside `HandleCommand`, and it is a vibrate at intensity 0.
   CHECK(handler.find("s_rfTransmitter->SendCommand(cmdRef.model, cmdRef.shockerId, ShockerCommandType::Vibrate, 0, KEEP_ALIVE_DURATION, false)") != std::string::npos);
 
-  // Inside `HandleCommand` the E-Stop check and the cap gate come before the send.
+  // Inside `HandleCommand` the cap gate comes before the send.
   const std::size_t entry = handler.find("bool CommandHandler::HandleCommand(");
-  const std::size_t estop = handler.find("EStopManager::IsEStopped()", entry);
   const std::size_t admit = handler.find("SafetyCaps::Admit(", entry);
   const std::size_t send  = handler.find("s_rfTransmitter->SendCommand(", entry);
-  CHECK(entry != std::string::npos && estop != std::string::npos && admit != std::string::npos && send != std::string::npos);
-  CHECK(entry < estop && estop < admit && admit < send);
+  CHECK(entry != std::string::npos && admit != std::string::npos && send != std::string::npos);
+  CHECK(entry < admit && admit < send);
 }
 
 typedef void (*Scenario)();
@@ -964,7 +923,6 @@ int main()
   SCENARIO(coldBootHolds);
   SCENARIO(onTimeCeilingRefusesAJoinedPulse);
   SCENARIO(runBreakIsTheTerminator);
-  SCENARIO(estopRefusesWithCapsSet);
   SCENARIO(uncappedTypesPassAtZeroCaps);
   SCENARIO(uncappedTypesNeverEncodeAsShock);
   SCENARIO(maxRadioFrameCoversEveryEncoder);

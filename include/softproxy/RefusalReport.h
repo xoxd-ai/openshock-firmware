@@ -1,6 +1,6 @@
 #pragma once
 
-// Report of the Softproxy cap and E-Stop refusals (include/softproxy/CapLimiter.h), so a refused step reaches
+// Report of the Softproxy cap refusals (include/softproxy/CapLimiter.h), so a refused step reaches
 // Softproxy instead of reading as an actuation (TIN-7545). Each refusal leaves two traces:
 //
 // - one hub log line, `softproxy-refusal seq=<n> channel=<shock|vibrate|other> verdict=<name>`, on the serial log;
@@ -30,8 +30,6 @@ namespace OpenShock::Softproxy {
   static_assert(static_cast<uint8_t>(Verdict::Gap) == 7);
   static_assert(static_cast<uint8_t>(Verdict::Hourly) == 8);
   static_assert(static_cast<uint8_t>(Verdict::Daily) == 9);
-  static_assert(static_cast<uint8_t>(Verdict::EStopEngaged) == 10);
-  static_assert(static_cast<uint8_t>(Verdict::EStopNotArmed) == 11);
   static_assert(static_cast<uint8_t>(Verdict::OverOnTime) == 12);
 
   /// One consistent reading of the report.

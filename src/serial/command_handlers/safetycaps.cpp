@@ -1,7 +1,6 @@
 #include "serial/command_handlers/common.h"
 
 #include "Convert.h"
-#include "estop/EStopManager.h"
 #include "softproxy/SafetyCaps.h"
 #include "util/StringUtils.h"
 
@@ -50,10 +49,8 @@ static void _handleSafetyCapsGetCommand(std::string_view arg, bool isAutomated)
 
   // The same refusal count and latest verdict that the gateway heartbeat carries.
   auto refusals = OpenShock::Softproxy::SafetyCaps::GetRefusals();
+  // The last line of the reply.
   SERPR_RESPONSE("SafetyCaps|refusals|count=%u,last=%s", static_cast<unsigned>(refusals.count), OpenShock::Softproxy::RefusalCodeName(refusals.lastCode));
-  SERPR_RESPONSE(
-    "SafetyCaps|estop|armed=%s,engaged=%s,source=%s", OpenShock::EStopManager::IsArmed() ? "true" : "false", OpenShock::EStopManager::IsEStopped() ? "true" : "false", OpenShock::Softproxy::EStopLatchName(OpenShock::EStopManager::GetLatchSource())
-  );
 }
 
 static void _handleSafetyCapsSet(std::string_view arg, OpenShock::ShockerCommandType type)
@@ -92,9 +89,6 @@ static void _handleSafetyCapsSet(std::string_view arg, OpenShock::ShockerCommand
     case SetResult::Stored:
       SERPR_SUCCESS("Saved caps");
       break;
-    case SetResult::NeedsEngagedEStop:
-      SERPR_ERROR("Refused (raising a cap needs the E-Stop armed and engaged by its button, see `estop state`)");
-      break;
     case SetResult::Unreadable:
       SERPR_ERROR("Caps storage is unreadable, run `safetycaps clear` first");
       break;
@@ -126,7 +120,7 @@ static void _handleSafetyCapsClearCommand(std::string_view arg, bool isAutomated
   }
 
   if (!OpenShock::Softproxy::SafetyCaps::Clear()) {
-    SERPR_ERROR("Caps are 0 until restart, but erasing the stored caps failed, so the E-Stop settings stay locked");
+    SERPR_ERROR("Caps are 0 until restart, but erasing the stored caps failed, so they load again at the next boot");
     return;
   }
 

@@ -76,8 +76,8 @@ void MessageHandlers::WebSocket::HandleLocalBinary(uint8_t socketId, tcb::span<c
     return;
   }
 
-  // Softproxy fork (SP-46): the port 81 socket runs only the commands softproxy/Lockout.h allows. The E-Stop,
-  // E-Stop pin, Wi-Fi and account-link commands refuse here and stay on the serial port.
+  // Softproxy fork (SP-46): the port 81 socket runs only the commands softproxy/Lockout.h allows, and that list is
+  // empty. Every command refuses here, and the serial port stays the local path.
   const char* payloadName = Schemas::EnumNameLocalToHubMessagePayload(msg->payload_type());
   if (!Softproxy::LocalSocketAllows(payloadName)) {
     OS_LOGW(TAG, "Refusing local socket command %s from client #%u, use the serial port", payloadName, socketId);

@@ -110,9 +110,8 @@ namespace OpenShock::Softproxy {
     Gap,            // Less than `minGapSec` since the previous stage started.
     Hourly,         // `maxPerHour` stages started in the last 60 minutes.
     Daily,          // `maxPerDay` stages started in the last 24 hours.
-    EStopEngaged,   // The E-Stop is engaged. Any command refuses, capped or not.
-    EStopNotArmed,  // No live E-Stop checker task on a valid pin. Shock and vibrate refuse (include/softproxy/KillPath.h).
-    OverOnTime,     // The command would take the channel's output run past `OnTimeCeilingMs`.
+    // Wire codes 10 and 11 are retired. They were the E-Stop verdicts, removed by TIN-7125 858126ce.
+    OverOnTime = 12,  // The command would take the channel's output run past `OnTimeCeilingMs`.
   };
 
   constexpr const char* VerdictName(Verdict v)
@@ -138,10 +137,6 @@ namespace OpenShock::Softproxy {
         return "hourly";
       case Verdict::Daily:
         return "daily";
-      case Verdict::EStopEngaged:
-        return "estop-engaged";
-      case Verdict::EStopNotArmed:
-        return "estop-not-armed";
       case Verdict::OverOnTime:
         return "over-on-time";
       default:
