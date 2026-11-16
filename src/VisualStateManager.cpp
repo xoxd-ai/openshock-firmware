@@ -4,7 +4,6 @@
 
 const char* const TAG = "VisualStateManager";
 
-#include "estop/EStopState.h"
 #include "events/Events.h"
 #include "GatewayClientState.h"
 #include "Logging.h"
@@ -21,9 +20,6 @@ const char* const TAG = "VisualStateManager";
 #endif  // OPENSHOCK_LED_WS2812B
 
 const uint64_t kCriticalErrorFlag                = 1 << 0;
-const uint64_t kEmergencyStoppedFlag             = 1 << 1;
-const uint64_t kEmergencyStopActiveClearingFlag  = 1 << 2;
-const uint64_t kEmergencyStopAwaitingReleaseFlag = 1 << 3;
 const uint64_t kWebSocketConnectedFlag           = 1 << 4;
 const uint64_t kHasIpAddressFlag                 = 1 << 5;
 const uint64_t kWiFiConnectedFlag                = 1 << 6;
@@ -59,41 +55,6 @@ const PinPatternManager::State kCriticalErrorPattern[] = {
 const RGBPatternManager::RGBState kCriticalErrorRGBPattern[] = {
   {255, 0, 0, 100}, // Red ON for 0.1 seconds
   {  0, 0, 0, 100}  // OFF for 0.1 seconds
-};
-
-const PinPatternManager::State kEmergencyStoppedPattern[] = {
-  { true, 500},
-  {false, 500}
-};
-const RGBPatternManager::RGBState kEmergencyStoppedRGBPattern[] = {
-  {255, 0, 0, 500},
-  {  0, 0, 0, 500}
-};
-
-const PinPatternManager::State kEmergencyStopActiveClearingPattern[] = {
-  { true, 200},
-  {false, 200}
-};
-
-const RGBPatternManager::RGBState kEmergencyStopActiveClearingRGBPattern[] = {
-  {  0,   0, 0, 50},
-  { 64,  69, 0, 50},
-  {128, 101, 0, 50},
-  {192, 133, 0, 50},
-  {255, 165, 0, 50},
-  {192, 133, 0, 50},
-  {128, 101, 0, 50},
-  { 64,  69, 0, 50},
-};
-
-const PinPatternManager::State kEmergencyStopAwaitingReleasePattern[] = {
-  { true, 100},
-  {false, 100}
-};
-
-const RGBPatternManager::RGBState kEmergencyStopAwaitingReleaseRGBPattern[] = {
-  {0, 255, 0, 150},
-  {0,   0, 0, 150}
 };
 
 const PinPatternManager::State kWiFiDisconnectedPattern[] = {
@@ -205,9 +166,6 @@ inline void _updateVisualStateGPIO(const PinPatternManager::State (&override)[N]
 void _updateVisualStateGPIO()
 {
   CSR_PATTERN(s_builtInLedManager, kCriticalErrorFlag, kCriticalErrorPattern);
-  CSR_PATTERN(s_builtInLedManager, kEmergencyStopAwaitingReleaseFlag, kEmergencyStopAwaitingReleasePattern);
-  CSR_PATTERN(s_builtInLedManager, kEmergencyStopActiveClearingFlag, kEmergencyStopActiveClearingPattern);
-  CSR_PATTERN(s_builtInLedManager, kEmergencyStoppedFlag, kEmergencyStoppedPattern);
   CSR_PATTERN(s_builtInLedManager, kWebSocketConnectedFlag, kWebSocketConnectedPattern);
   CSR_PATTERN(s_builtInLedManager, kHasIpAddressFlag, kWiFiConnectedWithoutWSPattern);
   CSR_PATTERN(s_builtInLedManager, kWiFiScanningFlag, kPingNoResponsePattern);
@@ -218,9 +176,6 @@ void _updateVisualStateGPIO()
 void _updateVisualStateRGB()
 {
   CSR_PATTERN(s_RGBLedManager, kCriticalErrorFlag, kCriticalErrorRGBPattern);
-  CSR_PATTERN(s_RGBLedManager, kEmergencyStopAwaitingReleaseFlag, kEmergencyStopAwaitingReleaseRGBPattern);
-  CSR_PATTERN(s_RGBLedManager, kEmergencyStopActiveClearingFlag, kEmergencyStopActiveClearingRGBPattern);
-  CSR_PATTERN(s_RGBLedManager, kEmergencyStoppedFlag, kEmergencyStoppedRGBPattern);
   CSR_PATTERN(s_RGBLedManager, kWebSocketConnectedFlag, kWebSocketConnectedRGBPattern);
   CSR_PATTERN(s_RGBLedManager, kHasIpAddressFlag, kWiFiConnectedWithoutWSRGBPattern);
   CSR_PATTERN(s_RGBLedManager, kWiFiScanningFlag, kPingNoResponseRGBPattern);
@@ -313,15 +268,6 @@ void _handleEspIpEvent(void* event_handler_arg, esp_event_base_t event_base, int
   }
 }
 
-void _handleOpenShockEStopStateChanged(void* event_data)
-{
-  auto state = *reinterpret_cast<EStopState*>(event_data);
-
-  _setStateFlag(kEmergencyStoppedFlag, state != EStopState::Idle);
-  _setStateFlag(kEmergencyStopActiveClearingFlag, state == EStopState::ActiveClearing);
-  _setStateFlag(kEmergencyStopAwaitingReleaseFlag, state == EStopState::AwaitingRelease);
-}
-
 void _handleOpenShockGatewayStateChanged(void* event_data)
 {
   auto state = *reinterpret_cast<GatewayClientState*>(event_data);
@@ -337,9 +283,6 @@ void _handleOpenShockEvent(void* event_handler_arg, esp_event_base_t event_base,
   uint64_t oldState = s_stateFlags;
 
   switch (event_id) {
-    case OPENSHOCK_EVENT_ESTOP_STATE_CHANGED:
-      _handleOpenShockEStopStateChanged(event_data);
-      break;
     case OPENSHOCK_EVENT_GATEWAY_CLIENT_STATE_CHANGED:
       _handleOpenShockGatewayStateChanged(event_data);
       break;

@@ -7,15 +7,12 @@ import { ByteBuffer } from 'flatbuffers';
 import { HubStateStore } from '$lib/stores';
 import { SerializeWifiScanCommand } from '$lib/Serializers/WifiScanCommand';
 import { SetRfTxPinCommandResult } from '$lib/_fbs/open-shock/serialization/local/set-rf-tx-pin-command-result';
-import { SetEstopPinCommandResult } from '$lib/_fbs/open-shock/serialization/local/set-estop-pin-command-result';
 import { SetGPIOResultCode } from '$lib/_fbs/open-shock/serialization/local/set-gpioresult-code';
 import { AccountLinkCommandResult } from '$lib/_fbs/open-shock/serialization/local/account-link-command-result';
 import { AccountLinkResultCode } from '$lib/_fbs/open-shock/serialization/local/account-link-result-code';
 import { ErrorMessage } from '$lib/_fbs/open-shock/serialization/local/error-message';
 import { WifiNetworkEventHandler } from './WifiNetworkEventHandler';
 import { mapConfig } from '$lib/mappers/ConfigMapper';
-import { SetEstopEnabledCommand } from '$lib/_fbs/open-shock/serialization/local';
-import { SetEstopEnabledCommandResult } from '$lib/_fbs/open-shock/serialization/local/set-estop-enabled-command-result';
 import { toast } from 'svelte-sonner';
 
 export type MessageHandler = (wsClient: WebSocketClient, message: HubToLocalMessage) => void;
@@ -139,48 +136,6 @@ PayloadHandlers[HubToLocalMessagePayload.SetRfTxPinCommandResult] = (cli, msg) =
         break;
     }
     toast.error('Failed to change RF TX pin: ' + reason);
-  }
-};
-
-PayloadHandlers[HubToLocalMessagePayload.SetEstopEnabledCommandResult] = (cli, msg) => {
-  const payload = new SetEstopEnabledCommandResult();
-  msg.payload(payload);
-
-  const enabled = payload.enabled();
-  const success = payload.success();
-
-  if (success) {
-    HubStateStore.setEstopEnabled(payload.enabled());
-    toast.success('Changed EStop enabled to: ' + enabled);
-  } else {
-    toast.error('Failed to change EStop enabled');
-  }
-};
-
-PayloadHandlers[HubToLocalMessagePayload.SetEstopPinCommandResult] = (cli, msg) => {
-  const payload = new SetEstopPinCommandResult();
-  msg.payload(payload);
-
-  const result = payload.result();
-
-  if (result == SetGPIOResultCode.Success) {
-    const gpioPin = payload.gpioPin();
-    HubStateStore.setEstopGpioPin(gpioPin);
-    toast.success('Changed EStop pin to: ' + gpioPin);
-  } else {
-    let reason: string;
-    switch (result) {
-      case SetGPIOResultCode.InvalidPin:
-        reason = 'Invalid pin';
-        break;
-      case SetGPIOResultCode.InternalError:
-        reason = 'Internal error';
-        break;
-      default:
-        reason = 'Unknown';
-        break;
-    }
-    toast.error('Failed to change EStop pin: ' + reason);
   }
 };
 

@@ -1,7 +1,6 @@
 // Host test of the radio path (TIN-7545). It links the real `HandleCommand`, `SafetyCaps`, `RFTransmitter` and its
-// encoders and the real `WebSocketDeFragger`. Fakes: the E-Stop manager, RMT, the `Config` store, NVS, FreeRTOS, the
-// number parser in `Convert` and `Chipset`, whose pin checks accept 0 to 39 instead of the board's own unsafe and
-// bypassed pins.
+// encoders and the real `WebSocketDeFragger`. Fakes: RMT, the `Config` store, NVS, FreeRTOS, the number parser in
+// `Convert` and `Chipset`, whose pin checks accept 0 to 39 instead of the board's own unsafe and bypassed pins.
 //
 // The FreeRTOS fake runs each task on its own thread with one thread awake at a time, and `advance` steps every task
 // in 5 millisecond ticks, so a run is deterministic.
@@ -271,12 +270,6 @@ esp_err_t esp_event_handler_register(esp_event_base_t, int32_t, void (*)(void*, 
   return ESP_OK;
 }
 
-// The E-Stop manager is upstream's, and nothing here engages it.
-bool EStopManager::IsEStopped()
-{
-  return false;
-}
-
 // `Config` store.
 static gpio_num_t s_cfgTx = static_cast<gpio_num_t>(OPENSHOCK_RF_TX_GPIO);
 bool Config::GetRFConfig(Config::RFConfig& out)
@@ -301,11 +294,6 @@ bool Config::SetRFConfigTxPin(gpio_num_t pin)
 }
 bool Config::SetRFConfigKeepAliveEnabled(bool)
 {
-  return true;
-}
-bool Config::GetEStop(Config::EStopConfig& out)
-{
-  out = {.enabled = false, .gpioPin = GPIO_NUM_NC};
   return true;
 }
 

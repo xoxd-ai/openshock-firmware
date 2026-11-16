@@ -68,12 +68,6 @@ struct AccountUnlinkCommandBuilder;
 struct SetRfTxPinCommand;
 struct SetRfTxPinCommandBuilder;
 
-struct SetEstopEnabledCommand;
-struct SetEstopEnabledCommandBuilder;
-
-struct SetEstopPinCommand;
-struct SetEstopPinCommandBuilder;
-
 struct LocalToHubMessage;
 struct LocalToHubMessageBuilder;
 
@@ -96,13 +90,11 @@ enum class LocalToHubMessagePayload : uint8_t {
   AccountLinkCommand = 15,
   AccountUnlinkCommand = 16,
   SetRfTxPinCommand = 17,
-  SetEstopEnabledCommand = 18,
-  SetEstopPinCommand = 19,
   MIN = NONE,
-  MAX = SetEstopPinCommand
+  MAX = SetRfTxPinCommand
 };
 
-inline const LocalToHubMessagePayload (&EnumValuesLocalToHubMessagePayload())[20] {
+inline const LocalToHubMessagePayload (&EnumValuesLocalToHubMessagePayload())[18] {
   static const LocalToHubMessagePayload values[] = {
     LocalToHubMessagePayload::NONE,
     LocalToHubMessagePayload::WifiScanCommand,
@@ -121,15 +113,13 @@ inline const LocalToHubMessagePayload (&EnumValuesLocalToHubMessagePayload())[20
     LocalToHubMessagePayload::OtaUpdateStartUpdateCommand,
     LocalToHubMessagePayload::AccountLinkCommand,
     LocalToHubMessagePayload::AccountUnlinkCommand,
-    LocalToHubMessagePayload::SetRfTxPinCommand,
-    LocalToHubMessagePayload::SetEstopEnabledCommand,
-    LocalToHubMessagePayload::SetEstopPinCommand
+    LocalToHubMessagePayload::SetRfTxPinCommand
   };
   return values;
 }
 
 inline const char * const *EnumNamesLocalToHubMessagePayload() {
-  static const char * const names[21] = {
+  static const char * const names[19] = {
     "NONE",
     "WifiScanCommand",
     "WifiNetworkSaveCommand",
@@ -148,15 +138,13 @@ inline const char * const *EnumNamesLocalToHubMessagePayload() {
     "AccountLinkCommand",
     "AccountUnlinkCommand",
     "SetRfTxPinCommand",
-    "SetEstopEnabledCommand",
-    "SetEstopPinCommand",
     nullptr
   };
   return names;
 }
 
 inline const char *EnumNameLocalToHubMessagePayload(LocalToHubMessagePayload e) {
-  if (::flatbuffers::IsOutRange(e, LocalToHubMessagePayload::NONE, LocalToHubMessagePayload::SetEstopPinCommand)) return "";
+  if (::flatbuffers::IsOutRange(e, LocalToHubMessagePayload::NONE, LocalToHubMessagePayload::SetRfTxPinCommand)) return "";
   const size_t index = static_cast<size_t>(e);
   return EnumNamesLocalToHubMessagePayload()[index];
 }
@@ -231,14 +219,6 @@ template<> struct LocalToHubMessagePayloadTraits<OpenShock::Serialization::Local
 
 template<> struct LocalToHubMessagePayloadTraits<OpenShock::Serialization::Local::SetRfTxPinCommand> {
   static const LocalToHubMessagePayload enum_value = LocalToHubMessagePayload::SetRfTxPinCommand;
-};
-
-template<> struct LocalToHubMessagePayloadTraits<OpenShock::Serialization::Local::SetEstopEnabledCommand> {
-  static const LocalToHubMessagePayload enum_value = LocalToHubMessagePayload::SetEstopEnabledCommand;
-};
-
-template<> struct LocalToHubMessagePayloadTraits<OpenShock::Serialization::Local::SetEstopPinCommand> {
-  static const LocalToHubMessagePayload enum_value = LocalToHubMessagePayload::SetEstopPinCommand;
 };
 
 bool VerifyLocalToHubMessagePayload(::flatbuffers::Verifier &verifier, const void *obj, LocalToHubMessagePayload type);
@@ -1214,106 +1194,6 @@ struct SetRfTxPinCommand::Traits {
   static auto constexpr Create = CreateSetRfTxPinCommand;
 };
 
-struct SetEstopEnabledCommand FLATBUFFERS_FINAL_CLASS : private ::flatbuffers::Table {
-  typedef SetEstopEnabledCommandBuilder Builder;
-  struct Traits;
-  static FLATBUFFERS_CONSTEXPR_CPP11 const char *GetFullyQualifiedName() {
-    return "OpenShock.Serialization.Local.SetEstopEnabledCommand";
-  }
-  enum FlatBuffersVTableOffset FLATBUFFERS_VTABLE_UNDERLYING_TYPE {
-    VT_ENABLED = 4
-  };
-  bool enabled() const {
-    return GetField<uint8_t>(VT_ENABLED, 0) != 0;
-  }
-  bool Verify(::flatbuffers::Verifier &verifier) const {
-    return VerifyTableStart(verifier) &&
-           VerifyField<uint8_t>(verifier, VT_ENABLED, 1) &&
-           verifier.EndTable();
-  }
-};
-
-struct SetEstopEnabledCommandBuilder {
-  typedef SetEstopEnabledCommand Table;
-  ::flatbuffers::FlatBufferBuilder &fbb_;
-  ::flatbuffers::uoffset_t start_;
-  void add_enabled(bool enabled) {
-    fbb_.AddElement<uint8_t>(SetEstopEnabledCommand::VT_ENABLED, static_cast<uint8_t>(enabled), 0);
-  }
-  explicit SetEstopEnabledCommandBuilder(::flatbuffers::FlatBufferBuilder &_fbb)
-        : fbb_(_fbb) {
-    start_ = fbb_.StartTable();
-  }
-  ::flatbuffers::Offset<SetEstopEnabledCommand> Finish() {
-    const auto end = fbb_.EndTable(start_);
-    auto o = ::flatbuffers::Offset<SetEstopEnabledCommand>(end);
-    return o;
-  }
-};
-
-inline ::flatbuffers::Offset<SetEstopEnabledCommand> CreateSetEstopEnabledCommand(
-    ::flatbuffers::FlatBufferBuilder &_fbb,
-    bool enabled = false) {
-  SetEstopEnabledCommandBuilder builder_(_fbb);
-  builder_.add_enabled(enabled);
-  return builder_.Finish();
-}
-
-struct SetEstopEnabledCommand::Traits {
-  using type = SetEstopEnabledCommand;
-  static auto constexpr Create = CreateSetEstopEnabledCommand;
-};
-
-struct SetEstopPinCommand FLATBUFFERS_FINAL_CLASS : private ::flatbuffers::Table {
-  typedef SetEstopPinCommandBuilder Builder;
-  struct Traits;
-  static FLATBUFFERS_CONSTEXPR_CPP11 const char *GetFullyQualifiedName() {
-    return "OpenShock.Serialization.Local.SetEstopPinCommand";
-  }
-  enum FlatBuffersVTableOffset FLATBUFFERS_VTABLE_UNDERLYING_TYPE {
-    VT_PIN = 4
-  };
-  int8_t pin() const {
-    return GetField<int8_t>(VT_PIN, 0);
-  }
-  bool Verify(::flatbuffers::Verifier &verifier) const {
-    return VerifyTableStart(verifier) &&
-           VerifyField<int8_t>(verifier, VT_PIN, 1) &&
-           verifier.EndTable();
-  }
-};
-
-struct SetEstopPinCommandBuilder {
-  typedef SetEstopPinCommand Table;
-  ::flatbuffers::FlatBufferBuilder &fbb_;
-  ::flatbuffers::uoffset_t start_;
-  void add_pin(int8_t pin) {
-    fbb_.AddElement<int8_t>(SetEstopPinCommand::VT_PIN, pin, 0);
-  }
-  explicit SetEstopPinCommandBuilder(::flatbuffers::FlatBufferBuilder &_fbb)
-        : fbb_(_fbb) {
-    start_ = fbb_.StartTable();
-  }
-  ::flatbuffers::Offset<SetEstopPinCommand> Finish() {
-    const auto end = fbb_.EndTable(start_);
-    auto o = ::flatbuffers::Offset<SetEstopPinCommand>(end);
-    return o;
-  }
-};
-
-inline ::flatbuffers::Offset<SetEstopPinCommand> CreateSetEstopPinCommand(
-    ::flatbuffers::FlatBufferBuilder &_fbb,
-    int8_t pin = 0) {
-  SetEstopPinCommandBuilder builder_(_fbb);
-  builder_.add_pin(pin);
-  return builder_.Finish();
-}
-
-struct SetEstopPinCommand::Traits {
-  using type = SetEstopPinCommand;
-  static auto constexpr Create = CreateSetEstopPinCommand;
-};
-
 struct LocalToHubMessage FLATBUFFERS_FINAL_CLASS : private ::flatbuffers::Table {
   typedef LocalToHubMessageBuilder Builder;
   struct Traits;
@@ -1381,12 +1261,6 @@ struct LocalToHubMessage FLATBUFFERS_FINAL_CLASS : private ::flatbuffers::Table 
   }
   const OpenShock::Serialization::Local::SetRfTxPinCommand *payload_as_SetRfTxPinCommand() const {
     return payload_type() == OpenShock::Serialization::Local::LocalToHubMessagePayload::SetRfTxPinCommand ? static_cast<const OpenShock::Serialization::Local::SetRfTxPinCommand *>(payload()) : nullptr;
-  }
-  const OpenShock::Serialization::Local::SetEstopEnabledCommand *payload_as_SetEstopEnabledCommand() const {
-    return payload_type() == OpenShock::Serialization::Local::LocalToHubMessagePayload::SetEstopEnabledCommand ? static_cast<const OpenShock::Serialization::Local::SetEstopEnabledCommand *>(payload()) : nullptr;
-  }
-  const OpenShock::Serialization::Local::SetEstopPinCommand *payload_as_SetEstopPinCommand() const {
-    return payload_type() == OpenShock::Serialization::Local::LocalToHubMessagePayload::SetEstopPinCommand ? static_cast<const OpenShock::Serialization::Local::SetEstopPinCommand *>(payload()) : nullptr;
   }
   bool Verify(::flatbuffers::Verifier &verifier) const {
     return VerifyTableStart(verifier) &&
@@ -1463,14 +1337,6 @@ template<> inline const OpenShock::Serialization::Local::AccountUnlinkCommand *L
 
 template<> inline const OpenShock::Serialization::Local::SetRfTxPinCommand *LocalToHubMessage::payload_as<OpenShock::Serialization::Local::SetRfTxPinCommand>() const {
   return payload_as_SetRfTxPinCommand();
-}
-
-template<> inline const OpenShock::Serialization::Local::SetEstopEnabledCommand *LocalToHubMessage::payload_as<OpenShock::Serialization::Local::SetEstopEnabledCommand>() const {
-  return payload_as_SetEstopEnabledCommand();
-}
-
-template<> inline const OpenShock::Serialization::Local::SetEstopPinCommand *LocalToHubMessage::payload_as<OpenShock::Serialization::Local::SetEstopPinCommand>() const {
-  return payload_as_SetEstopPinCommand();
 }
 
 struct LocalToHubMessageBuilder {
@@ -1580,14 +1446,6 @@ inline bool VerifyLocalToHubMessagePayload(::flatbuffers::Verifier &verifier, co
     }
     case LocalToHubMessagePayload::SetRfTxPinCommand: {
       auto ptr = reinterpret_cast<const OpenShock::Serialization::Local::SetRfTxPinCommand *>(obj);
-      return verifier.VerifyTable(ptr);
-    }
-    case LocalToHubMessagePayload::SetEstopEnabledCommand: {
-      auto ptr = reinterpret_cast<const OpenShock::Serialization::Local::SetEstopEnabledCommand *>(obj);
-      return verifier.VerifyTable(ptr);
-    }
-    case LocalToHubMessagePayload::SetEstopPinCommand: {
-      auto ptr = reinterpret_cast<const OpenShock::Serialization::Local::SetEstopPinCommand *>(obj);
       return verifier.VerifyTable(ptr);
     }
     default: return true;

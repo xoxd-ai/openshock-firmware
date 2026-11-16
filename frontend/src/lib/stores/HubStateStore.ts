@@ -124,20 +124,4 @@ export const HubStateStore = {
       return store;
     });
   },
-  setEstopEnabled(enabled: boolean) {
-    update((store) => {
-      if (store.config) {
-        store.config.estop.enabled = enabled;
-      }
-      return store;
-    });
-  },
-  setEstopGpioPin(gpioPin: number) {
-    update((store) => {
-      if (store.config) {
-        store.config.estop.gpioPin = gpioPin;
-      }
-      return store;
-    });
-  },
 };
