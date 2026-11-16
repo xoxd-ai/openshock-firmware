@@ -74,7 +74,7 @@
 // GPIO0, GPIO2 is used to control the boot mode of the chip.
 // GPIO5, GPIO15 is used for SDIO slave timing selection.
 // GPIO6, GPIO7, GPIO8, GPIO9, GPIO10, GPIO11, GPIO16, GPIO17 is used for SPI flash connection. (DO NOT TOUCH)
-// Softproxy fork: upstream's list skips GPIO10, the flash pin beside GPIO9, so `estop pin 10` and `rftxpin 10` passed.
+// Softproxy fork: upstream's list skips GPIO10, the flash pin beside GPIO9, so `rftxpin 10` passed.
 //
 // See: ESP32 Series Datasheet Version 4.3 Section 2.2 Pin Overview
 // See: ESP32 Series Datasheet Version 4.3 Section 2.4 Strapping Pins

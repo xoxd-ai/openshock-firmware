@@ -1,7 +1,7 @@
 #pragma once
 
 // Remote and local paths that the xoxd-ai fork closes so nobody off the serial port can undo the Softproxy
-// caps (include/softproxy/CapLimiter.h) or the hub E-Stop. No Arduino or ESP-IDF dependency, so the host test
+// caps (include/softproxy/CapLimiter.h). No Arduino or ESP-IDF dependency, so the host test
 // can check them.
 
 #include "ShockerCommandType.h"
@@ -27,9 +27,9 @@ namespace OpenShock::Softproxy {
   constexpr bool kAllowGatewayCaptivePortalEnable = false;
 
   /// The fork refuses Shock and Vibrate that arrive from the gateway in a `ShockerCommandList` (review H3). The hub caps
-  /// and the E-Stop would still apply, but none of Softproxy's server checks 4 to 8, so a linked account could actuate
-  /// outside the alarm service. Only the local serial port, where Softproxy's driver runs, actuates. The gateway
-  /// `Trigger` `EmergencyStop` still engages the E-Stop, and a gateway Stop or Sound still passes.
+  /// would still apply, but none of Softproxy's server checks 4 to 8, so a linked account could actuate outside the
+  /// alarm service. Only the local serial port, where Softproxy's driver runs, actuates. A gateway Stop or Sound still
+  /// passes.
   constexpr bool kAllowGatewayActuation = false;
 
   /// Whether a command of this type from the gateway may reach `HandleCommand`.
@@ -49,13 +49,12 @@ namespace OpenShock::Softproxy {
 
   /// Local socket commands (captive portal WebSocket, port 81) that the fork still serves, by their
   /// `LocalToHubMessagePayload` name. The socket has no authentication and the portal access point has no
-  /// password, so SP-46 refuses the E-Stop, E-Stop pin, Wi-Fi and account-link commands there. The serial
-  /// port stays the local path for each of them: `estop`, `networks` and `authtoken`.
+  /// password, so SP-46 refuses the Wi-Fi and account-link commands there. The serial port stays the local
+  /// path for each of them: `networks` and `authtoken`.
   ///
   /// This is an allow list, and it is empty: the socket serves no command. A payload not named here,
   /// including one a later upstream release adds, is refused. The RF TX pin is refused as well (TIN-7125
-  /// SPR-75), because it could move the transmitter onto the E-Stop GPIO and so disable the E-Stop from the
-  /// open access point. Serial `rftxpin` stays its local path. The nine OTA commands are empty handlers at
+  /// SPR-75). Serial `rftxpin` stays its local path. The nine OTA commands are empty handlers at
   /// 1.5.2, so refusing them changes nothing today and keeps a later upstream body from opening an install
   /// path.
   inline constexpr std::array<std::string_view, 0> kLocalSocketAllowed {};

@@ -50,8 +50,6 @@ static const char* const kUpstreamPayloads[] = {
 
 // SP-46 names these. Each must refuse on the port 81 socket.
 static const char* const kSp46Refused[] = {
-  "SetEstopEnabledCommand",
-  "SetEstopPinCommand",
   "WifiScanCommand",
   "WifiNetworkSaveCommand",
   "WifiNetworkForgetCommand",
@@ -73,8 +71,7 @@ static void sp46RefusesNamedCommands()
 
 static void localSocketAllowsNothing()
 {
-  // SPR-75: the port 81 socket serves no command, the RF TX pin included, since that pin could be moved
-  // onto the E-Stop GPIO.
+  // SPR-75: the port 81 socket serves no command, the RF TX pin included.
   for (const char* name : kUpstreamPayloads) {
     if (LocalSocketAllows(name)) {
       std::printf("FAIL %s:%d: local socket allows %s\n", __FILE__, __LINE__, name);
@@ -103,7 +100,7 @@ static void gatewayLockouts()
   static_assert(!kAllowGatewayCaptivePortalEnable, "SP-46: the gateway may not hold the captive portal open");
   static_assert(!kAllowOtaInstall, "the fork never installs firmware over the air");
   static_assert(!kAllowGatewayRestart, "the fork ignores the gateway restart trigger");
-  static_assert(!LocalSocketAllows("SetEstopEnabledCommand"), "the allow list is usable at compile time");
+  static_assert(!LocalSocketAllows("WifiScanCommand"), "the allow list is usable at compile time");
   static_assert(!LocalSocketAllows("SetRfTxPinCommand"), "SPR-75: the RF TX pin is serial only");
 }
 
@@ -165,8 +162,6 @@ static void wireCodeNames()
   CHECK(std::strcmp(RefusalCodeName(0), "none") == 0);
   CHECK(std::strcmp(RefusalCodeName(2), "caps-not-set") == 0);
   CHECK(std::strcmp(RefusalCodeName(9), "daily") == 0);
-  CHECK(std::strcmp(RefusalCodeName(10), "estop-engaged") == 0);
-  CHECK(std::strcmp(RefusalCodeName(11), "estop-not-armed") == 0);
   CHECK(std::strcmp(RefusalCodeName(12), "over-on-time") == 0);
   CHECK(std::strcmp(RefusalCodeName(13), "unknown") == 0);
   CHECK(std::strcmp(RefusalCodeName(255), "unknown") == 0);

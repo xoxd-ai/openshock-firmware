@@ -1,14 +1,13 @@
 #pragma once
 
-// Fakes for test/native/test_command_paths.cpp and test/native/test_kill_path.cpp. The firmware's own code compiles
+// Fakes for test/native/test_command_paths.cpp and test/native/test_radio_path.cpp. The firmware's own code compiles
 // against these on a host: every header in this directory forwards here. Fakes in both tests: the NVS store, the
-// mutexes, the `Config` store and the serial and socket transports. test_command_paths also fakes `RFTransmitter`
-// and `EStopManager`, as firmware logic, not hardware. With SOFTPROXY_KILL_TEST set those two are real, and
-// test_kill_path.cpp supplies FreeRTOS tasks and queues, GPIO, RMT and events.
+// mutexes, the `Config` store, `EStopManager` and the serial and socket transports. test_command_paths also fakes
+// `RFTransmitter`, as firmware logic, not hardware. With SOFTPROXY_RADIO_TEST set it is real, and test_radio_path.cpp
+// supplies FreeRTOS tasks and queues, RMT and events.
 
 #include "ShockerCommandType.h"
 #include "ShockerModelType.h"
-#include "softproxy/KillPath.h"
 #include "span.h"
 
 #include <algorithm>
@@ -77,24 +76,15 @@ enum nvs_open_mode_t {
   TypeName(TypeName&&)       = delete; \
   void operator=(TypeName&&) = delete
 #define portMUX_INITIALIZER_UNLOCKED 0
-#ifndef SOFTPROXY_KILL_TEST
-#define portENTER_CRITICAL(mux) (void)(mux)
-#define portEXIT_CRITICAL(mux)  (void)(mux)
-#else
-// One thread is awake at a time, so a critical section excludes nothing on the host. test_kill_path.cpp hooks the edges
-// of each outermost section instead: there another core's code can run, just before the section or just after it.
-void hostEnterCritical(portMUX_TYPE* mux);
-void hostExitCritical(portMUX_TYPE* mux);
-#define portENTER_CRITICAL(mux) hostEnterCritical(mux)
-#define portEXIT_CRITICAL(mux)  hostExitCritical(mux)
-#endif
+#define portENTER_CRITICAL(mux)      (void)(mux)
+#define portEXIT_CRITICAL(mux)       (void)(mux)
 
 inline const char* esp_err_to_name(esp_err_t)
 {
   return "fake";
 }
 
-#ifndef SOFTPROXY_KILL_TEST
+#ifndef SOFTPROXY_RADIO_TEST
 inline QueueHandle_t xQueueCreate(int, std::size_t)
 {
   return nullptr;
@@ -213,7 +203,6 @@ extern std::string g_serialOut;
 #define SERPR_RESPONSE(format, ...) SERPR_SYS("Response|" format, ##__VA_ARGS__)
 #define SERPR_SUCCESS(format, ...)  SERPR_SYS("Success|" format, ##__VA_ARGS__)
 #define SERPR_ERROR(format, ...)    SERPR_SYS("Error|" format, ##__VA_ARGS__)
-#define SERPR_LINE(format, ...)     hostSerial("plain|" format, ##__VA_ARGS__)
 inline void hostSerial(const char* format, ...)
 {
   char line[256];
@@ -278,7 +267,7 @@ namespace OpenShock {
     bool isLocked() const { return true; }
   };
   class ReadWriteMutex { };
-  // Runs once at the next read lock, so a scenario can let time pass where a real lock could wait (test_kill_path.cpp).
+  // Runs once at the next read lock, so a scenario can let time pass where a real lock could wait (test_radio_path.cpp).
   inline void (*g_onReadLock)() = nullptr;
   class ScopedReadLock {
   public:
@@ -295,7 +284,6 @@ namespace OpenShock {
     ScopedWriteLock(ReadWriteMutex*, TickType_t = portMAX_DELAY) { }
   };
 
-#ifndef SOFTPROXY_KILL_TEST
   enum class EStopState : uint8_t {
     Idle,
     Active,
@@ -303,12 +291,8 @@ namespace OpenShock {
 
   namespace EStopManager {
     bool IsEStopped();
-    bool IsArmed();
-    Softproxy::EStopLatchSource GetLatchSource();
-    gpio_num_t GetRunningPin();
     void Trigger();
   }  // namespace EStopManager
-#endif
 
   namespace Config {
     struct RFConfig {
@@ -325,13 +309,9 @@ namespace OpenShock {
     bool SetRFConfigTxPin(gpio_num_t txPin);
     bool SetRFConfigKeepAliveEnabled(bool enabled);
     bool GetEStop(EStopConfig& out);
-    bool GetEStopEnabled(bool& out);
-    bool SetEStopEnabled(bool enabled);
-    bool GetEStopGpioPin(gpio_num_t& out);
-    bool SetEStopGpioPin(gpio_num_t gpioPin);
   }  // namespace Config
 
-#ifndef SOFTPROXY_KILL_TEST
+#ifndef SOFTPROXY_RADIO_TEST
   namespace TaskUtils {
     inline BaseType_t TaskCreateExpensive(TaskFunction_t, const char*, uint32_t, void*, int, TaskHandle_t*)
     {
@@ -401,7 +381,7 @@ namespace OpenShock {
   extern std::vector<RadioSend> g_radio;
   extern std::vector<gpio_num_t> g_transmitterPins;  // One entry per transmitter built, in order.
 
-#ifndef SOFTPROXY_KILL_TEST
+#ifndef SOFTPROXY_RADIO_TEST
   class RFTransmitter {
   public:
     explicit RFTransmitter(gpio_num_t pin)
@@ -485,7 +465,6 @@ namespace OpenShock {
     namespace CommandHandlers {
       CommandGroup RfTransmitHandler();
       CommandGroup RfTxPinHandler();
-      CommandGroup EStopHandler();
       CommandGroup SafetyCapsHandler();
     }  // namespace CommandHandlers
   }  // namespace Serial
@@ -509,41 +488,16 @@ enum WStype_t {
 // esp_event and esp_system.
 extern esp_event_base_t OPENSHOCK_EVENTS;
 #define OPENSHOCK_EVENT_ESTOP_STATE_CHANGED 1
-#ifndef SOFTPROXY_KILL_TEST
+#ifndef SOFTPROXY_RADIO_TEST
 inline esp_err_t esp_event_handler_register(esp_event_base_t, int32_t, void (*)(void*, esp_event_base_t, int32_t, void*), void*)
 {
   return ESP_OK;
 }
 #else
 esp_err_t esp_event_handler_register(esp_event_base_t, int32_t, void (*)(void*, esp_event_base_t, int32_t, void*), void*);
-esp_err_t esp_event_post(esp_event_base_t, int32_t, const void*, std::size_t, TickType_t);
 #define ESP_ERROR_CHECK(x) (void)(x)
 
-// GPIO and RMT, which test_kill_path.cpp supplies.
-enum gpio_mode_t {
-  GPIO_MODE_INPUT,
-};
-enum gpio_pullup_t {
-  GPIO_PULLUP_DISABLE = 0,
-  GPIO_PULLUP_ENABLE  = 1,
-};
-enum gpio_pulldown_t {
-  GPIO_PULLDOWN_DISABLE,
-};
-enum gpio_int_type_t {
-  GPIO_INTR_DISABLE,
-};
-struct gpio_config_t {
-  uint64_t pin_bit_mask;
-  gpio_mode_t mode;
-  gpio_pullup_t pull_up_en;
-  gpio_pulldown_t pull_down_en;
-  gpio_int_type_t intr_type;
-};
-esp_err_t gpio_config(const gpio_config_t*);
-esp_err_t gpio_reset_pin(gpio_num_t);
-int gpio_get_level(gpio_num_t);
-
+// RMT, which test_radio_path.cpp supplies.
 struct rmt_obj_t;
 #define RMT_TX_MODE        1
 #define RMT_MEM_64         64
@@ -556,22 +510,4 @@ extern int g_restarts;
 inline void esp_restart()
 {
   ++g_restarts;
-}
-enum esp_reset_reason_t {
-  ESP_RST_UNKNOWN,
-  ESP_RST_POWERON,
-  ESP_RST_EXT,
-  ESP_RST_SW,
-  ESP_RST_PANIC,
-  ESP_RST_INT_WDT,
-  ESP_RST_TASK_WDT,
-  ESP_RST_WDT,
-  ESP_RST_DEEPSLEEP,
-  ESP_RST_BROWNOUT,
-  ESP_RST_SDIO,
-};
-inline esp_reset_reason_t g_resetReason = ESP_RST_POWERON;
-inline esp_reset_reason_t esp_reset_reason()
-{
-  return g_resetReason;
 }

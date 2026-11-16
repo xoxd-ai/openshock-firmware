@@ -5,15 +5,16 @@ Fork changes on `feat/tin-7545-softproxy-caps` from the delta review of `11c3fe6
 ### Bug Fixes
 
 - **Output bound (H1, N2, N3, #9)** - `CapsCoherent` needs `maxPulseMs <= minGapSec * 1000`. The cap limiter counts each shock or vibrate command above 0 ms as its duration plus one radio frame, `kMaxRadioFrameMs` of 73 ms, and refuses a command that would take a channel's output run above `maxPulsesPerStage * (maxPulseMs + 73)` as `over-on-time`, wire code 12. A run ends 300 ms after its last counted end. A host test pins the frame constant to the five encoders.
-- **Transmit stop (H2, H5, #10)** - The transmit task ends shock and vibrate output above intensity 0 when the E-Stop is not armed. The stop frame, the keep-alive, Sound and Light run on. The checker posts its state event with a finite wait, and `IsArmed` needs a sample since the task started. `estop state` prints a plain `softproxy-estop-health` line with the longest checker sample interval and the failed state posts since boot, and a failing post logs again every 10 s (T1, T2). The checker's task handle and pin are atomic (T3).
-- **Gateway actuation (H3, #11)** - `kAllowGatewayActuation = false` refuses Shock and Vibrate from the gateway. The gateway emergency stop, Stop and Sound still pass, and the serial path is unchanged.
-- **Failed caps clear (D4, C1)** - The E-Stop settings stay locked until the erase of a `safetycaps clear` commits. A failed open, erase or commit each keeps them locked.
+- **Gateway actuation (H3, #11)** - `kAllowGatewayActuation = false` refuses Shock and Vibrate from the gateway. Gateway Stop and Sound still pass, and the serial path is unchanged.
 - **Admitted start (review 3 F1)** - `SafetyCaps::Admit` returns the `millis()` reading it counted a command from, and `HandleCommand` passes it to a new `RFTransmitter::SendCommand` overload. The radio ends the command at that instant plus its duration, so a wait between admission and the send no longer moves output past the counted interval. The keep-alive and Stop keep the upstream timing.
-- **Checker delete order (review 3 F5)** - Disabling the E-Stop or moving its pin clears the checker task handle before it deletes the task, so `IsArmed` cannot read a task under deletion as armed.
 - **Retained version (review 3 F3)** - `kRetainedVersion` is 3, since the run end and run total now count one radio frame per command. A version 2 record reads as a cold boot and holds.
 - **Config print (H6)** - `jsonconfig` with no argument prints the config without the Wi-Fi passwords and the auth token.
-- **Docs (D1, D2, D3, D5, C2, C3)** - `SOFTPROXY.md` lists every E-Stop pin refusal, drops the app-only write, marks the merged write as measured and asks for `source=cold-boot` to be read after a power cycle. It warns that writing `jsonconfig` output back stores empty Wi-Fi passwords, so the hub opens its no-password access point, and names `estop pin` and `rftxpin` for single fields. The `estop pin` refusal names a pin this chip cannot use.
+- **Docs (D1, D2, D3, D5, C2, C3)** - `SOFTPROXY.md` drops the app-only write and marks the merged write as measured. It warns that writing `jsonconfig` output back stores empty Wi-Fi passwords, so the hub opens its no-password access point, and names `rftxpin` for the RF TX pin.
 - **Dose ruling (review 3 F2)** - `SOFTPROXY.md` records Jess's ruling on the dose, TIN-7125 `7f50c8e5` item 1, "Accept it as is": the hub bounds unbroken output and keeps no hourly on-time cap.
+
+### Removed
+
+- **E-Stop rules (TIN-7125 `858126ce`, `41d24ddc`)** - Jess removed the E-Stop work, since there is no physical E-Stop. The fork no longer refuses shock and vibrate without an armed E-Stop, no longer needs an engaged E-Stop to raise a cap, no longer refuses an RF TX pin on the E-Stop GPIO and no longer starts a cold boot engaged. The mushroom-up clear, the normally closed contact rule, the latch sources, the retained latch, the E-Stop config gate on the whole-config writers, their tests and the mutation run are gone. Upstream 1.5.2's own optional E-Stop is unchanged. The `safetycaps` reply drops its `SafetyCaps|estop|` line, the `Pong` field `softproxy_estop` is deprecated and refusal codes 10 and 11 are retired.
 
 
 

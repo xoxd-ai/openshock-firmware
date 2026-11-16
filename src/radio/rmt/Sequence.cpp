@@ -54,8 +54,6 @@ Rmt::Sequence::Sequence(ShockerModelType shockerModel, uint16_t shockerId, int64
   , m_transmitEnd(transmitEnd)
   , m_shockerId(shockerId)
   , m_shockerModel(shockerModel)
-  , m_commandType()
-  , m_intensity(0)
 {
   if (m_size == 0) return;
 
@@ -75,8 +73,5 @@ Rmt::Sequence::Sequence(ShockerModelType shockerModel, uint16_t shockerId, int64
 
 bool Rmt::Sequence::fill(ShockerCommandType commandType, uint8_t intensity)
 {
-  // Recorded before the fill, so a payload that failed half way still reads as what it was asked to carry.
-  m_commandType = commandType;
-  m_intensity   = intensity;
   return fillSequenceImpl(payload(), m_shockerModel, m_shockerId, commandType, intensity);
 }
