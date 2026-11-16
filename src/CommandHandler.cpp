@@ -8,8 +8,6 @@ const char* const TAG = "CommandHandler";
 #include "Common.h"
 #include "config/Config.h"
 #include "Core.h"
-#include "estop/EStopManager.h"
-#include "estop/EStopState.h"
 #include "events/Events.h"
 #include "Logging.h"
 #include "radio/RFTransmitter.h"
@@ -155,24 +153,11 @@ bool _internalSetKeepAliveEnabled(bool enabled)
   return true;
 }
 
-static void commandhandler_handleestopstatechange(void* event_handler_arg, esp_event_base_t event_base, int32_t event_id, void* event_data)
-{
-  (void)event_handler_arg;
-  (void)event_base;
-  (void)event_id;
-
-  EStopState state = *reinterpret_cast<EStopState*>(event_data);
-
-  _internalSetKeepAliveEnabled(state == EStopState::Idle);
-}
-
 bool CommandHandler::Init()
 {
-  esp_err_t err;
-
   static bool initialized = false;
   if (initialized) {
-    OS_LOGW(TAG, "RF Transmitter and EStopManager are already initialized?");
+    OS_LOGW(TAG, "RF Transmitter is already initialized?");
     return true;
   }
   initialized = true;
@@ -215,20 +200,6 @@ bool CommandHandler::Init()
   if (rfConfig.keepAliveEnabled) {
     _internalSetKeepAliveEnabled(true);
   }
-
-  Config::EStopConfig estopConfig;
-  if (!Config::GetEStop(estopConfig)) {
-    OS_LOGE(TAG, "Failed to get EStop config");
-    return false;
-  }
-
-  err = esp_event_handler_register(OPENSHOCK_EVENTS, OPENSHOCK_EVENT_ESTOP_STATE_CHANGED, commandhandler_handleestopstatechange, nullptr);
-  if (err != ESP_OK) {
-    OS_LOGE(TAG, "Failed to register event handler for OPENSHOCK_EVENTS: %s", esp_err_to_name(err));
-    return false;
-  }
-
-  // TODO: Implement EStopManager pin change logic
 
   return true;
 }
@@ -299,11 +270,6 @@ gpio_num_t CommandHandler::GetRfTxPin()
 
 bool CommandHandler::HandleCommand(ShockerModelType model, uint16_t shockerId, ShockerCommandType type, uint8_t intensity, uint16_t durationMs)
 {
-  if (EStopManager::IsEStopped()) {
-    OS_LOGD(TAG, "Ignoring shocker command due to EmergencyStop being activated");
-    return false;
-  }
-
   // Softproxy caps (ADR-0008 decision 6). Every shock and vibrate command passes here before the radio.
   // Admit counts and logs each refusal (softproxy/RefusalReport.h).
   int64_t admittedAtMs       = 0;

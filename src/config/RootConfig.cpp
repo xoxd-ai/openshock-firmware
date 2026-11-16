@@ -13,7 +13,6 @@ RootConfig::RootConfig()
   , backend()
   , serialInput()
   , otaUpdate()
-  , estop()
 {
 }
 
@@ -25,7 +24,6 @@ void RootConfig::ToDefault()
   backend.ToDefault();
   serialInput.ToDefault();
   otaUpdate.ToDefault();
-  estop.ToDefault();
 }
 
 bool RootConfig::FromFlatbuffers(const Serialization::Configuration::HubConfig* config)
@@ -66,11 +64,6 @@ bool RootConfig::FromFlatbuffers(const Serialization::Configuration::HubConfig* 
     return false;
   }
 
-  if (!estop.FromFlatbuffers(config->estop())) {
-    OS_LOGE(TAG, "Unable to load estop config");
-    return false;
-  }
-
   return true;
 }
 
@@ -82,9 +75,8 @@ flatbuffers::Offset<OpenShock::Serialization::Configuration::HubConfig> RootConf
   auto backendOffset       = backend.ToFlatbuffers(builder, withSensitiveData);
   auto serialInputOffset   = serialInput.ToFlatbuffers(builder, withSensitiveData);
   auto otaUpdateOffset     = otaUpdate.ToFlatbuffers(builder, withSensitiveData);
-  auto estopOffset         = estop.ToFlatbuffers(builder, withSensitiveData);
 
-  return Serialization::Configuration::CreateHubConfig(builder, rfOffset, wifiOffset, captivePortalOffset, backendOffset, serialInputOffset, otaUpdateOffset, estopOffset);
+  return Serialization::Configuration::CreateHubConfig(builder, rfOffset, wifiOffset, captivePortalOffset, backendOffset, serialInputOffset, otaUpdateOffset);
 }
 
 bool RootConfig::FromJSON(const cJSON* json)
@@ -130,11 +122,6 @@ bool RootConfig::FromJSON(const cJSON* json)
     return false;
   }
 
-  if (!estop.FromJSON(cJSON_GetObjectItemCaseSensitive(json, "estop"))) {
-    OS_LOGE(TAG, "Unable to load estop config");
-    return false;
-  }
-
   return true;
 }
 
@@ -148,7 +135,6 @@ cJSON* RootConfig::ToJSON(bool withSensitiveData) const
   cJSON_AddItemToObject(root, "backend", backend.ToJSON(withSensitiveData));
   cJSON_AddItemToObject(root, "serialInput", serialInput.ToJSON(withSensitiveData));
   cJSON_AddItemToObject(root, "otaUpdate", otaUpdate.ToJSON(withSensitiveData));
-  cJSON_AddItemToObject(root, "estop", estop.ToJSON(withSensitiveData));
 
   return root;
 }

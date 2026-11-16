@@ -27,8 +27,6 @@ namespace OpenShock::MessageHandlers::Local::_Private {
   HANDLER_FN(AccountLinkCommand);
   HANDLER_FN(AccountUnlinkCommand);
   HANDLER_FN(SetRfTxPinCommand);
-  HANDLER_FN(SetEstopEnabledCommand);
-  HANDLER_FN(SetEstopPinCommand);
   HANDLER_FN(InvalidMessage);
 }  // namespace OpenShock::MessageHandlers::Local::_Private
 

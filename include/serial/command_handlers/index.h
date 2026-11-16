@@ -11,7 +11,6 @@ namespace OpenShock::Serial::CommandHandlers {
   OpenShock::Serial::CommandGroup EchoHandler();
   OpenShock::Serial::CommandGroup ValidGpiosHandler();
   OpenShock::Serial::CommandGroup RfTxPinHandler();
-  OpenShock::Serial::CommandGroup EStopHandler();
   OpenShock::Serial::CommandGroup DomainHandler();
   OpenShock::Serial::CommandGroup AuthTokenHandler();
   OpenShock::Serial::CommandGroup HostnameHandler();
@@ -32,7 +31,6 @@ namespace OpenShock::Serial::CommandHandlers {
       EchoHandler(),
       ValidGpiosHandler(),
       RfTxPinHandler(),
-      EStopHandler(),
       DomainHandler(),
       AuthTokenHandler(),
       HostnameHandler(),

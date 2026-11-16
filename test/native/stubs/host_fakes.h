@@ -2,7 +2,7 @@
 
 // Fakes for test/native/test_command_paths.cpp and test/native/test_radio_path.cpp. The firmware's own code compiles
 // against these on a host: every header in this directory forwards here. Fakes in both tests: the NVS store, the
-// mutexes, the `Config` store, `EStopManager` and the serial and socket transports. test_command_paths also fakes
+// mutexes, the `Config` store and the serial and socket transports. test_command_paths also fakes
 // `RFTransmitter`, as firmware logic, not hardware. With SOFTPROXY_RADIO_TEST set it is real, and test_radio_path.cpp
 // supplies FreeRTOS tasks and queues, RMT and events.
 
@@ -284,31 +284,16 @@ namespace OpenShock {
     ScopedWriteLock(ReadWriteMutex*, TickType_t = portMAX_DELAY) { }
   };
 
-  enum class EStopState : uint8_t {
-    Idle,
-    Active,
-  };
-
-  namespace EStopManager {
-    bool IsEStopped();
-    void Trigger();
-  }  // namespace EStopManager
-
   namespace Config {
     struct RFConfig {
       gpio_num_t txPin;
       bool keepAliveEnabled;
-    };
-    struct EStopConfig {
-      bool enabled;
-      gpio_num_t gpioPin;
     };
     bool GetRFConfig(RFConfig& out);
     bool GetRFConfigKeepAliveEnabled(bool& out);
     bool GetRFConfigTxPin(gpio_num_t& out);
     bool SetRFConfigTxPin(gpio_num_t txPin);
     bool SetRFConfigKeepAliveEnabled(bool enabled);
-    bool GetEStop(EStopConfig& out);
   }  // namespace Config
 
 #ifndef SOFTPROXY_RADIO_TEST
@@ -487,7 +472,6 @@ enum WStype_t {
 
 // esp_event and esp_system.
 extern esp_event_base_t OPENSHOCK_EVENTS;
-#define OPENSHOCK_EVENT_ESTOP_STATE_CHANGED 1
 #ifndef SOFTPROXY_RADIO_TEST
 inline esp_err_t esp_event_handler_register(esp_event_base_t, int32_t, void (*)(void*, esp_event_base_t, int32_t, void*), void*)
 {

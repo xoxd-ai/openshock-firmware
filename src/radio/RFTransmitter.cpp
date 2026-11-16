@@ -5,7 +5,6 @@
 const char* const TAG = "RFTransmitter";
 
 #include "Core.h"
-#include "estop/EStopManager.h"
 #include "Logging.h"
 #include "radio/rmt/Sequence.h"
 #include "util/FnProxy.h"
@@ -212,7 +211,6 @@ void RFTransmitter::TransmitTask()
 {
   OS_LOGD(TAG, "[pin-%hhi] RMT loop running on core %d", m_txPin, xPortGetCoreID());
 
-  bool wasEstopped = false;
   std::vector<Rmt::Sequence> sequences;
   while (true) {
     // Receive commands
@@ -225,17 +223,6 @@ void RFTransmitter::TransmitTask()
         return;
       }
 
-      // Discard any command received while estopped
-      if (OpenShock::EStopManager::IsEStopped()) {
-        // Immediately break out to stop sequences; we can empty the queue later
-        if (!wasEstopped) {
-          break;
-        }
-
-        // Discard next item in queue
-        continue;
-      }
-
       if ((cmd.flags & kFlagOverwrite) != 0) {
         // Replace the sequence if it already exists
         if (modifySequence(sequences, cmd.modelType, cmd.shockerId, cmd.type, cmd.intensity, cmd.transmitEnd)) {
@@ -245,20 +232,6 @@ void RFTransmitter::TransmitTask()
 
       if (!addSequence(sequences, cmd.modelType, cmd.shockerId, cmd.type, cmd.intensity, cmd.transmitEnd)) {
         OS_LOGD(TAG, "[pin-%hhi] Failed to add sequence");
-      }
-    }
-
-    // Terminate all remaining sequences
-    bool isEstopped = OpenShock::EStopManager::IsEStopped();
-    if (isEstopped != wasEstopped) {
-      wasEstopped = isEstopped;
-
-      if (isEstopped) {
-        // Set all sequences to transmit their terminators
-        int64_t now = OpenShock::millis();
-        for (auto seq = sequences.begin(); seq != sequences.end(); ++seq) {
-          seq->setTransmitEnd(now);
-        }
       }
     }
 

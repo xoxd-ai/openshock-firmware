@@ -24,7 +24,8 @@ static int s_failures = 0;
     }                                                             \
   } while (0)
 
-// Every LocalToHubMessagePayload name at 1.5.2 (include/serialization/_fbs/LocalToHubMessage_generated.h).
+// Every LocalToHubMessagePayload name in the fork schema (include/serialization/_fbs/LocalToHubMessage_generated.h).
+// Upstream 1.5.2 also had SetEstopEnabledCommand and SetEstopPinCommand, removed by TIN-7125 858126ce.
 static const char* const kUpstreamPayloads[] = {
   "NONE",
   "WifiScanCommand",
@@ -44,8 +45,6 @@ static const char* const kUpstreamPayloads[] = {
   "AccountLinkCommand",
   "AccountUnlinkCommand",
   "SetRfTxPinCommand",
-  "SetEstopEnabledCommand",
-  "SetEstopPinCommand",
 };
 
 // SP-46 names these. Each must refuse on the port 81 socket.

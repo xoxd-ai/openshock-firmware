@@ -1,7 +1,7 @@
 // Host test of the real command paths: gateway, port 81 socket, serial and radio encoders. It links the firmware's
 // own dispatchers, `HandleCommand`, `SafetyCaps` and the encoders. test/native/stubs fakes the hardware edge and also
-// three pieces of firmware logic: `EStopManager`, `Config` and `CaptivePortal`, plus `RFTransmitter`. So nothing here
-// runs the radio task. test/native/test_radio_path.cpp runs it for real.
+// two pieces of firmware logic: `Config` and `CaptivePortal`, plus `RFTransmitter`. So nothing here runs the radio
+// task. test/native/test_radio_path.cpp runs it for real.
 // `softproxy-host-test.yml` runs it. Run it from the repository root after `pio pkg install -e Pishock-2023`:
 //
 //   FB=.pio/libdeps/Pishock-2023/flatbuffers/include
@@ -74,13 +74,6 @@ static std::vector<bool> s_alwaysOpen;  // Each `SetAlwaysEnabled` argument, in 
 static int s_socketFrames = 0;
 static int s_localHandlerRuns;
 
-bool EStopManager::IsEStopped()
-{
-  return false;
-}
-void EStopManager::Trigger()
-{
-}
 bool Config::GetRFConfig(Config::RFConfig& out)
 {
   out = {.txPin = s_configTxPin, .keepAliveEnabled = false};
@@ -104,11 +97,6 @@ bool Config::GetRFConfigKeepAliveEnabled(bool& out)
 }
 bool Config::SetRFConfigKeepAliveEnabled(bool)
 {
-  return true;
-}
-bool Config::GetEStop(Config::EStopConfig& out)
-{
-  out = {.enabled = false, .gpioPin = GPIO_NUM_NC};
   return true;
 }
 void CaptivePortal::SetAlwaysEnabled(bool alwaysEnabled)
@@ -145,8 +133,6 @@ FAKE_LOCAL_HANDLER(OtaUpdateCheckForUpdatesCommand)
 FAKE_LOCAL_HANDLER(OtaUpdateStartUpdateCommand)
 FAKE_LOCAL_HANDLER(AccountLinkCommand)
 FAKE_LOCAL_HANDLER(AccountUnlinkCommand)
-FAKE_LOCAL_HANDLER(SetEstopEnabledCommand)
-FAKE_LOCAL_HANDLER(SetEstopPinCommand)
 FAKE_LOCAL_HANDLER(InvalidMessage)
 
 namespace GatewayHandlers = OpenShock::MessageHandlers::Server::_Private;

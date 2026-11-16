@@ -6,7 +6,6 @@ const char* const TAG = "main";
 #include "CommandHandler.h"
 #include "Common.h"
 #include "config/Config.h"
-#include "estop/EStopManager.h"
 #include "events/Events.h"
 #include "GatewayConnectionManager.h"
 #include "Logging.h"
@@ -26,11 +25,6 @@ bool trySetup()
 {
   if (!OpenShock::VisualStateManager::Init()) {
     OS_LOGE(TAG, "Unable to initialize VisualStateManager");
-    return false;
-  }
-
-  if (!OpenShock::EStopManager::Init()) {
-    OS_LOGE(TAG, "Unable to initialize EStopManager");
     return false;
   }
 

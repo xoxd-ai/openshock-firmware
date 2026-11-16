@@ -3,7 +3,6 @@
 const char* const TAG = "ServerMessageHandlers";
 
 #include "captiveportal/Manager.h"
-#include "estop/EStopManager.h"
 #include "Logging.h"
 #include "softproxy/Lockout.h"
 
@@ -23,11 +22,6 @@ void _Private::HandleTrigger(const OpenShock::Serialization::Gateway::GatewayToH
     return;
   }
 
-  if (EStopManager::IsEStopped()) {
-    OS_LOGD(TAG, "Ignoring trigger command due to EmergencyStop being activated");
-    return;
-  }
-
   auto triggerType = msg->type();
 
   switch (triggerType) {
@@ -38,9 +32,6 @@ void _Private::HandleTrigger(const OpenShock::Serialization::Gateway::GatewayToH
         break;
       }
       esp_restart();
-      break;
-    case TriggerType::EmergencyStop:
-      EStopManager::Trigger();
       break;
     case TriggerType::CaptivePortalEnable:
       // Softproxy fork (SP-46): the gateway may not hold the portal open (softproxy/Lockout.h).

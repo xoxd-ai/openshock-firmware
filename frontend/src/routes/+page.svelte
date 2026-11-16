@@ -1,7 +1,6 @@
 <script lang="ts">
   import { SerializeAccountLinkCommand } from '$lib/Serializers/AccountLinkCommand';
   import { SerializeSetRfTxPinCommand } from '$lib/Serializers/SetRfTxPinCommand';
-  import { SerializeSetEstopPinCommand } from '$lib/Serializers/SetEstopPinCommand';
   import { WebSocketClient } from '$lib/WebSocketClient';
   import GpioPinSelector from '$lib/components/GpioPinSelector.svelte';
   import WiFiList from '$lib/components/WiFiList.svelte';
@@ -56,14 +55,6 @@
       name="RF TX Pin"
       currentPin={$HubStateStore.config?.rf?.txPin ?? null}
       serializer={SerializeSetRfTxPinCommand}
-    />
-
-    <!-- TODO: Add EStop Enable/Disable toggle -->
-
-    <GpioPinSelector
-      name="EStop Pin"
-      currentPin={$HubStateStore.config?.estop?.gpioPin ?? null}
-      serializer={SerializeSetEstopPinCommand}
     />
   </div>
 </div>

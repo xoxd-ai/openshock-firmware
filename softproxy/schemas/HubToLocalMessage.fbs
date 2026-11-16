@@ -1,0 +1,93 @@
+// xoxd-ai fork copy of OpenShock/flatbuffers-schemas HubToLocalMessage.fbs at commit aaceae189d7e8513091f52b8d5046c7c6da20b71 (the
+// schemas submodule pin), with the two E-Stop results removed by TIN-7125 858126ce (SOFTPROXY.md).
+// include/serialization/_fbs/HubToLocalMessage_generated.h carries the matching code. They were the last two union
+// members, so every other payload type keeps its number.
+
+include "./Types/WifiScanStatus.fbs";
+include "./Types/WifiNetwork.fbs";
+include "./Types/WifiNetworkEventType.fbs";
+include "./HubConfig.fbs";
+
+attribute "fs_serializer";
+
+namespace OpenShock.Serialization.Local;
+
+table ReadyMessage {
+  poggies:bool;
+  connected_wifi:Types.WifiNetwork;
+  account_linked:bool;
+
+  config:Configuration.HubConfig;
+  gpio_valid_inputs:[int8];
+  gpio_valid_outputs:[int8];
+}
+
+table ErrorMessage {
+  message:string;
+}
+
+table WifiScanStatusMessage {
+  status:Types.WifiScanStatus;
+}
+table WifiNetworkEvent {
+  event_type:Types.WifiNetworkEventType;
+  networks:[Types.WifiNetwork];
+}
+table WifiGotIpEvent {
+  ip:string;
+}
+table WifiLostIpEvent {
+  ip:string;
+}
+
+enum AccountLinkResultCode : uint8 {
+  Success = 0,
+  CodeRequired = 1,
+  InvalidCodeLength = 2,
+  NoInternetConnection = 3,
+  InvalidCode = 4,
+  RateLimited = 5,
+  InternalError = 6
+}
+
+table AccountLinkCommandResult {
+  result:AccountLinkResultCode;
+}
+
+enum SetGPIOResultCode : uint8 {
+  Success = 0,
+  InvalidPin = 1,
+  InternalError = 2
+}
+table SetRfTxPinCommandResult {
+  pin:int8;
+  result:SetGPIOResultCode;
+}
+
+union HubToLocalMessagePayload {
+
+  // General stuff
+  ReadyMessage,
+  ErrorMessage,
+
+  // Wifi stuff
+  WifiScanStatusMessage,
+  WifiNetworkEvent,
+  WifiGotIpEvent,
+  WifiLostIpEvent,
+
+  // Account linking stuff
+  AccountLinkCommandResult,
+
+  // RF transmitter stuff
+  SetRfTxPinCommandResult
+
+  // xoxd-ai fork: types 9 and 10 were SetEstopEnabledCommandResult and SetEstopPinCommandResult, removed by
+  // TIN-7125 858126ce. Never reuse them.
+}
+
+table HubToLocalMessage (fs_serializer) {
+  payload:HubToLocalMessagePayload;
+}
+
+root_type HubToLocalMessage;
