@@ -80,6 +80,10 @@ say "step 1/4: frontend (pnpm install --frozen-lockfile, pnpm run build)"
 (cd frontend && CI=true pnpm install --frozen-lockfile --strict-peer-dependencies && CI=true pnpm run build)
 
 say "step 2/4: static filesystem (pio run --target buildfs -e fs)"
+fixed_time_dir="$(mktemp -d "${TMPDIR:-/tmp}/openshock-fixed-time.XXXXXX")"
+gcc -shared -fPIC -O2 -nostdlib -fno-stack-protector -o "$fixed_time_dir/fixed_time.so" softproxy/just/fixed_time.c
+export SOFTPROXY_FIXED_TIME_SO="$fixed_time_dir/fixed_time.so"
+trap 'rm -rf "$fixed_time_dir"' EXIT
 rm -rf .pio/build/fs
 CI=true python -m platformio run --target buildfs -e fs
 
@@ -92,7 +96,7 @@ rm -rf "$out_dir"
 mkdir -p "$out_dir"
 out_dir="$(cd "$out_dir" && pwd)"
 stage="$(mktemp -d "${TMPDIR:-/tmp}/openshock-merge.XXXXXX")"
-trap 'rm -rf "$stage"' EXIT
+trap 'rm -rf "$stage" "$fixed_time_dir"' EXIT
 for p in scripts chips boards platformio.ini; do ln -s "$root/$p" "$stage/$p"; done
 cp ".pio/build/${env_name}/app.bin" ".pio/build/${env_name}/bootloader.bin" ".pio/build/${env_name}/partitions.bin" "$stage/"
 cp .pio/build/fs/littlefs.bin "$stage/staticfs.bin"
