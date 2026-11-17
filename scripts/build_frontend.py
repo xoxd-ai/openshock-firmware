@@ -26,7 +26,10 @@ def file_gzip(file_path, gzip_path):
     size_before = os.path.getsize(file_path)
     dir_ensure(os.path.dirname(gzip_path))
     file_delete(gzip_path)
-    with open(file_path, 'rb') as f_in, gzip.open(gzip_path, 'wb') as f_out:
+    # Softproxy fork (TIN-7545): SOURCE_DATE_EPOCH, when set, fixes the gzip header time, so the static filesystem
+    # of a rebuild is byte-identical. Unset, as in CI, the header holds the current time as before.
+    mtime = int(os.environ['SOURCE_DATE_EPOCH']) if os.environ.get('SOURCE_DATE_EPOCH') else None
+    with open(file_path, 'rb') as f_in, gzip.GzipFile(gzip_path, 'wb', mtime=mtime) as f_out:
         f_out.write(f_in.read())
     size_after = os.path.getsize(gzip_path)
     print(f'Gzipped {file_path}: {size_before} => {size_after} bytes')
