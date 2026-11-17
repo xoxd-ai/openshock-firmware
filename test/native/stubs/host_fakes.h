@@ -1,7 +1,7 @@
 #pragma once
 
 // Fakes for test/native/test_command_paths.cpp and test/native/test_radio_path.cpp. The firmware's own code compiles
-// against these on a host: every header in this directory forwards here. Fakes in both tests: the NVS store, the
+// against these on a host: every header in this directory forwards here. Fakes in both tests: the
 // mutexes, the `Config` store and the serial and socket transports. test_command_paths also fakes
 // `RFTransmitter`, as firmware logic, not hardware. With SOFTPROXY_RADIO_TEST set it is real, and test_radio_path.cpp
 // supplies FreeRTOS tasks and queues, RMT and events.
@@ -40,7 +40,6 @@ typedef void* QueueHandle_t;
 typedef void* TaskHandle_t;
 typedef int esp_err_t;
 typedef const char* esp_event_base_t;
-typedef uint32_t nvs_handle_t;
 typedef void (*TaskFunction_t)(void*);
 typedef unsigned int UBaseType_t;
 typedef int portMUX_TYPE;
@@ -52,10 +51,6 @@ enum eTaskState {
   eRunning,
   eDeleted,
 };
-enum nvs_open_mode_t {
-  NVS_READONLY,
-  NVS_READWRITE,
-};
 
 #define portMAX_DELAY         0xFFFFFFFFu
 #define pdMS_TO_TICKS(ms)     static_cast<TickType_t>(ms)
@@ -63,8 +58,6 @@ enum nvs_open_mode_t {
 #define pdPASS                1
 #define ESP_OK                0
 #define ESP_FAIL              -1
-#define ESP_ERR_NVS_NOT_FOUND 0x1102
-#define RTC_NOINIT_ATTR
 #define OPENSHOCK_GPIO_INVALID -1
 #ifndef OPENSHOCK_RF_TX_GPIO
 #define OPENSHOCK_RF_TX_GPIO 12
@@ -123,61 +116,6 @@ inline int xPortGetCoreID()
   return 0;
 }
 #endif
-
-// In-memory NVS: one blob, with injectable errors.
-struct FakeNvs {
-  bool present          = false;
-  esp_err_t openError   = ESP_OK;
-  esp_err_t readError   = ESP_OK;
-  esp_err_t eraseError  = ESP_OK;
-  esp_err_t commitError = ESP_OK;
-  std::vector<uint8_t> blob;
-};
-extern FakeNvs g_nvs;
-
-inline esp_err_t nvs_open(const char*, nvs_open_mode_t mode, nvs_handle_t* handle)
-{
-  *handle = 1;
-  if (g_nvs.openError != ESP_OK) {
-    return g_nvs.openError;
-  }
-  return mode == NVS_READONLY && !g_nvs.present ? ESP_ERR_NVS_NOT_FOUND : ESP_OK;
-}
-inline void nvs_close(nvs_handle_t)
-{
-}
-inline esp_err_t nvs_commit(nvs_handle_t)
-{
-  return g_nvs.commitError;
-}
-inline esp_err_t nvs_get_blob(nvs_handle_t, const char*, void* out, std::size_t* size)
-{
-  if (g_nvs.readError != ESP_OK) {
-    return g_nvs.readError;
-  }
-  if (!g_nvs.present) {
-    return ESP_ERR_NVS_NOT_FOUND;
-  }
-  std::memcpy(out, g_nvs.blob.data(), std::min(*size, g_nvs.blob.size()));
-  *size = g_nvs.blob.size();
-  return ESP_OK;
-}
-inline esp_err_t nvs_set_blob(nvs_handle_t, const char*, const void* in, std::size_t size)
-{
-  const uint8_t* bytes = static_cast<const uint8_t*>(in);
-  g_nvs.blob.assign(bytes, bytes + size);
-  g_nvs.present = true;
-  return ESP_OK;
-}
-inline esp_err_t nvs_erase_key(nvs_handle_t, const char*)
-{
-  if (g_nvs.eraseError != ESP_OK) {
-    return g_nvs.eraseError;
-  }
-  g_nvs.present = false;
-  g_nvs.blob.clear();
-  return ESP_OK;
-}
 
 // Logging keeps the last line, so a test can read what the firmware wrote.
 extern std::string g_lastLog;
@@ -267,16 +205,9 @@ namespace OpenShock {
     bool isLocked() const { return true; }
   };
   class ReadWriteMutex { };
-  // Runs once at the next read lock, so a scenario can let time pass where a real lock could wait (test_radio_path.cpp).
-  inline void (*g_onReadLock)() = nullptr;
   class ScopedReadLock {
   public:
-    ScopedReadLock(ReadWriteMutex*, TickType_t = portMAX_DELAY)
-    {
-      if (auto hook = std::exchange(g_onReadLock, nullptr)) {
-        hook();
-      }
-    }
+    ScopedReadLock(ReadWriteMutex*, TickType_t = portMAX_DELAY) { }
     bool unlock() { return true; }
   };
   class ScopedWriteLock {
@@ -450,7 +381,6 @@ namespace OpenShock {
     namespace CommandHandlers {
       CommandGroup RfTransmitHandler();
       CommandGroup RfTxPinHandler();
-      CommandGroup SafetyCapsHandler();
     }  // namespace CommandHandlers
   }  // namespace Serial
 }  // namespace OpenShock

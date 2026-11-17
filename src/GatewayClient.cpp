@@ -29,6 +29,12 @@ GatewayClient::GatewayClient(const std::string& authToken)
   m_webSocket.setUserAgent(OpenShock::Constants::FW_USERAGENT);
   m_webSocket.setExtraHeaders(headers.c_str());
   m_webSocket.onEvent(std::bind(&GatewayClient::_handleEvent, this, std::placeholders::_1, std::placeholders::_2, std::placeholders::_3));
+
+#ifdef OPENSHOCK_GATEWAY_PING_INTERVAL_MS
+  // Softproxy fork (TIN-7125): the hub sends a WebSocket ping at this interval, so a proxy in front of the gateway sees
+  // traffic before its idle timeout. Two missed pongs, 10 seconds each, drop the connection and the manager reconnects.
+  m_webSocket.enableHeartbeat(OPENSHOCK_GATEWAY_PING_INTERVAL_MS, 10'000, 2);
+#endif
 }
 GatewayClient::~GatewayClient()
 {

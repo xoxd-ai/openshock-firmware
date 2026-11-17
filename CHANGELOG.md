@@ -12,8 +12,13 @@ Fork changes on `feat/tin-7545-softproxy-caps` from the delta review of `11c3fe6
 - **Docs (D1, D2, D3, D5, C2, C3)** - `SOFTPROXY.md` drops the app-only write and marks the merged write as measured. It warns that writing `jsonconfig` output back stores empty Wi-Fi passwords, so the hub opens its no-password access point, and names `rftxpin` for the RF TX pin.
 - **Dose ruling (review 3 F2)** - `SOFTPROXY.md` records Jess's ruling on the dose, TIN-7125 `7f50c8e5` item 1, "Accept it as is": the hub bounds unbroken output and keeps no hourly on-time cap.
 
+### Gateway
+
+- **Softproxy as gateway (TIN-7125 `ac3567f4`)** - The `Pishock-2023` env builds with `OPENSHOCK_API_DOMAIN=softproxy-hub.clients.xoxd.ai` as its default domain and `OPENSHOCK_GATEWAY_PING_INTERVAL_MS=30000`, which makes `GatewayClient` send a WebSocket ping every 30 seconds. Serial `authtoken` sets the hub token. Server certificates are still not verified, as upstream, see `SOFTPROXY.md` TLS.
+
 ### Removed
 
+- **Caps and the gateway actuation lockout (TIN-7125 `cf8437c7`)** - Jess removed every software gate, the caps included. `SafetyCaps`, `CapLimiter`, `RefusalReport`, serial `safetycaps`, the admitted start, the `Pong` refusal fields and `kAllowGatewayActuation` are gone, with their host tests. Gateway Shock and Vibrate run as upstream. The OTA, gateway restart and captive portal lockouts, the local socket allow list and the port 81 message bound stay.
 - **E-Stop rules (TIN-7125 `858126ce`, `41d24ddc`)** - Jess removed the E-Stop work, since there is no physical E-Stop. The fork no longer refuses shock and vibrate without an armed E-Stop, no longer needs an engaged E-Stop to raise a cap, no longer refuses an RF TX pin on the E-Stop GPIO and no longer starts a cold boot engaged. The mushroom-up clear, the normally closed contact rule, the latch sources, the retained latch, the E-Stop config gate on the whole-config writers, their tests and the mutation run are gone. Upstream 1.5.2's own optional E-Stop is removed too: `EStopManager`, `EStopConfig`, serial `estop`, the port 81 E-Stop commands, `OPENSHOCK_ESTOP_PIN`, the E-Stop LED patterns and the frontend E-Stop pin selector. `HubConfig.estop` is deprecated in place, so a stored config still loads. The gateway `EmergencyStop` trigger is logged and ignored. The `safetycaps` reply drops its `SafetyCaps|estop|` line, the `Pong` field `softproxy_estop` is deprecated and refusal codes 10 and 11 are retired.
 
 

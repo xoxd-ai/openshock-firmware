@@ -1,42 +1,27 @@
 #pragma once
 
-// Remote and local paths that the xoxd-ai fork closes so nobody off the serial port can undo the Softproxy
-// caps (include/softproxy/CapLimiter.h). No Arduino or ESP-IDF dependency, so the host test
-// can check them.
-
-#include "ShockerCommandType.h"
+// Remote and local paths that the xoxd-ai fork closes, so the gateway cannot replace the firmware or reboot the hub and
+// the open captive portal cannot change its settings. Shock and vibrate from the gateway run as upstream (TIN-7125
+// cf8437c7). No Arduino or ESP-IDF dependency, so the host test can check them.
 
 #include <array>
 #include <cstddef>
 #include <string_view>
 
 namespace OpenShock::Softproxy {
-  /// The fork never installs firmware over the air. An upstream image carries no cap enforcement, so a
-  /// remote install would remove it. The gateway `OtaUpdateRequest`, the update check on startup or on a
-  /// timer and a changed CDN domain all stop before any download. Firmware changes only by a serial flash.
+  /// The fork never installs firmware over the air. A remote install would replace this image with one from the
+  /// upstream CDN. The gateway `OtaUpdateRequest`, the update check on startup or on a timer and a changed CDN domain
+  /// all stop before any download. Firmware changes only by a serial flash.
   constexpr bool kAllowOtaInstall = false;
 
-  /// The fork ignores the gateway `Restart` trigger. A restart is no longer a way to clear the counters,
-  /// since they survive a warm restart (`RetainedLimiters`), but the gateway has no need to reboot the hub.
-  /// The local serial `restart` command still works.
+  /// The fork ignores the gateway `Restart` trigger. The gateway has no need to reboot the hub. The local serial
+  /// `restart` command still works.
   constexpr bool kAllowGatewayRestart = false;
 
   /// The fork ignores the gateway `CaptivePortalEnable` trigger (Softproxy SP-46). The portal still opens
   /// while the gateway is unreachable, as upstream does, but the gateway can no longer hold it open.
   /// `CaptivePortalDisable` still works, since it only closes the portal.
   constexpr bool kAllowGatewayCaptivePortalEnable = false;
-
-  /// The fork refuses Shock and Vibrate that arrive from the gateway in a `ShockerCommandList` (review H3). The hub caps
-  /// would still apply, but none of Softproxy's server checks 4 to 8, so a linked account could actuate outside the
-  /// alarm service. Only the local serial port, where Softproxy's driver runs, actuates. A gateway Stop or Sound still
-  /// passes.
-  constexpr bool kAllowGatewayActuation = false;
-
-  /// Whether a command of this type from the gateway may reach `HandleCommand`.
-  constexpr bool GatewayCommandAllowed(ShockerCommandType type)
-  {
-    return kAllowGatewayActuation || (type != ShockerCommandType::Shock && type != ShockerCommandType::Vibrate);
-  }
 
   /// The fork keeps the portal closed when only the radio fails. Upstream opens it so a phone can fix the RF TX pin,
   /// but the local socket serves no command here, so the portal would add an open access point and no repair path.

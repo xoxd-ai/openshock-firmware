@@ -1,5 +1,5 @@
-// Host test of the radio path (TIN-7545). It links the real `HandleCommand`, `SafetyCaps`, `RFTransmitter` and its
-// encoders and the real `WebSocketDeFragger`. Fakes: RMT, the `Config` store, NVS, FreeRTOS, the number parser in
+// Host test of the radio path (TIN-7545). It links the real `HandleCommand`, `RFTransmitter` and its
+// encoders and the real `WebSocketDeFragger`. Fakes: RMT, the `Config` store, FreeRTOS, the number parser in
 // `Convert` and `Chipset`, whose pin checks accept 0 to 39 instead of the board's own unsafe and bypassed pins.
 //
 // The FreeRTOS fake runs each task on its own thread with one thread awake at a time, and `advance` steps every task
@@ -16,18 +16,16 @@
 //   FLAGS="-std=c++20 -O1 -pthread -DSOFTPROXY_RADIO_TEST -DOPENSHOCK_FW_CHIP_ESP32 -DOPENSHOCK_LED_GPIO=2"
 //   FLAGS="$FLAGS -DOPENSHOCK_RF_TX_GPIO=$TX"
 //   INC="-Itest/native/radio_stubs -Itest/native/stubs -Iinclude -I$FB"
-//   SRC="src/CommandHandler.cpp src/softproxy/SafetyCaps.cpp src/WebSocketDeFragger.cpp src/radio/RFTransmitter.cpp"
+//   SRC="src/CommandHandler.cpp src/WebSocketDeFragger.cpp src/radio/RFTransmitter.cpp"
 //   SRC="$SRC src/radio/rmt/Sequence.cpp src/radio/rmt/*Encoder.cpp"
 //   g++ $FLAGS $INC -Wl,--wrap=malloc test/native/test_radio_path.cpp $SRC -o radio_path_test && ./radio_path_test
 //
-// Every cap below is a synthetic test value chosen for the arithmetic. None is a body-safety value. The test has no
-// model of the receiver or of the board.
+// The test has no model of the receiver or of the board.
 
 #include "CommandHandler.h"
 #include "radio/RFTransmitter.h"
 #include "radio/rmt/Sequence.h"
 #include "softproxy/Lockout.h"
-#include "softproxy/SafetyCaps.h"
 #include "util/TaskUtils.h"
 #include "WebSocketDeFragger.h"
 
@@ -47,17 +45,15 @@
 
 using namespace OpenShock;
 using namespace OpenShock::Softproxy;
-using SafetyCaps::SetResult;
 
 // Fake state declared in host_fakes.h.
-FakeNvs g_nvs;
 std::string g_lastLog;
 std::string g_serialOut;
 esp_event_base_t OPENSHOCK_EVENTS = "fake";
 int g_restarts                    = 0;
 int g_panics                      = 0;
 namespace OpenShock {
-  int64_t g_nowMs = 1'000'000'000;  // Past every cold boot hold of the synthetic caps.
+  int64_t g_nowMs = 1'000'000'000;
   namespace Serialization::Local {
     std::string g_lastError;
   }
@@ -309,34 +305,10 @@ static int s_failures = 0;
 
 static const auto kModel = ShockerModelType::CaiXianlin;
 
-// Synthetic caps. `high` is above `low` in every field.
-static ChannelCaps lowCaps()
-{
-  ChannelCaps c {};
-  c.maxIntensityPct   = 10;
-  c.maxPulseMs        = 100;
-  c.maxPulsesPerStage = 1;
-  c.minGapSec         = 2;
-  c.maxPerHour        = 10;
-  c.maxPerDay         = 20;
-  return c;
-}
-static ChannelCaps highCaps()
-{
-  ChannelCaps c       = lowCaps();
-  c.maxIntensityPct   = 20;
-  c.maxPulseMs        = 2000;
-  c.maxPulsesPerStage = 2;
-  c.maxPerHour        = 20;
-  c.maxPerDay         = 40;
-  return c;
-}
-
-// The radio, started once. A later run reuses it with every cap cleared, 5 seconds on, past the gap of its last stage.
+// The radio, started once. A later run reuses it 5 seconds on, after the last command's terminator.
 static void hubWithRadio()
 {
   static bool started = false;
-  (void)SafetyCaps::Clear();
   if (!started) {
     CHECK(CommandHandler::Init());
     started = true;
@@ -444,89 +416,30 @@ static void allocationFailureDropsTheMessage()
   CHECK(tiny.size() == 200);
 }
 
-// Time on the air of one RMT frame, in microseconds: its items' durations at the RF task's 1000 ns tick (`kTickrateNs`
-// in src/radio/RFTransmitter.cpp, which the fake `rmtSetTick` keeps).
-static int64_t frameAirUs(const std::vector<uint32_t>& words)
+// A command through the real `HandleCommand` reaches the air through the real RF task: its payload frame repeats for the
+// command's duration and then stops.
+static void commandReachesTheAir()
 {
-  int64_t ticks = 0;
-  for (uint32_t word : words) {
-    rmt_data_t item;
-    item.val = word;
-    ticks += item.duration0 + item.duration1;
-  }
-  return ticks;
-}
+  hubWithRadio();
 
-static int64_t s_sendDelayMs = 0;
+  Rmt::Sequence expected(kModel, 7, 0);
+  CHECK(expected.fill(ShockerCommandType::Vibrate, 20));
+  const std::vector<uint32_t> payload(reinterpret_cast<const uint32_t*>(expected.payload()), reinterpret_cast<const uint32_t*>(expected.payload()) + expected.size());
 
-// Review 3 F1: the limiter counts a command from the instant `Admit` reads the clock, and the radio used to set the
-// command's end from its own clock in `SendCommand`. A delay between the two, here a wait at the transmitter lock, moved
-// the output past the interval the limiter counted, and with it past the run break the limiter saw. The radio now ends
-// the command at the admitted instant plus its duration. Two stages at the minimum gap, the first delayed: every payload
-// frame, at its real length, ends inside its own command's counted interval, and no unbroken stretch on the air passes
-// the ceiling.
-static void delayedSendStaysInsideItsCount()
-{
-  for (int64_t delayMs : {int64_t {50}, int64_t {1000}}) {
-    hubWithRadio();
-    ChannelCaps caps       = highCaps();
-    caps.maxPulseMs        = 1000;
-    caps.maxPulsesPerStage = 1;
-    CHECK(SafetyCaps::Set(ShockerCommandType::Vibrate, caps) == SetResult::Stored);
-    const int64_t ceilingMs = OnTimeCeilingMs(caps);
-    CHECK(ceilingMs == 1000 + kMaxRadioFrameMs);
+  const int64_t start = g_nowMs;
+  CHECK(CommandHandler::HandleCommand(kModel, 7, ShockerCommandType::Vibrate, 20, 1000));
+  advance(1500);
 
-    Rmt::Sequence expected(kModel, 7, 0);
-    CHECK(expected.fill(ShockerCommandType::Vibrate, 20));
-    const std::vector<uint32_t> payload(reinterpret_cast<const uint32_t*>(expected.payload()), reinterpret_cast<const uint32_t*>(expected.payload()) + expected.size());
-    CHECK(frameAirUs(payload) <= kMaxRadioFrameMs * 1000);
-
-    s_air.clear();
-    const int64_t first = g_nowMs;
-    s_sendDelayMs       = delayMs;
-
-    OpenShock::g_onReadLock = [] {
-      advance(s_sendDelayMs);
-    };
-    CHECK(CommandHandler::HandleCommand(kModel, 7, ShockerCommandType::Vibrate, 20, 1000));
-    CHECK(OpenShock::g_onReadLock == nullptr);
-    CHECK(g_nowMs == first + delayMs);
-
-    // The next stage at the 2 second gap, sent at once. The limiter sees a new run: it starts past the first command's
-    // counted end plus the 300 ms break.
-    advance(first + 2000 - g_nowMs);
-    const int64_t second = g_nowMs;
-    CHECK(second >= first + CountedOutputMs(1000) + kOutputRunBreakMs);
-    CHECK(CommandHandler::HandleCommand(kModel, 7, ShockerCommandType::Vibrate, 20, 1000));
-    advance(1500);
-
-    std::size_t frames     = 0;
-    int64_t stretchStartUs = 0;
-    int64_t stretchEndUs   = -1;
-    int64_t longestUs      = 0;
-    for (const auto& frame : s_air) {
-      if (frame.words != payload) {
-        continue;
-      }
+  std::size_t frames = 0;
+  int64_t lastMs     = 0;
+  for (const auto& frame : s_air) {
+    if (frame.words == payload) {
       ++frames;
-      const int64_t admitted = frame.atMs < second ? first : second;
-      const int64_t startUs  = frame.atMs * 1000;
-      const int64_t endUs    = startUs + frameAirUs(frame.words);
-      CHECK(frame.atMs >= admitted);
-      CHECK(endUs <= (admitted + CountedOutputMs(1000)) * 1000);
-      if (startUs > stretchEndUs) {
-        stretchStartUs = startUs;
-      }
-      stretchEndUs = std::max(stretchEndUs, endUs);
-      longestUs    = std::max(longestUs, stretchEndUs - stretchStartUs);
+      lastMs = frame.atMs;
     }
-    CHECK(frames > 100);
-    CHECK(longestUs <= ceilingMs * 1000);
-    if (longestUs > ceilingMs * 1000) {
-      std::printf("  delay %lld ms: unbroken output %lld us against a ceiling of %lld ms\n", static_cast<long long>(delayMs), static_cast<long long>(longestUs), static_cast<long long>(ceilingMs));
-    }
-    (void)SafetyCaps::Clear();
   }
+  CHECK(frames > 10);
+  CHECK(lastMs < start + 1000 + 100);
 }
 
 #define SCENARIO(name)                             \
@@ -547,7 +460,7 @@ int main()
   SCENARIO(fragmentStreamIsBounded);
   SCENARIO(fragmentBoundIsExact);
   SCENARIO(allocationFailureDropsTheMessage);
-  SCENARIO(delayedSendStaysInsideItsCount);
+  SCENARIO(commandReachesTheAir);
 
   if (s_failures != 0) {
     std::printf("%d check(s) failed\n", s_failures);
