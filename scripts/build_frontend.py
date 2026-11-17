@@ -26,7 +26,10 @@ def file_gzip(file_path, gzip_path):
     size_before = os.path.getsize(file_path)
     dir_ensure(os.path.dirname(gzip_path))
     file_delete(gzip_path)
-    with open(file_path, 'rb') as f_in, gzip.open(gzip_path, 'wb') as f_out:
+    # Softproxy fork (TIN-7545): SOURCE_DATE_EPOCH, when set, fixes the gzip header time, so the static filesystem
+    # of a rebuild is byte-identical. Unset, as in CI, the header holds the current time as before.
+    mtime = int(os.environ['SOURCE_DATE_EPOCH']) if os.environ.get('SOURCE_DATE_EPOCH') else None
+    with open(file_path, 'rb') as f_in, gzip.GzipFile(gzip_path, 'wb', mtime=mtime) as f_out:
         f_out.write(f_in.read())
     size_after = os.path.getsize(gzip_path)
     print(f'Gzipped {file_path}: {size_before} => {size_after} bytes')
@@ -105,6 +108,15 @@ def build_frontend(source, target, env):
         else:
             file_gzip(src_path, dst_path + '.gz')
 
+    # Softproxy fork (TIN-7545): mklittlefs stores each file's modification time in the image, so with
+    # SOURCE_DATE_EPOCH set every file and directory under data/www gets that time. Unset, as in CI, nothing changes.
+    if os.environ.get('SOURCE_DATE_EPOCH'):
+        epoch = int(os.environ['SOURCE_DATE_EPOCH'])
+        for root, dirs, files in os.walk('data/www'):
+            for name in dirs + files:
+                os.utime(os.path.join(root, name), (epoch, epoch))
+        os.utime('data/www', (epoch, epoch))
+
 
 def hash_file(filepath):
     md5 = hashlib.md5()
@@ -144,6 +156,12 @@ def process_littlefs_binary(source, target, env):
     print('SHA1:   ' + bin_hashes['SHA1'])
     print('SHA256: ' + bin_hashes['SHA256'])
 
+
+# Softproxy fork (TIN-7545): mklittlefs stamps the image's root directory with the current time. With
+# SOURCE_DATE_EPOCH and SOFTPROXY_FIXED_TIME_SO set (softproxy/just/build.sh), it runs through a wrapper that
+# fixes that stamp. Unset, as in CI, the platform's mklittlefs runs as before.
+if os.environ.get('SOURCE_DATE_EPOCH') and os.environ.get('SOFTPROXY_FIXED_TIME_SO') and env.get('MKFSTOOL') == 'mklittlefs':
+    env.Replace(MKFSTOOL=os.path.abspath('softproxy/just/mkfs-fixed-time.sh'))
 
 env.AddPreAction('$BUILD_DIR/littlefs.bin', build_frontend)
 env.AddPostAction('$BUILD_DIR/littlefs.bin', process_littlefs_binary)
