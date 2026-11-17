@@ -13,7 +13,6 @@ const char* const TAG = "CommandHandler";
 #include "radio/RFTransmitter.h"
 #include "ReadWriteMutex.h"
 #include "SimpleMutex.h"
-#include "softproxy/SafetyCaps.h"
 #include "util/TaskUtils.h"
 
 #include <freertos/queue.h>
@@ -162,11 +161,6 @@ bool CommandHandler::Init()
   }
   initialized = true;
 
-  // Load the Softproxy caps first. If they fail to load they stay 0, and shock and vibrate refuse.
-  if (!Softproxy::SafetyCaps::Init()) {
-    OS_LOGE(TAG, "Failed to load Softproxy caps, shock and vibrate commands will refuse");
-  }
-
   Config::RFConfig rfConfig;
   if (!Config::GetRFConfig(rfConfig)) {
     OS_LOGE(TAG, "Failed to get RF config");
@@ -270,14 +264,6 @@ gpio_num_t CommandHandler::GetRfTxPin()
 
 bool CommandHandler::HandleCommand(ShockerModelType model, uint16_t shockerId, ShockerCommandType type, uint8_t intensity, uint16_t durationMs)
 {
-  // Softproxy caps (ADR-0008 decision 6). Every shock and vibrate command passes here before the radio.
-  // Admit counts and logs each refusal (softproxy/RefusalReport.h).
-  int64_t admittedAtMs       = 0;
-  Softproxy::Verdict verdict = Softproxy::SafetyCaps::Admit(type, intensity, durationMs, admittedAtMs);
-  if (!Softproxy::Admitted(verdict)) {
-    return false;
-  }
-
   ScopedReadLock lock__rf(&s_rfTransmitterMutex);
 
   if (s_rfTransmitter == nullptr) {
@@ -285,9 +271,7 @@ bool CommandHandler::HandleCommand(ShockerModelType model, uint16_t shockerId, S
     return false;
   }
 
-  // The radio ends the command at the admitted instant plus its duration, the interval the cap limiter counted, however
-  // long the lock above or the queue took (review 3 F1).
-  bool ok = s_rfTransmitter->SendCommand(model, shockerId, type, intensity, durationMs, true, admittedAtMs);
+  bool ok = s_rfTransmitter->SendCommand(model, shockerId, type, intensity, durationMs);
 
   lock__rf.unlock();
   ScopedReadLock lock__ka(&s_keepAliveMutex);

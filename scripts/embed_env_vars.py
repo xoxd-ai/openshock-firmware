@@ -226,6 +226,13 @@ if 'OPENSHOCK_FW_VERSION' not in cpp_defines:
     cpp_defines['OPENSHOCK_FW_VERSION'] = version
 
 
+# Softproxy fork (TIN-7125): SOFTPROXY_FW_BUILD_TAG, set per env in platformio.ini, joins the version's build
+# metadata, so the gateway can read from BootStatus and Firmware-Version what this image does.
+softproxy_build_tag = cpp_defines.pop('SOFTPROXY_FW_BUILD_TAG', None)
+if softproxy_build_tag:
+    fw_version = str(cpp_defines['OPENSHOCK_FW_VERSION'])
+    cpp_defines['OPENSHOCK_FW_VERSION'] = fw_version + ('.' if '+' in fw_version else '+') + str(softproxy_build_tag)
+
 version_major, version_minor, version_patch, version_prerelease, version_build = split_semver(
     cpp_defines['OPENSHOCK_FW_VERSION']
 )

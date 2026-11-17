@@ -7,7 +7,6 @@ const char* const TAG = "WSGateway";
 #include "config/Config.h"
 #include "Core.h"
 #include "Logging.h"
-#include "softproxy/SafetyCaps.h"
 
 #ifndef OPENSHOCK_FW_VERSION_MAJOR
 #define OPENSHOCK_FW_VERSION_MAJOR 0
@@ -44,10 +43,7 @@ bool Gateway::SerializePongMessage(Common::SerializationCallbackFn callback)
 
   flatbuffers::FlatBufferBuilder builder(64);
 
-  // Softproxy fork: the heartbeat carries the refusals since boot (softproxy/RefusalReport.h).
-  auto refusals = OpenShock::Softproxy::SafetyCaps::GetRefusals();
-
-  auto pong = Gateway::CreatePong(builder, static_cast<uint64_t>(uptime), static_cast<int32_t>(rssi), refusals.count, refusals.lastCode);
+  auto pong = Gateway::CreatePong(builder, static_cast<uint64_t>(uptime), static_cast<int32_t>(rssi));
 
   auto msg = Gateway::CreateHubToGatewayMessage(builder, Gateway::HubToGatewayMessagePayload::Pong, pong.Union());
 

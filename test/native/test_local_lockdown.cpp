@@ -1,15 +1,14 @@
-// Host test for the SP-46 local lockdown (include/softproxy/Lockout.h) and the cap refusal report
-// (include/softproxy/RefusalReport.h). It needs no board and no PlatformIO:
+// Host test for the SP-46 local lockdown and the gateway lockouts (include/softproxy/Lockout.h) and the pinned gateway
+// roots (include/softproxy/GatewayRoots.h). It needs no board and no PlatformIO. Run it from the repository root:
 //
 //   g++ -std=c++20 -Wall -Wextra -Werror -Iinclude test/native/test_local_lockdown.cpp -o local_lockdown_test && ./local_lockdown_test
 
-#include "softproxy/CapLimiter.h"
+#include "softproxy/GatewayRoots.h"
 #include "softproxy/Lockout.h"
-#include "softproxy/RefusalReport.h"
 
-#include <cstdint>
 #include <cstdio>
-#include <cstring>
+#include <fstream>
+#include <iterator>
 #include <string>
 
 using namespace OpenShock::Softproxy;
@@ -101,85 +100,32 @@ static void gatewayLockouts()
   static_assert(!kAllowGatewayRestart, "the fork ignores the gateway restart trigger");
   static_assert(!LocalSocketAllows("WifiScanCommand"), "the allow list is usable at compile time");
   static_assert(!LocalSocketAllows("SetRfTxPinCommand"), "SPR-75: the RF TX pin is serial only");
+  static_assert(!kOpenPortalOnRadioFailure, "the portal stays closed when only the radio fails");
+  static_assert(kLocalSocketMaxMessageBytes == 4096, "the port 81 message bound is the verifier limit");
 }
 
-static void reportStartsEmpty()
+// Each pinned root is a whole block of certificates/cacert.pem, byte for byte, and there are exactly three.
+static void gatewayRootsComeFromTheBundle()
 {
-  RefusalReport r;
-  RefusalSnapshot s = r.Snapshot();
-  CHECK(s.count == 0);
-  CHECK(s.lastCode == 0);
-  CHECK(std::strcmp(RefusalCodeName(s.lastCode), "none") == 0);
-}
+  std::ifstream in("certificates/cacert.pem");
+  const std::string bundle((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+  CHECK(!bundle.empty());
 
-static void reportIgnoresAdmitted()
-{
-  RefusalReport r;
-  CHECK(r.Record(Verdict::Allow) == 0);
-  CHECK(r.Record(Verdict::NotCapped) == 0);
-  RefusalSnapshot s = r.Snapshot();
-  CHECK(s.count == 0);
-  CHECK(s.lastCode == 0);
-}
-
-static void reportCountsEachRefusal()
-{
-  const Verdict refusals[] = {Verdict::CapsNotSet, Verdict::BootHold, Verdict::OverIntensity, Verdict::OverPulseMs, Verdict::OverPulses, Verdict::Gap, Verdict::Hourly, Verdict::Daily, Verdict::OverOnTime};
-
-  RefusalReport r;
-  uint32_t expected = 0;
-  for (Verdict v : refusals) {
-    ++expected;
-    CHECK(r.Record(v) == expected);
-    RefusalSnapshot s = r.Snapshot();
-    CHECK(s.count == expected);
-    CHECK(s.lastCode == static_cast<uint8_t>(v));
-    CHECK(std::strcmp(RefusalCodeName(s.lastCode), VerdictName(v)) == 0);
-
-    // An admitted command between two refusals changes nothing.
-    CHECK(r.Record(Verdict::Allow) == 0);
-    CHECK(r.Snapshot().count == expected);
-    CHECK(r.Snapshot().lastCode == static_cast<uint8_t>(v));
+  const std::string pinned(kGatewayRootsPem);
+  const std::string begin = "-----BEGIN CERTIFICATE-----\n";
+  const std::string end   = "-----END CERTIFICATE-----\n";
+  int blocks              = 0;
+  for (std::size_t at = pinned.find(begin); at != std::string::npos; at = pinned.find(begin, at + 1)) {
+    const std::size_t stop = pinned.find(end, at);
+    CHECK(stop != std::string::npos);
+    if (stop == std::string::npos) {
+      break;
+    }
+    const std::string block = pinned.substr(at, stop + end.size() - at);
+    CHECK(bundle.find(block) != std::string::npos);
+    ++blocks;
   }
-}
-
-static void reportSaturates()
-{
-  RefusalReport r;
-  for (uint32_t i = 0; i < RefusalReport::kMaxCount; ++i) {
-    r.Record(Verdict::Gap);
-  }
-  CHECK(r.Snapshot().count == RefusalReport::kMaxCount);
-  CHECK(r.Record(Verdict::Daily) == RefusalReport::kMaxCount);
-  RefusalSnapshot s = r.Snapshot();
-  CHECK(s.count == RefusalReport::kMaxCount);
-  CHECK(s.lastCode == static_cast<uint8_t>(Verdict::Daily));
-}
-
-static void wireCodeNames()
-{
-  CHECK(std::strcmp(RefusalCodeName(0), "none") == 0);
-  CHECK(std::strcmp(RefusalCodeName(2), "caps-not-set") == 0);
-  CHECK(std::strcmp(RefusalCodeName(9), "daily") == 0);
-  CHECK(std::strcmp(RefusalCodeName(12), "over-on-time") == 0);
-  CHECK(std::strcmp(RefusalCodeName(13), "unknown") == 0);
-  CHECK(std::strcmp(RefusalCodeName(255), "unknown") == 0);
-}
-
-static void logLine()
-{
-  char line[kRefusalLineSize];
-  int n = FormatRefusalLine(line, sizeof(line), 7, "shock", Verdict::Gap);
-  CHECK(n > 0);
-  CHECK(std::string(line) == "softproxy-refusal seq=7 channel=shock verdict=gap");
-
-  FormatRefusalLine(line, sizeof(line), 1, nullptr, Verdict::Daily);
-  CHECK(std::string(line) == "softproxy-refusal seq=1 channel=unknown verdict=daily");
-
-  // The longest line fits the buffer without truncation.
-  n = FormatRefusalLine(line, sizeof(line), RefusalReport::kMaxCount, "vibrate", Verdict::OverIntensity);
-  CHECK(n > 0 && static_cast<std::size_t>(n) < kRefusalLineSize);
-  CHECK(std::string(line) == "softproxy-refusal seq=16777215 channel=vibrate verdict=over-intensity");
+  CHECK(blocks == 3);
 }
 
 int main()
@@ -188,17 +134,12 @@ int main()
   localSocketAllowsNothing();
   localSocketFailsClosed();
   gatewayLockouts();
-  reportStartsEmpty();
-  reportIgnoresAdmitted();
-  reportCountsEachRefusal();
-  reportSaturates();
-  wireCodeNames();
-  logLine();
+  gatewayRootsComeFromTheBundle();
 
   if (s_failures != 0) {
     std::printf("%d check(s) failed\n", s_failures);
     return 1;
   }
-  std::printf("local lockdown and refusal report: all checks passed\n");
+  std::printf("local lockdown: all checks passed\n");
   return 0;
 }

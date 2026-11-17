@@ -5,7 +5,6 @@ const char* const TAG = "ServerMessageHandlers";
 #include "CommandHandler.h"
 #include "Logging.h"
 #include "ShockerModelType.h"
-#include "softproxy/Lockout.h"
 
 #include <cstdint>
 
@@ -78,12 +77,6 @@ void _Private::HandleShockerCommandList(const OpenShock::Serialization::Gateway:
       default:
         OS_LOGE(TAG, "Unsupported command type: %s", OpenShock::Serialization::Types::EnumNameShockerCommandType(fbsCommandType));
         continue;
-    }
-
-    // Softproxy review H3: only the serial port actuates. The gateway emergency stop is a `Trigger` and stays.
-    if (!OpenShock::Softproxy::GatewayCommandAllowed(commandType)) {
-      OS_LOGW(TAG, "Refusing gateway %s, only the serial port may actuate", OpenShock::Serialization::Types::EnumNameShockerCommandType(fbsCommandType));
-      continue;
     }
 
     if (!OpenShock::CommandHandler::HandleCommand(model, id, commandType, intensity, durationMs)) {

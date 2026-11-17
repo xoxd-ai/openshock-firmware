@@ -1,18 +1,16 @@
 // Host test of the real command paths: gateway, port 81 socket, serial and radio encoders. It links the firmware's
-// own dispatchers, `HandleCommand`, `SafetyCaps` and the encoders. test/native/stubs fakes the hardware edge and also
+// own dispatchers, `HandleCommand` and the encoders. test/native/stubs fakes the hardware edge and also
 // two pieces of firmware logic: `Config` and `CaptivePortal`, plus `RFTransmitter`. So nothing here runs the radio
 // task. test/native/test_radio_path.cpp runs it for real.
 // `softproxy-host-test.yml` runs it. Run it from the repository root after `pio pkg install -e Pishock-2023`:
 //
 //   FB=.pio/libdeps/Pishock-2023/flatbuffers/include
 //   WS=src/message_handlers/websocket
-//   SRC="src/CommandHandler.cpp src/softproxy/SafetyCaps.cpp $WS/Local.cpp $WS/Gateway.cpp"
+//   SRC="src/CommandHandler.cpp $WS/Local.cpp $WS/Gateway.cpp"
 //   SRC="$SRC $WS/gateway/ShockerCommandList.cpp $WS/gateway/Trigger.cpp $WS/local/SetRfTxPinCommand.cpp"
 //   SRC="$SRC src/serial/command_handlers/rftransmit.cpp src/serial/command_handlers/rftxpin.cpp src/radio/rmt/*Encoder.cpp"
 //   g++ -std=c++20 -O1 -Itest/native/stubs -Iinclude -I"$FB" test/native/test_command_paths.cpp $SRC -o command_paths_test
 //   ./command_paths_test
-//
-// Every cap below is a synthetic test value chosen for the arithmetic. None is a body-safety value.
 
 #include "CommandHandler.h"
 #include "host_fakes.h"
@@ -24,7 +22,6 @@
 #include "radio/rmt/Petrainer998DREncoder.h"
 #include "radio/rmt/PetrainerEncoder.h"
 #include "radio/rmt/T330Encoder.h"
-#include "softproxy/SafetyCaps.h"
 
 #include "serialization/_fbs/LocalToHubMessage_generated.h"
 
@@ -43,14 +40,12 @@
 #include <vector>
 
 using namespace OpenShock;
-using namespace OpenShock::Softproxy;
 
 namespace GatewaySchema = OpenShock::Serialization::Gateway;
 namespace LocalSchema   = OpenShock::Serialization::Local;
 namespace TypesSchema   = OpenShock::Serialization::Types;
 
 // Fake state declared in host_fakes.h.
-FakeNvs g_nvs;
 std::string g_lastLog;
 std::string g_serialOut;
 esp_event_base_t OPENSHOCK_EVENTS = "fake";
@@ -162,41 +157,6 @@ static int s_failures = 0;
     }                                                               \
   } while (0)
 
-static const int64_t kDayMs = 86'400'000;
-
-// A hub clock past every cold boot hold the fixtures produce.
-static const int64_t kWarmMs = 2 * kDayMs;
-
-// Synthetic caps: 10 percent, 100 ms, 1 pulse, 1 s gap, 3 per hour, 5 per day.
-static ChannelCaps fixture()
-{
-  return ChannelCaps {.maxIntensityPct = 10, .maxPulseMs = 100, .maxPulsesPerStage = 1, .minGapSec = 1, .maxPerHour = 3, .maxPerDay = 5, .stageJoinMs = 0};
-}
-
-// The layout of `StoredRecord` in src/softproxy/SafetyCaps.cpp, so a test can plant a bad record.
-struct PlantedRecord {
-  uint32_t magic;
-  uint16_t version;
-  uint16_t size;
-  ChannelCaps shock;
-  ChannelCaps vibrate;
-};
-
-static void plantRecord(const ChannelCaps& shock, const ChannelCaps& vibrate, uint32_t magic = 0x53504341, uint16_t version = 1)
-{
-  PlantedRecord record;
-  std::memset(&record, 0, sizeof(record));
-  record.magic   = magic;
-  record.version = version;
-  record.size    = sizeof(record);
-  record.shock   = shock;
-  record.vibrate = vibrate;
-
-  const uint8_t* bytes = reinterpret_cast<const uint8_t*>(&record);
-  g_nvs.blob.assign(bytes, bytes + sizeof(record));
-  g_nvs.present = true;
-}
-
 static TypesSchema::ShockerModelType toFbs(ShockerModelType model)
 {
   switch (model) {
@@ -279,271 +239,9 @@ static void bootHub()
   CHECK(CommandHandler::Init());
 }
 
-static const ShockerCommandType kCapped[]      = {ShockerCommandType::Shock, ShockerCommandType::Vibrate};
-static const uint16_t kDurations[]             = {0, 1, 2, 99, 100, 101, 300, 1000, 30'000, 65'535};
-static const uint16_t kIds[]                   = {0, 1, 12'345, 65'535};
+static const uint16_t kIds[] = {0, 1, 12'345, 65'535};
 static const ShockerModelType kGatewayModels[] = {ShockerModelType::CaiXianlin, ShockerModelType::Petrainer, ShockerModelType::Petrainer998DR, ShockerModelType::WellturnT330};
 static const ShockerModelType kSerialModels[]  = {ShockerModelType::CaiXianlin, ShockerModelType::Petrainer, ShockerModelType::Petrainer998DR, ShockerModelType::WellturnT330, ShockerModelType::D80};
-
-// Every shock and vibrate command, on the gateway and serial paths and at `HandleCommand`, reaches no radio.
-static void refusesEveryCommandOnEveryPath()
-{
-  const std::size_t radioBefore = g_radio.size();
-
-  for (ShockerCommandType type : kCapped) {
-    for (int intensity = 0; intensity <= 255; ++intensity) {
-      const uint8_t i = static_cast<uint8_t>(intensity);
-      for (uint16_t durationMs : kDurations) {
-        for (uint16_t id : kIds) {
-          for (ShockerModelType model : kGatewayModels) {
-            sendGateway(model, id, type, i, durationMs);
-          }
-          for (ShockerModelType model : kSerialModels) {
-            sendSerial(model, id, type, i, durationMs);
-            CHECK(!CommandHandler::HandleCommand(model, id, type, i, durationMs));
-          }
-        }
-      }
-    }
-  }
-
-  CHECK(g_radio.size() == radioBefore);
-}
-
-static void zeroCapsAtBoot()
-{
-  bootHub();
-  for (int64_t now : {int64_t {0}, int64_t {1}, kDayMs, kWarmMs}) {
-    g_nowMs = now;
-    refusesEveryCommandOnEveryPath();
-  }
-
-  RefusalSnapshot refusals = SafetyCaps::GetRefusals();
-  CHECK(refusals.count > 0);
-  CHECK(refusals.lastCode == static_cast<uint8_t>(Verdict::CapsNotSet));
-  CHECK(g_serialOut.find("Failed to send command") != std::string::npos);
-  CHECK(g_serialOut.find("Command sent") == std::string::npos);
-}
-
-// Each single cap at 0 in a stored record refuses that channel, on either channel.
-static void storedRecord(int channel, int field)
-{
-  ChannelCaps bad = fixture();
-  switch (field) {
-    case 0:
-      bad.maxIntensityPct = 0;
-      break;
-    case 1:
-      bad.maxPulseMs = 0;
-      break;
-    case 2:
-      bad.maxPulsesPerStage = 0;
-      break;
-    case 3:
-      bad.minGapSec = 0;
-      break;
-    case 4:
-      bad.maxPerHour = 0;
-      break;
-    default:
-      bad.maxPerDay = 0;
-      break;
-  }
-  plantRecord(channel == 0 ? bad : ChannelCaps {}, channel == 0 ? ChannelCaps {} : bad);
-  bootHub();
-  g_nowMs = kWarmMs;
-  refusesEveryCommandOnEveryPath();
-}
-
-static void incoherentStoredCaps()
-{
-  ChannelCaps overHundred     = fixture();
-  overHundred.maxIntensityPct = 101;
-  plantRecord(overHundred, overHundred);
-  bootHub();
-  g_nowMs = kWarmMs;
-  refusesEveryCommandOnEveryPath();
-}
-
-static void unknownStoredLayout()
-{
-  plantRecord(fixture(), fixture(), 0x12345678);
-  bootHub();
-  g_nowMs = kWarmMs;
-  refusesEveryCommandOnEveryPath();
-}
-
-static void otherStoredVersion()
-{
-  plantRecord(fixture(), fixture(), 0x53504341, 2);
-  bootHub();
-  g_nowMs = kWarmMs;
-  refusesEveryCommandOnEveryPath();
-}
-
-static void truncatedStoredRecord()
-{
-  plantRecord(fixture(), fixture());
-  g_nvs.blob.resize(g_nvs.blob.size() - 1);
-  bootHub();
-  g_nowMs = kWarmMs;
-  refusesEveryCommandOnEveryPath();
-}
-
-static void storageOpenFails()
-{
-  plantRecord(fixture(), fixture());
-  g_nvs.openError = ESP_FAIL;
-  bootHub();
-  g_nowMs = kWarmMs;
-  refusesEveryCommandOnEveryPath();
-}
-
-static void storageReadFails()
-{
-  plantRecord(fixture(), fixture());
-  g_nvs.readError = ESP_FAIL;
-  bootHub();
-  g_nowMs = kWarmMs;
-  refusesEveryCommandOnEveryPath();
-}
-
-// The positive control: the same path does reach the radio, so a refusal above comes from the caps and the harness
-// is able to see a send.
-static void withinCapsReachesRadio()
-{
-  plantRecord(fixture(), fixture());
-  bootHub();
-  g_nowMs = kWarmMs;
-
-  CHECK(CommandHandler::HandleCommand(ShockerModelType::CaiXianlin, 7, ShockerCommandType::Vibrate, 10, 100));
-  CHECK(g_radio.size() == 1);
-  CHECK(g_radio.back().type == ShockerCommandType::Vibrate);
-  CHECK(g_radio.back().intensity == 10);
-  CHECK(g_radio.back().durationMs == 100);
-
-  g_nowMs += 1000;
-  sendSerial(ShockerModelType::CaiXianlin, 7, ShockerCommandType::Shock, 10, 100);
-  CHECK(g_radio.size() == 2);
-  CHECK(g_radio.back().type == ShockerCommandType::Shock);
-
-  g_nowMs += 1000;
-  sendSerial(ShockerModelType::CaiXianlin, 7, ShockerCommandType::Vibrate, 10, 100);
-  CHECK(g_radio.size() == 3);
-
-  // One over the caps on each path, past the gap, refuses.
-  g_nowMs += 1000;
-  sendGateway(ShockerModelType::CaiXianlin, 7, ShockerCommandType::Shock, 11, 100);
-  sendGateway(ShockerModelType::CaiXianlin, 7, ShockerCommandType::Shock, 10, 101);
-  sendSerial(ShockerModelType::CaiXianlin, 7, ShockerCommandType::Shock, 11, 100);
-  sendSerial(ShockerModelType::CaiXianlin, 7, ShockerCommandType::Vibrate, 10, 101);
-  CHECK(g_radio.size() == 3);
-}
-
-// The bench state after a vibrate calibration: the vibrate channel set and every shock cap still 0.
-static void vibrateSetLeavesShockRefused()
-{
-  plantRecord(ChannelCaps {}, fixture());
-  bootHub();
-  g_nowMs = kWarmMs;
-
-  sendSerial(ShockerModelType::CaiXianlin, 7, ShockerCommandType::Vibrate, 10, 100);
-  CHECK(g_radio.size() == 1);
-
-  const std::size_t sent = g_radio.size();
-  for (int intensity = 0; intensity <= 255; ++intensity) {
-    for (uint16_t durationMs : kDurations) {
-      g_nowMs += 1000;
-      sendGateway(ShockerModelType::CaiXianlin, 7, ShockerCommandType::Shock, static_cast<uint8_t>(intensity), durationMs);
-      sendSerial(ShockerModelType::CaiXianlin, 7, ShockerCommandType::Shock, static_cast<uint8_t>(intensity), durationMs);
-    }
-  }
-  CHECK(g_radio.size() == sent);
-}
-
-static void clearRefusesAgain()
-{
-  plantRecord(fixture(), fixture());
-  bootHub();
-  g_nowMs = kWarmMs;
-  CHECK(CommandHandler::HandleCommand(ShockerModelType::CaiXianlin, 7, ShockerCommandType::Vibrate, 10, 100));
-  CHECK(g_radio.size() == 1);
-
-  CHECK(SafetyCaps::Clear());
-  g_radio.clear();
-  g_nowMs += kDayMs;
-  refusesEveryCommandOnEveryPath();
-}
-
-// A hub just past power-on holds even with valid caps: the cold boot hold of the fixture is 86400 s / 5.
-static void coldBootHolds()
-{
-  plantRecord(fixture(), fixture());
-  bootHub();
-  g_nowMs = ColdBootHoldMs(fixture()) - 1;
-  CHECK(!CommandHandler::HandleCommand(ShockerModelType::CaiXianlin, 7, ShockerCommandType::Vibrate, 10, 100));
-  CHECK(SafetyCaps::GetRefusals().lastCode == static_cast<uint8_t>(Verdict::BootHold));
-  CHECK(g_radio.empty());
-
-  g_nowMs += 1;
-  CHECK(CommandHandler::HandleCommand(ShockerModelType::CaiXianlin, 7, ShockerCommandType::Vibrate, 10, 100));
-  CHECK(g_radio.size() == 1);
-}
-
-// Review H1 through the real `HandleCommand` and serial `rftransmit`: pulses as long as the gap, one stage apart, abut,
-// so the second would join the first on the radio. It refuses as `over-on-time`, wire code 12, and never reaches the
-// radio. The run's output counts one radio frame past each command's end (review N2), and once the output has stayed
-// off for the 300 ms terminator after that a new run starts.
-static void onTimeCeilingRefusesAJoinedPulse()
-{
-  ChannelCaps abutting  = fixture();
-  abutting.maxPulseMs   = 1000;  // equal to the 1 s gap, the most the coherence rule allows
-  abutting.maxPerHour   = 3;
-  abutting.maxPerDay    = 5;
-  CHECK(CapsCoherent(abutting));
-  plantRecord(abutting, abutting);
-  bootHub();
-  g_nowMs = kWarmMs;
-
-  CHECK(CommandHandler::HandleCommand(ShockerModelType::CaiXianlin, 7, ShockerCommandType::Shock, 10, 1000));
-  CHECK(g_radio.size() == 1);
-
-  g_nowMs += 1000;
-  CHECK(!CommandHandler::HandleCommand(ShockerModelType::CaiXianlin, 7, ShockerCommandType::Shock, 10, 1000));
-  CHECK(SafetyCaps::GetRefusals().lastCode == 12);
-  CHECK(g_lastLog.find("verdict=over-on-time") != std::string::npos);
-  g_nowMs += kMaxRadioFrameMs + kOutputRunBreakMs - 1;
-  sendSerial(ShockerModelType::CaiXianlin, 7, ShockerCommandType::Shock, 10, 1000);
-  CHECK(g_radio.size() == 1);
-
-  g_nowMs += 1;
-  sendSerial(ShockerModelType::CaiXianlin, 7, ShockerCommandType::Shock, 10, 1000);
-  CHECK(g_radio.size() == 2);
-}
-
-// The run break in CapLimiter.h is the RF task's terminator time. The constant there is file-local, so read it.
-static void runBreakIsTheTerminator()
-{
-  std::ifstream in("src/radio/RFTransmitter.cpp");
-  const std::string source((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
-  std::smatch match;
-  CHECK(std::regex_search(source, match, std::regex(R"(const int64_t kTerminatorDurationMs\s*=\s*(\d+);)")));
-  CHECK(match.size() == 2 && std::stoll(match[1].str()) == kOutputRunBreakMs);
-}
-
-// Stop, Sound and Light carry no cap, so they pass at every cap 0, and the radio gets exactly what was asked.
-// `uncappedTypesNeverEncodeAsShock` covers what those types become on the air.
-static void uncappedTypesPassAtZeroCaps()
-{
-  bootHub();
-  g_nowMs = kWarmMs;
-
-  CHECK(CommandHandler::HandleCommand(ShockerModelType::CaiXianlin, 7, ShockerCommandType::Stop, 0, 0));
-  CHECK(CommandHandler::HandleCommand(ShockerModelType::CaiXianlin, 7, ShockerCommandType::Sound, 0, 300));
-  CHECK(CommandHandler::HandleCommand(ShockerModelType::CaiXianlin, 7, ShockerCommandType::Light, 0, 300));
-  CHECK(g_radio.size() == 3);
-  CHECK(SafetyCaps::GetRefusals().count == 0);
-}
 
 template<typename Fill>
 static std::vector<uint32_t> encode(std::size_t size, Fill fill, bool& ok)
@@ -579,10 +277,9 @@ static std::vector<Encoder> encoders()
   };
 }
 
-// `SafetyCaps::Admit` answers `NotCapped` for anything but Shock and Vibrate, so the encoders are what stands
-// between such a type and the air. Each must refuse a type it does not know, and Sound and Light must differ from
-// Shock and Vibrate at the same id and intensity.
-static void uncappedTypesNeverEncodeAsShock()
+// Each encoder must refuse a type it does not know, and Sound and Light must differ from Shock and Vibrate at the same
+// id and intensity.
+static void soundAndLightNeverEncodeAsShock()
 {
   for (const Encoder& e : encoders()) {
     for (int raw = 0; raw <= 255; ++raw) {
@@ -610,63 +307,11 @@ static void uncappedTypesNeverEncodeAsShock()
         bool ok    = false;
         auto words = encode(e.size, [&](rmt_data_t* s) { return e.fill(s, 7, type, i); }, ok);
         if (ok && (words == shock || words == vibrate)) {
-          std::printf("FAIL %s:%d: %s encodes an uncapped type as a capped one\n", __FILE__, __LINE__, e.name);
+          std::printf("FAIL %s:%d: %s encodes Sound or Light as Shock or Vibrate\n", __FILE__, __LINE__, e.name);
           ++s_failures;
         }
       }
     }
-  }
-}
-
-// Review N2: `kMaxRadioFrameMs` in CapLimiter.h is the longest frame any encoder can send, rounded up to whole ms. For
-// each model, every item position takes the longest value it shows over ids 0, 0xFFFF and each single bit, every type
-// and intensities 0 to 255, which sets each id, type and intensity bit both ways. An item is a one or a zero, so the sum
-// bounds every frame that model can send. The RF task's tick, read from its source since the constant is file-local,
-// turns ticks into time. The constant must equal the largest bound rounded up, so an encoder or tick change that
-// lengthens a frame fails here, and so does one that shortens the longest.
-static void maxRadioFrameCoversEveryEncoder()
-{
-  std::ifstream in("src/radio/RFTransmitter.cpp");
-  const std::string source((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
-  std::smatch match;
-  CHECK(std::regex_search(source, match, std::regex(R"(const float kTickrateNs\s*=\s*(\d+);)")));
-  const int64_t tickNs = match.size() == 2 ? std::stoll(match[1].str()) : 0;
-  CHECK(tickNs == 1000);
-
-  std::vector<uint16_t> ids = {0, 0xFFFF};
-  for (int bit = 0; bit < 16; ++bit) {
-    ids.push_back(static_cast<uint16_t>(1u << bit));
-  }
-  int64_t longestNs = 0;
-  for (const Encoder& e : encoders()) {
-    std::vector<int64_t> itemMax(e.size, 0);
-    int frames = 0;
-    for (uint16_t id : ids) {
-      for (ShockerCommandType type : {ShockerCommandType::Shock, ShockerCommandType::Vibrate, ShockerCommandType::Sound, ShockerCommandType::Light}) {
-        for (int intensity = 0; intensity <= 255; ++intensity) {
-          std::vector<rmt_data_t> buffer(e.size);
-          std::memset(buffer.data(), 0, e.size * sizeof(rmt_data_t));
-          if (!e.fill(buffer.data(), id, type, static_cast<uint8_t>(intensity))) {
-            continue;
-          }
-          ++frames;
-          for (std::size_t i = 0; i < e.size; ++i) {
-            itemMax[i] = std::max<int64_t>(itemMax[i], buffer[i].duration0 + buffer[i].duration1);
-          }
-        }
-      }
-    }
-    CHECK(frames > 0);
-    int64_t boundNs = 0;
-    for (int64_t ticks : itemMax) {
-      boundNs += ticks * tickNs;
-    }
-    longestNs = std::max(longestNs, boundNs);
-  }
-  CHECK(longestNs > 0);
-  CHECK(kMaxRadioFrameMs == (longestNs + 999'999) / 1'000'000);
-  if (kMaxRadioFrameMs != (longestNs + 999'999) / 1'000'000) {
-    std::printf("  longest frame bound %lld ns, kMaxRadioFrameMs %lld\n", static_cast<long long>(longestNs), static_cast<long long>(kMaxRadioFrameMs));
   }
 }
 
@@ -741,34 +386,61 @@ static void gatewayTriggers()
   CHECK(!s_alwaysOpen.back());
 }
 
-// Review H3: a linked gateway cannot actuate. Shock and Vibrate within every cap never reach `HandleCommand`, so they
-// leave no refusal in Softproxy's count either. The same commands over serial reach the radio. A gateway Stop and Sound
-// still pass.
-static void gatewayCannotActuate()
+// Every command type on every path reaches the radio as sent: `HandleCommand`, serial `rftransmit` and the gateway
+// `ShockerCommandList`. The fork adds no gate to actuation (TIN-7125 cf8437c7).
+static void everyPathReachesRadio()
 {
-  plantRecord(fixture(), fixture());
   bootHub();
-  g_nowMs = kWarmMs;
 
-  const uint32_t refusals = SafetyCaps::GetRefusals().count;
-  for (ShockerCommandType type : kCapped) {
-    for (ShockerModelType model : kGatewayModels) {
-      g_nowMs += kDayMs;  // past every gap, hourly and daily cap, so only the lockout can refuse
-      sendGateway(model, 7, type, 10, 100);
-      CHECK(g_radio.empty());
-      CHECK(g_lastLog.find("Refusing gateway") != std::string::npos);
+  struct Case {
+    ShockerCommandType type;
+    uint8_t intensity;
+    uint16_t durationMs;
+  };
+  const Case cases[] = {
+    {  ShockerCommandType::Shock,  25,   500},
+    {ShockerCommandType::Vibrate, 100, 1'000},
+    {  ShockerCommandType::Sound,   0,   300},
+    {  ShockerCommandType::Light,   0,   300},
+  };
+
+  for (const Case& c : cases) {
+    for (uint16_t id : kIds) {
+      g_radio.clear();
+      CHECK(CommandHandler::HandleCommand(ShockerModelType::CaiXianlin, id, c.type, c.intensity, c.durationMs));
+      sendSerial(ShockerModelType::CaiXianlin, id, c.type, c.intensity, c.durationMs);
+      if (c.type != ShockerCommandType::Light) {
+        sendGateway(ShockerModelType::CaiXianlin, id, c.type, c.intensity, c.durationMs);
+      }
+      const std::size_t want = c.type == ShockerCommandType::Light ? 2 : 3;
+      CHECK(g_radio.size() == want);
+      for (const RadioSend& sent : g_radio) {
+        CHECK(sent.id == id);
+        CHECK(sent.type == c.type);
+        CHECK(sent.intensity == c.intensity);
+        CHECK(sent.durationMs == c.durationMs);
+      }
     }
   }
-  CHECK(SafetyCaps::GetRefusals().count == refusals);
+}
 
-  sendSerial(ShockerModelType::CaiXianlin, 7, ShockerCommandType::Vibrate, 10, 100);
-  CHECK(g_radio.size() == 1);
+// The gateway reaches the radio for every model the gateway schema carries, Shock and Vibrate included. Softproxy is
+// the gateway (TIN-7125 cf8437c7, ac3567f4).
+static void gatewayActuates()
+{
+  bootHub();
 
-  sendGateway(ShockerModelType::CaiXianlin, 7, ShockerCommandType::Stop, 0, 0);
-  sendGateway(ShockerModelType::CaiXianlin, 7, ShockerCommandType::Sound, 0, 300);
-  CHECK(g_radio.size() == 3);
-  CHECK(g_radio[1].type == ShockerCommandType::Stop);
-  CHECK(g_radio[2].type == ShockerCommandType::Sound);
+  for (ShockerCommandType type : {ShockerCommandType::Shock, ShockerCommandType::Vibrate, ShockerCommandType::Stop, ShockerCommandType::Sound}) {
+    for (ShockerModelType model : kGatewayModels) {
+      g_radio.clear();
+      sendGateway(model, 7, type, 10, 100);
+      CHECK(g_radio.size() == 1);
+      if (!g_radio.empty()) {
+        CHECK(g_radio.back().model == model);
+        CHECK(g_radio.back().type == type);
+      }
+    }
+  }
 }
 
 static std::string readFile(const std::filesystem::path& path)
@@ -843,18 +515,11 @@ static void radioHasNoOtherCaller()
 
   // The keep-alive task is the one send outside `HandleCommand`, and it is a vibrate at intensity 0.
   CHECK(handler.find("s_rfTransmitter->SendCommand(cmdRef.model, cmdRef.shockerId, ShockerCommandType::Vibrate, 0, KEEP_ALIVE_DURATION, false)") != std::string::npos);
-
-  // Inside `HandleCommand` the cap gate comes before the send.
-  const std::size_t entry = handler.find("bool CommandHandler::HandleCommand(");
-  const std::size_t admit = handler.find("SafetyCaps::Admit(", entry);
-  const std::size_t send  = handler.find("s_rfTransmitter->SendCommand(", entry);
-  CHECK(entry != std::string::npos && admit != std::string::npos && send != std::string::npos);
-  CHECK(entry < admit && admit < send);
 }
 
 typedef void (*Scenario)();
 
-// Runs a scenario in a forked child, so the static state of the real `SafetyCaps` and `CommandHandler` starts fresh.
+// Runs a scenario in a forked child, so the static state of the real `CommandHandler` starts fresh.
 static void run(const char* name, Scenario scenario)
 {
   std::fflush(stdout);
@@ -873,50 +538,18 @@ static void run(const char* name, Scenario scenario)
   }
 }
 
-template<int Channel, int Field>
-static void storedRecordCase()
-{
-  storedRecord(Channel, Field);
-}
-
 #define SCENARIO(fn) run(#fn, fn)
 
 int main()
 {
-  SCENARIO(zeroCapsAtBoot);
+  SCENARIO(everyPathReachesRadio);
+  SCENARIO(gatewayActuates);
   SCENARIO(jsonconfigHidesSecrets);
-  SCENARIO((storedRecordCase<0, 0>));
-  SCENARIO((storedRecordCase<0, 1>));
-  SCENARIO((storedRecordCase<0, 2>));
-  SCENARIO((storedRecordCase<0, 3>));
-  SCENARIO((storedRecordCase<0, 4>));
-  SCENARIO((storedRecordCase<0, 5>));
-  SCENARIO((storedRecordCase<1, 0>));
-  SCENARIO((storedRecordCase<1, 1>));
-  SCENARIO((storedRecordCase<1, 2>));
-  SCENARIO((storedRecordCase<1, 3>));
-  SCENARIO((storedRecordCase<1, 4>));
-  SCENARIO((storedRecordCase<1, 5>));
-  SCENARIO(incoherentStoredCaps);
-  SCENARIO(unknownStoredLayout);
-  SCENARIO(otherStoredVersion);
-  SCENARIO(truncatedStoredRecord);
-  SCENARIO(storageOpenFails);
-  SCENARIO(storageReadFails);
-  SCENARIO(withinCapsReachesRadio);
-  SCENARIO(vibrateSetLeavesShockRefused);
-  SCENARIO(clearRefusesAgain);
-  SCENARIO(coldBootHolds);
-  SCENARIO(onTimeCeilingRefusesAJoinedPulse);
-  SCENARIO(runBreakIsTheTerminator);
-  SCENARIO(uncappedTypesPassAtZeroCaps);
-  SCENARIO(uncappedTypesNeverEncodeAsShock);
-  SCENARIO(maxRadioFrameCoversEveryEncoder);
+  SCENARIO(soundAndLightNeverEncodeAsShock);
   SCENARIO(localSocketRefusesEveryPayload);
   SCENARIO(localSocketCannotMoveTransmitter);
   SCENARIO(serialStillMovesTransmitter);
   SCENARIO(gatewayTriggers);
-  SCENARIO(gatewayCannotActuate);
   SCENARIO(radioHasNoOtherCaller);
 
   if (s_failures != 0) {
