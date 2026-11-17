@@ -166,6 +166,7 @@ bool GatewayConnectionManager::SendMessageBIN(tcb::span<const uint8_t> data)
   return s_wsClient->sendMessageBIN(data);
 }
 
+#ifndef OPENSHOCK_GATEWAY_DIRECT_PATH
 bool FetchHubInfo(std::string authToken)
 {
   // TODO: this function is very slow, should be optimized!
@@ -209,6 +210,7 @@ bool FetchHubInfo(std::string authToken)
 
   return true;
 }
+#endif
 
 bool StartConnectingToLCG()
 {
@@ -241,6 +243,19 @@ bool StartConnectingToLCG()
     return false;
   }
 
+#ifdef OPENSHOCK_GATEWAY_DIRECT_PATH
+  // Softproxy fork (TIN-7125): the gateway is the backend domain itself, so there is no LCG to assign. The hub opens
+  // WSS straight to the domain, and the gateway checks the Device-Token header on the upgrade.
+  (void)authToken;
+  std::string domain;
+  if (!Config::GetBackendDomain(domain)) {
+    OS_LOGE(TAG, "Failed to get backend domain");
+    return false;
+  }
+  OS_LOGI(TAG, "Connecting to gateway { host: '%s', port: %hu, path: '%s' }", domain.c_str(), static_cast<uint16_t>(OPENSHOCK_GATEWAY_DIRECT_PORT), OPENSHOCK_GATEWAY_DIRECT_PATH);
+  s_wsClient->connect(domain, OPENSHOCK_GATEWAY_DIRECT_PORT, OPENSHOCK_GATEWAY_DIRECT_PATH);
+  return true;
+#else
   auto response = HTTP::JsonAPI::AssignLcg(std::move(authToken));
 
   if (response.code == 401) {
@@ -266,6 +281,7 @@ bool StartConnectingToLCG()
   s_wsClient->connect(response.data.host, response.data.port, response.data.path);
 
   return true;
+#endif
 }
 
 void GatewayConnectionManager::Update()
@@ -282,10 +298,12 @@ void GatewayConnectionManager::Update()
       return;
     }
 
+#ifndef OPENSHOCK_GATEWAY_DIRECT_PATH
     // Fetch hub info
     if (!FetchHubInfo(authToken)) {
       return;
     }
+#endif
 
     s_flags |= FLAG_LINKED;
     OS_LOGD(TAG, "Successfully verified auth token");

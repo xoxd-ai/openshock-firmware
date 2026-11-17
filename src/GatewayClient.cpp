@@ -10,6 +10,7 @@ const char* const TAG = "GatewayClient";
 #include "message_handlers/WebSocket.h"
 #include "OtaUpdateManager.h"
 #include "serialization/WSGateway.h"
+#include "softproxy/GatewayRoots.h"
 #include "VisualStateManager.h"
 
 using namespace OpenShock;
@@ -65,8 +66,13 @@ void GatewayClient::connect(const std::string& host, uint16_t port, const std::s
 //
 #warning SSL certificate verification is currently not implemented, by RFC definition this is a security risk, and allows for MITM attacks, but the realistic risk is low
 
+#ifdef OPENSHOCK_GATEWAY_PINNED_ROOTS
+  // Softproxy fork (TIN-7125): verify the gateway against the pinned public roots (softproxy/GatewayRoots.h).
+  m_webSocket.beginSslWithCA(host.c_str(), port, path.c_str(), OpenShock::Softproxy::kGatewayRootsPem);
+#else
   m_webSocket.beginSSL(host.c_str(), port, path.c_str());
   OS_LOGW(TAG, "WEBSOCKET CONNECTION BY RFC DEFINITION IS INSECURE, remote endpoint can not be verified due to lack of CA verification support, theoretically this is a security risk and allows for MITM attacks, but the realistic risk is low");
+#endif
 }
 
 void GatewayClient::disconnect()

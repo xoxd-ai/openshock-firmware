@@ -19,11 +19,15 @@ void _handleAuthtokenCommand(std::string_view arg, bool isAutomated)
     return;
   }
 
+#ifndef OPENSHOCK_GATEWAY_DIRECT_PATH
   auto apiResponse = OpenShock::HTTP::JsonAPI::GetHubInfo(arg);
   if (apiResponse.code == 401) {
     SERPR_ERROR("Invalid auth token, refusing to save it!");
     return;
   }
+#endif
+  // Softproxy fork (TIN-7125): with a direct gateway the domain serves no HTTP API, so the token is saved unchecked and
+  // the gateway checks it on the WebSocket upgrade.
 
   // If we have some other kind of request fault just set it anyway, we probably arent connected to a network
 

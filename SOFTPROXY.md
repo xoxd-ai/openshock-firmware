@@ -4,27 +4,37 @@ This fork of `OpenShock/Firmware` starts from tag `1.5.2` (commit `5546c13eb745e
 
 ## Gateway path
 
-The hub reaches its gateway in three steps, all upstream code. Every request carries the hub token.
+The `Pishock-2023` env connects straight to Softproxy. Other envs keep upstream's three steps.
 
-| Step | Request | Code |
+| Step | Upstream, other envs | `Pishock-2023` |
 | --- | --- | --- |
-| Check the token | `GET https://<domain>/1/device/self` with header `DeviceToken: <token>`. A 200 links the hub, a 401 waits 5 minutes | `HTTP::JsonAPI::GetHubInfo` in `src/http/JsonAPI.cpp` |
-| Find the gateway | `GET https://<domain>/2/device/assignLCG?version=2` with the same header. The JSON answer names `host`, `port`, `path` and `country` | `HTTP::JsonAPI::AssignLcg`, `StartConnectingToLCG` in `src/GatewayConnectionManager.cpp` |
-| Connect | WSS to that host, port and path, with headers `Firmware-Version` and `Device-Token` | `GatewayClient::GatewayClient` and `GatewayClient::connect` in `src/GatewayClient.cpp` |
+| Check the token | `GET https://<domain>/1/device/self` with header `DeviceToken: <token>`. A 200 links the hub, a 401 waits 5 minutes (`FetchHubInfo`) | skipped. The domain serves no HTTP API, and the edge answers 404 off the hub path |
+| Find the gateway | `GET https://<domain>/2/device/assignLCG?version=2`. The JSON answer names `host`, `port` and `path` (`StartConnectingToLCG`) | skipped. Host is the domain, port is `OPENSHOCK_GATEWAY_DIRECT_PORT` 443, path is `OPENSHOCK_GATEWAY_DIRECT_PATH` `/api/v0/hub/ws` |
+| Connect | WSS with headers `Firmware-Version` and `Device-Token`, unverified | the same two headers, verified against the pinned roots (see TLS) |
 
-Serial `domain <name>` first checks `GET https://<name>/1` and saves the domain only on a 200, then restarts the hub. Serial `authtoken <token>` saves the token unless `/1/device/self` answers 401. The local socket can no longer link an account (see Local socket), so serial is the only way to set the token.
+The default domain of `Pishock-2023` is `OPENSHOCK_API_DOMAIN=softproxy-hub.clients.xoxd.ai`, so the hub opens `wss://softproxy-hub.clients.xoxd.ai:443/api/v0/hub/ws`. A stored config keeps its own domain until serial `domain` changes it. Serial `authtoken <token>` sets the hub token, which travels as `Device-Token` on every upgrade. With the direct path both serial commands save without an HTTP check, since the domain has no `/1` or `/1/device/self`. The local socket can no longer link an account (see Local socket), so serial is the only way to set the token.
 
-The `Pishock-2023` env builds with `OPENSHOCK_API_DOMAIN=softproxy-hub.clients.xoxd.ai`, the default domain for a hub with no stored config. A stored config keeps its own domain until serial `domain` changes it. The other envs keep upstream's `api.openshock.app` from `.env`.
+The version carries `sp-gw1` in its build metadata on `Pishock-2023` (`SOFTPROXY_FW_BUILD_TAG` in `platformio.ini`, applied by `scripts/embed_env_vars.py`). It marks an image whose gateway Shock and Vibrate run. It reaches Softproxy in the `Firmware-Version` header and in `BootStatus.firmware_version.build`.
 
-The hub sends no WebSocket ping of its own upstream. It answers the gateway's `Ping` message with a `Pong` that carries `uptime` and `rssi`, so the gateway sets the keepalive. A proxy that closes an idle WebSocket after about 100 seconds would drop a quiet hub, so the `Pishock-2023` env sets `OPENSHOCK_GATEWAY_PING_INTERVAL_MS=30000`. With it set, `GatewayClient` sends a WebSocket ping every 30 seconds and drops the connection after two pongs missed by 10 seconds each, and the manager reconnects. Other envs leave it unset.
+Keepalive: the hub answers the gateway's `Ping` message with an upstream `Pong`, `uptime` and `rssi` only (`src/message_handlers/websocket/gateway/Ping.cpp`). The WebSocket library answers a WebSocket ping frame with a pong frame on its own (`WSop_ping` in BadWebSockets `WebSockets.cpp`). The `Pishock-2023` env also sets `OPENSHOCK_GATEWAY_PING_INTERVAL_MS=30000`, so `GatewayClient` sends its own WebSocket ping every 30 seconds and drops the connection after two pongs missed by 10 seconds each. The manager then reconnects, at most once every 20 seconds.
 
-Extra fixed headers on the WSS handshake, such as a proxy service token, would go into the `headers` string in `GatewayClient::GatewayClient`, which `setExtraHeaders` sends on every connect. The three HTTPS requests above take their headers from the maps in `src/http/JsonAPI.cpp` and `src/serial/command_handlers/domain.cpp`, so a proxy that checks a header on every request needs them there as well. None is added yet.
+A 401 on the upgrade gets no 5 minute backoff, unlike a 401 from `AssignLcg` upstream. The pinned BadWebSockets clears the HTTP status in `clientDisconnect` before it raises `WStype_DISCONNECTED`, so `GatewayClient` cannot tell a 401 from any other failed upgrade. A bad token therefore retries every 20 seconds. The fix needs a BadWebSockets change that keeps the status for the disconnect event.
+
+Extra fixed headers on the upgrade, such as a proxy service token, would go into the `headers` string in `GatewayClient::GatewayClient` in `src/GatewayClient.cpp`, which `setExtraHeaders` sends on every connect. None is added.
 
 ### TLS
 
-Upstream 1.5.2 verifies no server certificate. `GatewayClient::connect` calls `beginSSL` with no fingerprint, so the WebSocket library calls `setInsecure()`, and the HTTPS requests go through `HTTPClient::begin(url)` with no CA, which the arduino-esp32 2.x client runs without verification (I, from that library's source, not read in this tree). Both files carry upstream's `#warning` that verification is not implemented. The build embeds `certificates/x509_crt_bundle`, made by `certificates/gen_crt_bundle.py` from curl's extract of the Mozilla roots (`certificates/cacert.pem`, Mozilla data of December 2, 2025, 144 roots), but no code loads it. Upstream's note in `src/GatewayConnectionManager.cpp` says loading it failed with an allocation error in `esp_crt_bundle_init`.
+Upstream 1.5.2 verifies no server certificate. `GatewayClient::connect` calls `beginSSL` with no fingerprint, so the WebSocket library calls `setInsecure()`, and the HTTPS requests go through `HTTPClient::begin(url)` with no CA, which the arduino-esp32 2.x client runs without verification (I, from that library's source, not read in this tree). The build embeds `certificates/x509_crt_bundle`, made by `certificates/gen_crt_bundle.py` from curl's extract of the Mozilla roots (`certificates/cacert.pem`, Mozilla data of December 2, 2025, 144 roots), but no code loads it. Upstream's note in `src/GatewayConnectionManager.cpp` says loading it failed with an allocation error in `esp_crt_bundle_init`.
 
-So any certificate for the gateway name works today, and so does any certificate an attacker on the path presents. Pinning public roots needs a code change: a PEM string with at least two roots, such as GTS Root R1, GTS Root R4 and ISRG Root X1 (all three are in `cacert.pem`), passed to `beginSslWithCA` in `GatewayClient::connect` and to `HTTPClient::begin(url, caCert)` in `src/http/HTTPRequestManager.cpp`. A short PEM list avoids the bundle allocation that upstream reports. Pin a root, never a leaf or an intermediate such as WE1, since the proxy's issuer can change at renewal. This fork adds no certificate yet.
+With `OPENSHOCK_GATEWAY_PINNED_ROOTS` set, as on `Pishock-2023`, `GatewayClient::connect` calls `beginSslWithCA` with `kGatewayRootsPem` from `include/softproxy/GatewayRoots.h`. It holds three roots, each copied byte for byte from `cacert.pem`, which the host test checks:
+
+| Root | Covers | Expires | SHA-256 |
+| --- | --- | --- | --- |
+| GTS Root R4 | a Google Trust Services chain, such as the WE1 intermediate the proxy uses today | June 22, 2036 | `349DFA4058C5E263123B398AE795573C4E1313C83FE68F93556CD5E8031B3C7D` |
+| GTS Root R1 | a Google Trust Services chain under R1 | June 22, 2036 | `D947432ABDE7B7FA90FC2E6B59101B1280E0E1C7E4E40FA3C6887FFF57A7F4CF` |
+| ISRG Root X1 | a Let's Encrypt chain | June 4, 2035 | `96BCEC06264976F37460779ACF28C5A7CFE8A3C0AAE11A8FFCEE05C0BDDF08C6` |
+
+No leaf or intermediate is pinned, so a renewal under any of these roots keeps working. The HTTPS requests stay unverified, and with the direct path the hub makes none to the gateway. Open points, all U: whether mbedtls on this board accepts the three concatenated PEM roots, whether it checks validity dates while the hub has no SNTP time, and the live chain of `softproxy-hub.clients.xoxd.ai`, which did not resolve on November 17, 2026. The first bench run settles them.
 
 ## Remote paths
 
@@ -88,16 +98,19 @@ An app-only write onto the vendor partition table is not supported. The fork mou
 | `src/OtaUpdateManager.cpp`, `src/message_handlers/websocket/gateway/Trigger.cpp`, `src/captiveportal/Manager.cpp` | apply the gateway lockouts |
 | `src/message_handlers/websocket/Local.cpp` | applies the local socket allow list |
 | `src/WebSocketDeFragger.cpp`, `include/TinyVec.h`, `src/captiveportal/CaptivePortalInstance.cpp` | the message bound on port 81 and the disconnect after an overflow |
-| `src/GatewayClient.cpp` | the optional WebSocket ping, `OPENSHOCK_GATEWAY_PING_INTERVAL_MS` |
-| `platformio.ini` | the `Pishock-2023` default domain and ping interval |
+| `src/GatewayClient.cpp` | the optional WebSocket ping and the pinned roots on connect |
+| `src/GatewayConnectionManager.cpp`, `src/serial/command_handlers/authtoken.cpp`, `src/serial/command_handlers/domain.cpp` | the direct gateway path, `OPENSHOCK_GATEWAY_DIRECT_PATH` |
+| `include/softproxy/GatewayRoots.h` | the three pinned roots |
+| `scripts/embed_env_vars.py` | adds `SOFTPROXY_FW_BUILD_TAG` to the version's build metadata |
+| `platformio.ini` | the `Pishock-2023` gateway settings |
 | `softproxy/schemas/HubConfig.fbs`, `softproxy/schemas/LocalToHubMessage.fbs`, `softproxy/schemas/HubToLocalMessage.fbs` | the deprecated `HubConfig.estop` slot and the retired E-Stop payloads (see Removed: E-Stop) |
 | `src/serial/command_handlers/jsonconfig.cpp` | prints the config without secrets (review H6) |
-| `test/native/test_local_lockdown.cpp` | host test of the local socket allow list and the lockout constants |
+| `test/native/test_local_lockdown.cpp` | host test of the local socket allow list, the lockout constants and the pinned roots |
 | `test/native/test_command_paths.cpp`, `test/native/stubs/` | host test that links the real `HandleCommand`, gateway and local dispatchers, `Trigger`, `SetRfTxPinCommand`, serial `rftransmit` and `rftxpin` and the five encoders. It checks that every path reaches the radio with the command as sent, and that the local socket and the gateway triggers stay closed. Its header gives the command |
 | `test/native/test_radio_path.cpp`, `test/native/radio_stubs/` | host test of the real `HandleCommand`, `RFTransmitter` and its task, `Sequence` and `WebSocketDeFragger`, built once for each `Pishock-*` RF TX default. Its header gives the command |
 | `.github/workflows/softproxy-host-test.yml` | runs the three host tests on pushes and PRs to `softproxy/**` and on PRs to the release branch |
 
-Run the lockout test with:
+Run the lockout and roots test from the repository root with:
 
 ```sh
 g++ -std=c++20 -Wall -Wextra -Werror -Iinclude test/native/test_local_lockdown.cpp -o local_lockdown_test && ./local_lockdown_test
@@ -105,8 +118,9 @@ g++ -std=c++20 -Wall -Wextra -Werror -Iinclude test/native/test_local_lockdown.c
 
 ## Not covered here
 
-- Server certificate verification, see TLS.
+- Server certificate verification on the HTTPS requests, and the TLS open points, see TLS.
+- The 5 minute backoff on a 401 from the upgrade, see Gateway path.
 - The hub cannot see a request's purpose or schedule. Softproxy decides what to send.
 - The host test's fake `Chipset` accepts pins 0 to 39, so `CHIP_UNSAFE_GPIO`, the `OPENSHOCK_BYPASSED_GPIO` entries and the `int8_t` signature of the real functions do not run there. A scan pins GPIO 10 in the real ESP32 list.
 - A serial `rftransmit` command in the host test comes from a fake parser, so `JsonSerial::ParseShockerCommand` is read, not run.
-- The WebSocket ping is built and unrun on a board. Whether the proxy counts a ping frame as activity is unmeasured (U).
+- The direct path, the pinned roots and the WebSocket ping are built and unrun on a board. Whether the proxy counts a ping frame as activity is unmeasured (U).

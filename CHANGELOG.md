@@ -14,7 +14,7 @@ Fork changes on `feat/tin-7545-softproxy-caps` from the delta review of `11c3fe6
 
 ### Gateway
 
-- **Softproxy as gateway (TIN-7125 `ac3567f4`)** - The `Pishock-2023` env builds with `OPENSHOCK_API_DOMAIN=softproxy-hub.clients.xoxd.ai` as its default domain and `OPENSHOCK_GATEWAY_PING_INTERVAL_MS=30000`, which makes `GatewayClient` send a WebSocket ping every 30 seconds. Serial `authtoken` sets the hub token. Server certificates are still not verified, as upstream, see `SOFTPROXY.md` TLS.
+- **Softproxy as gateway (TIN-7125 `ac3567f4`)** - The `Pishock-2023` env connects straight to `wss://softproxy-hub.clients.xoxd.ai:443/api/v0/hub/ws` with the stock `Firmware-Version` and `Device-Token` headers, skipping `FetchHubInfo` and `AssignLcg`. It verifies the gateway against three pinned roots, GTS Root R4, GTS Root R1 and ISRG Root X1, sends a WebSocket ping every 30 seconds and carries `sp-gw1` in its version build metadata. Serial `authtoken` sets the hub token. Other envs are unchanged.
 
 ### Removed
 

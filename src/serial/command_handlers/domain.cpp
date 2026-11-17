@@ -31,6 +31,7 @@ void _handleDomainCommand(std::string_view arg, bool isAutomated)
     return;
   }
 
+#ifndef OPENSHOCK_GATEWAY_DIRECT_PATH
   char uri[OPENSHOCK_URI_BUFFER_SIZE];
   sprintf(uri, "https://%.*s/1", arg.length(), arg.data());
 
@@ -49,6 +50,8 @@ void _handleDomainCommand(std::string_view arg, bool isAutomated)
   }
 
   OS_LOGI(TAG, "Successfully connected to \"%.*s\", version: %s, commit: %s, current time: %s", arg.length(), arg.data(), resp.data.version.c_str(), resp.data.commit.c_str(), resp.data.currentTime.c_str());
+#endif
+  // Softproxy fork (TIN-7125): with a direct gateway the domain serves no HTTP API, so the domain is saved unchecked.
 
   bool result = OpenShock::Config::SetBackendDomain(std::string(arg));
 
